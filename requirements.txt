@@ -1,0 +1,42 @@
+# ── Core API & Server ──────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-dotenv==1.0.1
+pydantic==2.7.1
+pydantic-settings==2.2.1
+httpx==0.27.0
+aiohttp==3.9.5
+websockets==12.0
+apscheduler==3.10.4
+
+# ── Binance.US (Official connector — more reliable than python-binance)
+binance-connector==3.7.0
+python-binance==1.0.19
+
+# ── AI / LLM ───────────────────────────────────────────────
+openai==1.30.1
+
+# ── Technical Analysis ─────────────────────────────────────
+pandas==2.2.2
+numpy==1.26.4
+ta==0.11.0
+# pandas-ta is intentionally NOT pinned: 0.4.x requires numpy>=2.2 which
+# conflicts with vectorbt's numpy<2 requirement, and 0.3.14b was yanked.
+# Install manually only if you need it: pip install "pandas-ta<0.4" --pre
+
+# ── Backtesting ────────────────────────────────────────────
+vectorbt==0.26.2
+# jesse is installed separately: pip install jesse
+
+# ── Market Data ────────────────────────────────────────────
+pycoingecko==3.1.0
+# openbb: pip install openbb (large package — optional)
+# cryptofeed: pip install cryptofeed (optional for live streams)
+
+# ── Utilities ──────────────────────────────────────────────
+scipy==1.13.0     # for Kelly optimization
+scikit-learn==1.5.0  # for regime ML classification (optional)
+
+# ── Dev / test ─────────────────────────────────────────────
+pytest==8.2.0
+pytest-asyncio==0.23.6
