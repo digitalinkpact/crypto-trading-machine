@@ -1,4 +1,9 @@
-"""OHLCV repository with a simple parquet-on-disk cache."""
+"""OHLCV repository with a simple pickle-on-disk cache.
+
+Pickle is used instead of parquet so we don't pull in `pyarrow` (heavy and
+sometimes unavailable on slim images). Swap to parquet later if you need
+cross-language reads of the cache.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,7 +19,7 @@ log = get_logger(__name__)
 
 
 class OHLCVRepository:
-    """Fetch candles via the exchange wrapper, cache to parquet on disk."""
+    """Fetch candles via the exchange wrapper, cache to pickle on disk."""
 
     def __init__(
         self,
@@ -26,7 +31,7 @@ class OHLCVRepository:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _path(self, symbol: str, timeframe: Timeframe) -> Path:
-        return self._cache_dir / f"{symbol}_{timeframe.value}.parquet"
+        return self._cache_dir / f"{symbol}_{timeframe.value}.pkl"
 
     async def get(
         self,
@@ -37,7 +42,7 @@ class OHLCVRepository:
     ) -> pd.DataFrame:
         path = self._path(symbol, timeframe)
         if not refresh and path.exists():
-            return pd.read_parquet(path)
+            return pd.read_pickle(path)
         df = await self._client.klines(symbol, timeframe, limit=limit)
-        df.to_parquet(path)
+        df.to_pickle(path)
         return df

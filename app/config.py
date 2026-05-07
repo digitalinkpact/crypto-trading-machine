@@ -24,12 +24,14 @@ class Timeframe(str, Enum):
 
 # ── Universe ─────────────────────────────────────────────────────────────
 # 25 symbols traded on Binance.US (USDT pairs). Adjust as listings change.
+# NOTE: Binance.US has fewer listings than Binance.com — verify with
+# GET /api/v3/exchangeInfo before adding new symbols.
 SYMBOLS: tuple[str, ...] = (
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
     "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "DOTUSDT", "LINKUSDT",
     "MATICUSDT", "LTCUSDT", "BCHUSDT", "ATOMUSDT", "UNIUSDT",
     "ETCUSDT", "FILUSDT", "NEARUSDT", "APTUSDT", "ARBUSDT",
-    "OPUSDT", "INJUSDT", "SUIUSDT", "RNDRUSDT", "AAVEUSDT",
+    "OPUSDT", "SHIBUSDT", "SUIUSDT", "RNDRUSDT", "AAVEUSDT",
 )
 
 TIMEFRAMES: tuple[Timeframe, ...] = (
