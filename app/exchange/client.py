@@ -134,3 +134,48 @@ class BinanceUSClient:
     async def open_orders(self, symbol: Optional[str] = None) -> list[dict[str, Any]]:
         kwargs = {"symbol": symbol} if symbol else {}
         return await asyncio.to_thread(self._spot.get_open_orders, **kwargs)
+
+    # ── Liquidation ──────────────────────────────────────────────────────
+    async def liquidate_all(self, quote: str = "USDT") -> list[Order]:
+        """Market-sell every non-quote balance into `quote`.
+
+        Used by the Autopilot Stop button. Bypasses the dry_run / paper_trading
+        gate intentionally — the user has explicitly asked to flatten.
+        """
+        account = await asyncio.to_thread(self._spot.account)
+        results: list[Order] = []
+        for bal in account.get("balances", []):
+            asset = bal["asset"]
+            free = Decimal(bal["free"])
+            if asset == quote or free <= 0:
+                continue
+            symbol = f"{asset}{quote}"
+            coid = _new_client_order_id("liq")
+            params = {
+                "symbol": symbol,
+                "side": OrderSide.SELL.value,
+                "type": OrderType.MARKET.value,
+                "quantity": str(free),
+                "newClientOrderId": coid,
+            }
+            try:
+                raw = await asyncio.to_thread(self._spot.new_order, **params)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("liquidate %s failed: %s", symbol, exc)
+                continue
+            results.append(
+                Order(
+                    symbol=symbol,
+                    side=OrderSide.SELL,
+                    type=OrderType.MARKET,
+                    quantity=free,
+                    client_order_id=coid,
+                    status=OrderStatus(raw.get("status", "NEW")),
+                    exchange_order_id=str(raw.get("orderId")),
+                    submitted_at=datetime.now(timezone.utc),
+                    filled_quantity=Decimal(str(raw.get("executedQty", "0"))),
+                    raw=raw,
+                )
+            )
+            log.warning("liquidated %s qty=%s coid=%s", symbol, free, coid)
+        return results
