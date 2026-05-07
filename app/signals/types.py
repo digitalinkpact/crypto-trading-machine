@@ -26,6 +26,7 @@ class Signal(BaseModel):
     action: SignalAction
     confidence: float = Field(..., ge=0.0, le=1.0)
     rationale: str = ""
+    contributing_agents: tuple[str, ...] = ()
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -46,9 +47,13 @@ class SignalAggregator:
             lambda: {SignalAction.BUY: 0.0, SignalAction.SELL: 0.0, SignalAction.HOLD: 0.0}
         )
         rationales: dict[str, list[str]] = defaultdict(list)
+        contribs: dict[str, dict[SignalAction, set[str]]] = defaultdict(
+            lambda: {SignalAction.BUY: set(), SignalAction.SELL: set(), SignalAction.HOLD: set()}
+        )
         for s in signals:
             w = _TF_WEIGHT.get(s.timeframe, 1.0) * s.confidence
             scores[s.symbol][s.action] += w
+            contribs[s.symbol][s.action].add(s.agent)
             if s.rationale:
                 rationales[s.symbol].append(f"[{s.agent}/{s.timeframe.value}] {s.rationale}")
 
@@ -64,5 +69,6 @@ class SignalAggregator:
                 action=action,
                 confidence=confidence,
                 rationale=" | ".join(rationales[symbol]),
+                contributing_agents=tuple(sorted(contribs[symbol][action])),
             )
         return result
