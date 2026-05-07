@@ -17,13 +17,13 @@ class MomentumAgent(Agent):
         if h0 < h1 < h2 and h2 > 0:
             return Signal(
                 agent=self.name, symbol=ctx.symbol, timeframe=ctx.timeframe,
-                action=SignalAction.BUY, confidence=0.55,
+                action=SignalAction.BUY, confidence=0.45,
                 rationale=f"macd hist rising {h0:.4f}->{h2:.4f}",
             )
         if h0 > h1 > h2 and h2 < 0:
             return Signal(
                 agent=self.name, symbol=ctx.symbol, timeframe=ctx.timeframe,
-                action=SignalAction.SELL, confidence=0.55,
+                action=SignalAction.SELL, confidence=0.45,
                 rationale=f"macd hist falling {h0:.4f}->{h2:.4f}",
             )
         return None

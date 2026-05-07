@@ -51,4 +51,5 @@ class LLMReasonerAgent:
             action=action,
             confidence=confidence,
             rationale=str(out.get("rationale", ""))[:200],
+            contributing_agents=(self.name,),
         )

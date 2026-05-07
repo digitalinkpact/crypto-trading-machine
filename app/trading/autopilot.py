@@ -3,6 +3,13 @@
 Single source of truth for "are we trading?". Runs in either PAPER or LIVE mode
 based on `settings.paper_trading`. Both modes share the SQLite store, so the
 agent-attribution stats earned during paper trading carry straight into live.
+
+Each tick:
+  1. Run risk gates over all open positions (stop-loss / take-profit / trailing /
+     max-hold). Force-exit anything that hit a rule.
+  2. Check drawdown circuit breaker. If tripped, skip new BUYs.
+  3. Run agents → aggregator → execute high-confidence signals subject to
+     cooldown, max_open_positions, max_long_exposure, volatility-scaled sizing.
 """
 from __future__ import annotations
 
@@ -19,14 +26,13 @@ from app.exchange.filters import filters
 from app.logging_setup import get_logger
 from app.signals import SignalAction
 from app.storage import storage
+from app.trading import risk
 from app.trading.paper import paper_exchange
 from app.trading.portfolio import portfolio_snapshot
 
 log = get_logger(__name__)
 
 _STATE_KEY = "autopilot_state"
-_COOLDOWN_MIN = 60  # minutes between BUYs on the same symbol
-_MIN_CONFIDENCE = 0.6
 
 
 @dataclass
@@ -158,6 +164,22 @@ class Autopilot:
             return
         async with self._lock:
             self.state.last_tick_at = datetime.now(timezone.utc)
+
+            # 1. Risk gates — stop-loss / take-profit / trailing / max-hold.
+            #    Run BEFORE agents so we exit losers regardless of new signals.
+            try:
+                await self._run_risk_gates()
+            except Exception as exc:  # noqa: BLE001
+                log.exception("risk gate run failed: %s", exc)
+
+            # 2. Drawdown circuit breaker.
+            try:
+                breaker_tripped = await self._check_circuit_breaker()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("circuit breaker check failed: %s", exc)
+                breaker_tripped = False
+
+            # 3. Agent signals → execute (skip BUYs if breaker tripped).
             try:
                 signals = await run_all_agents(use_llm=False)
             except Exception as exc:  # noqa: BLE001
@@ -166,12 +188,55 @@ class Autopilot:
                 self._save()
                 return
             try:
-                await self._execute(signals)
+                await self._execute(signals, allow_buys=not breaker_tripped)
             finally:
                 self._save()
 
+    # ── risk gates ─────────────────────────────────────────────────────
+    async def _run_risk_gates(self) -> None:
+        positions = [p for p in storage.all_positions() if p["mode"] == self.state.mode]
+        if not positions:
+            return
+        prices: dict[str, Decimal] = {}
+        for pos in positions:
+            try:
+                prices[pos["symbol"]] = await self._price(pos["symbol"])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("price fetch failed for %s: %s", pos["symbol"], exc)
+        exits = risk.evaluate_exits(positions=positions, prices=prices)
+        for ex in exits:
+            try:
+                price = prices.get(ex.symbol) or await self._price(ex.symbol)
+                qty = filters.round_qty(ex.symbol, ex.qty)
+                if qty <= 0 or not filters.meets_min(ex.symbol, qty, price):
+                    log.info("risk-exit %s skipped: filters reject qty=%s", ex.symbol, qty)
+                    continue
+                log.warning("RISK EXIT %s reason=%s qty=%s price=%s",
+                            ex.symbol, ex.reason, qty, price)
+                await self._submit(ex.symbol, OrderSide.SELL, qty, [f"risk:{ex.reason}"])
+                risk.clear_hwm(ex.symbol)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("risk-exit failed for %s: %s", ex.symbol, exc)
+
+    async def _check_circuit_breaker(self) -> bool:
+        try:
+            snap = await portfolio_snapshot(mode=self.state.mode)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("breaker portfolio fetch failed: %s", exc)
+            return False
+        tripped, dd = risk.is_circuit_breaker_tripped(
+            starting_balance=self.state.starting_balance_usdt,
+            current_balance=Decimal(str(snap["total_usdt"])),
+        )
+        if tripped:
+            self.state.last_error = (
+                f"DRAWDOWN BREAKER TRIPPED at {dd:.1%} — new BUYs halted"
+            )
+            log.warning(self.state.last_error)
+        return tripped
+
     # ── execution ──────────────────────────────────────────────────────
-    async def _execute(self, signals) -> None:
+    async def _execute(self, signals, *, allow_buys: bool = True) -> None:
         if not signals:
             return
         s = get_settings()
@@ -183,42 +248,94 @@ class Autopilot:
             return
 
         usdt_free = Decimal(str(snap["usdt_cash"]))
+        total_eq = Decimal(str(snap["total_usdt"]))
+        long_exposure_pct = float(
+            (total_eq - usdt_free) / total_eq if total_eq > 0 else Decimal("0")
+        )
         balances: dict[str, Decimal] = {
             asset: Decimal(str(qty)) for asset, qty in snap["all_balances"].items()
         }
-        per_trade_usdt = usdt_free * Decimal(str(s.max_position_pct))
+        open_positions = [
+            p for p in storage.all_positions() if p["mode"] == self.state.mode
+        ]
+        open_count = len(open_positions)
+        held_symbols = {p["symbol"] for p in open_positions}
         now = datetime.now(timezone.utc)
+        cooldown = timedelta(minutes=s.buy_cooldown_minutes)
 
         for symbol, sig in signals.items():
-            if sig.confidence < _MIN_CONFIDENCE:
+            if sig.confidence < s.min_signal_confidence:
                 continue
             if not filters.is_listed(symbol):
                 continue
             try:
                 if sig.action == SignalAction.BUY:
-                    if self._on_cooldown(symbol, now):
+                    if not allow_buys:
                         continue
+                    if symbol in held_symbols:
+                        continue  # don't pyramid into existing position
+                    if self._on_cooldown(symbol, now, cooldown):
+                        continue
+                    ok, why = risk.can_open_new_position(
+                        open_positions=open_count,
+                        long_exposure_pct=long_exposure_pct,
+                    )
+                    if not ok:
+                        log.info("skip %s BUY: %s", symbol, why)
+                        continue
+
+                    # Volatility-scaled sizing.
+                    atr_pct = await self._atr_pct(symbol)
+                    eff_pct = risk.volatility_scaled_pct(s.max_position_pct, atr_pct)
+                    per_trade_usdt = usdt_free * Decimal(str(eff_pct))
                     if per_trade_usdt <= 1:
                         continue
+
                     await self._place_buy(symbol, sig, per_trade_usdt)
                     self.state.cooldowns[symbol] = now.isoformat()
+                    open_count += 1
+                    held_symbols.add(symbol)
+                    # Approximate exposure update so subsequent BUYs see the new total.
+                    long_exposure_pct = min(
+                        1.0,
+                        long_exposure_pct + float(per_trade_usdt / total_eq) if total_eq > 0 else 0,
+                    )
                 elif sig.action == SignalAction.SELL:
                     base = symbol.replace("USDT", "")
                     free = balances.get(base, Decimal("0"))
                     if free > 0:
                         await self._place_sell(symbol, sig, free)
+                        risk.clear_hwm(symbol)
             except Exception as exc:  # noqa: BLE001
                 self.state.last_error = f"{symbol}: {exc}"
                 log.warning("execute failed %s: %s", symbol, exc)
 
-    def _on_cooldown(self, symbol: str, now: datetime) -> bool:
+    def _on_cooldown(self, symbol: str, now: datetime, cooldown: timedelta) -> bool:
         ts = self.state.cooldowns.get(symbol)
         if not ts:
             return False
         last = _parse_dt(ts)
         if not last:
             return False
-        return (now - last) < timedelta(minutes=_COOLDOWN_MIN)
+        return (now - last) < cooldown
+
+    async def _atr_pct(self, symbol: str) -> Optional[float]:
+        """Best-effort ATR% from cached daily OHLCV. None on any failure."""
+        try:
+            from app.config import Timeframe
+            from app.data import OHLCVRepository
+            from app.ta import add_indicators
+            df = await OHLCVRepository().get(symbol, Timeframe.D1, refresh=False)
+            df = add_indicators(df).dropna()
+            if df.empty:
+                return None
+            last = df.iloc[-1]
+            close = float(last["close"])
+            atr = float(last["atr_14"])
+            return (atr / close) if close > 0 else None
+        except Exception as exc:  # noqa: BLE001
+            log.debug("atr_pct fetch failed for %s: %s", symbol, exc)
+            return None
 
     async def _price(self, symbol: str) -> Decimal:
         if self.state.mode == "paper":

@@ -249,6 +249,38 @@ class Storage:
             out.append(d)
         return out
 
+    def agent_win_rates(self, min_trades: int = 5) -> dict[str, float]:
+        """Return {agent: win_rate} for agents with >= min_trades closed trades.
+
+        Used by the SignalAggregator to scale each agent's vote by its rolling
+        track record. Agents with too few trades return no entry (caller falls
+        back to baseline weight).
+        """
+        with self._lock, self._conn() as c:
+            rows = c.execute(
+                "SELECT agent, wins, losses FROM agent_stats"
+            ).fetchall()
+        out: dict[str, float] = {}
+        for r in rows:
+            n = (r["wins"] or 0) + (r["losses"] or 0)
+            if n >= min_trades:
+                out[r["agent"]] = (r["wins"] or 0) / n
+        return out
+
+    def total_realized_pnl(self, mode: Optional[str] = None) -> float:
+        """Sum of pnl from closed_trades. Used for drawdown calc."""
+        with self._lock, self._conn() as c:
+            if mode:
+                row = c.execute(
+                    "SELECT COALESCE(SUM(pnl), 0) AS s FROM closed_trades WHERE mode=?",
+                    (mode,),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT COALESCE(SUM(pnl), 0) AS s FROM closed_trades"
+                ).fetchone()
+        return float(row["s"]) if row else 0.0
+
     def closed_trades(self, limit: int = 100) -> list[dict]:
         with self._lock, self._conn() as c:
             rows = c.execute(
