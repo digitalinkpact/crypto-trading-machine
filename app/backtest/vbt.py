@@ -17,15 +17,23 @@ def run_vectorbt_backtest(
     exits: pd.Series,
     init_cash: float = 10_000.0,
     fees: float = 0.001,
+    sl_stop: float | None = None,
+    tp_stop: float | None = None,
+    freq: str | None = None,
 ) -> dict[str, Any]:
-    pf = vbt.Portfolio.from_signals(
-        close=df["close"],
-        entries=entries,
-        exits=exits,
-        init_cash=init_cash,
-        fees=fees,
-        freq=pd.infer_freq(df.index) or "1H",
-    )
+    kwargs: dict[str, Any] = {
+        "close": df["close"],
+        "entries": entries,
+        "exits": exits,
+        "init_cash": init_cash,
+        "fees": fees,
+        "freq": freq or pd.infer_freq(df.index) or "1H",
+    }
+    if sl_stop is not None:
+        kwargs["sl_stop"] = sl_stop
+    if tp_stop is not None:
+        kwargs["tp_stop"] = tp_stop
+    pf = vbt.Portfolio.from_signals(**kwargs)
     stats = pf.stats()
     return {
         "total_return": float(stats.get("Total Return [%]", 0.0)) / 100.0,

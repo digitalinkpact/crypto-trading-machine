@@ -50,3 +50,39 @@ def credentials_present() -> bool:
         s.binance_api_key.get_secret_value()
         and s.binance_api_secret.get_secret_value()
     )
+
+
+# ── Tunable risk knobs (written to .env so they survive restarts) ──────────
+
+
+_RISK_KEYS = {
+    "stop_loss_pct":                  ("STOP_LOSS_PCT",                  float, (0.005, 0.20)),
+    "take_profit_pct":                ("TAKE_PROFIT_PCT",                float, (0.005, 0.50)),
+    "trailing_stop_pct":              ("TRAILING_STOP_PCT",              float, (0.005, 0.20)),
+    "max_hold_hours":                 ("MAX_HOLD_HOURS",                 int,   (1, 10000)),
+    "drawdown_circuit_breaker_pct":   ("DRAWDOWN_CIRCUIT_BREAKER_PCT",   float, (0.01, 0.50)),
+    "min_signal_confidence":          ("MIN_SIGNAL_CONFIDENCE",          float, (0.0, 1.0)),
+    "max_position_pct":               ("MAX_POSITION_PCT",               float, (0.005, 1.0)),
+    "max_open_positions":             ("MAX_OPEN_POSITIONS",             int,   (1, 25)),
+}
+
+
+def save_risk_settings(values: dict[str, str]) -> dict[str, float | int]:
+    """Validate & persist a subset of risk knobs. Returns the parsed values."""
+    parsed: dict[str, float | int] = {}
+    env_updates: dict[str, str] = {}
+    for field_name, (env_key, caster, (lo, hi)) in _RISK_KEYS.items():
+        raw = values.get(field_name)
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            v = caster(str(raw).strip())
+        except ValueError as exc:
+            raise ValueError(f"{field_name}: {exc}") from exc
+        if not (lo <= v <= hi):
+            raise ValueError(f"{field_name} must be between {lo} and {hi}")
+        parsed[field_name] = v
+        env_updates[env_key] = str(v)
+    if env_updates:
+        _write_env(env_updates)
+    return parsed

@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     env: str = "dev"
     log_level: str = "INFO"
 
+    # Optional dashboard/API guard. If either value is blank, auth is disabled.
+    app_basic_auth_user: str = ""
+    app_basic_auth_password: SecretStr = SecretStr("")
+
     # Safety toggles — default to safe values
     dry_run: bool = True
     paper_trading: bool = True
@@ -115,6 +119,12 @@ class Settings(BaseSettings):
     # Adaptive: scale each agent's weight by its rolling win-rate.
     # weight *= clamp(0.5 + win_rate, 0.5, 1.5). Disable for pure deterministic mode.
     adaptive_agent_weights: bool = True
+
+    # ML learning loop (signal outcome labeling + retraining)
+    ml_learning_enabled: bool = True
+    ml_signal_horizon_minutes: int = Field(240, ge=15, le=10_080)  # default 4h
+    ml_min_training_samples: int = Field(200, ge=20, le=1_000_000)
+    ml_min_new_labels: int = Field(50, ge=10, le=1_000_000)
 
     # Storage
     data_cache_dir: Path = Path("./data/cache")

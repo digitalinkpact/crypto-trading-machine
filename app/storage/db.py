@@ -6,6 +6,7 @@ file lives under `data/trading.db` next to the OHLCV cache.
 from __future__ import annotations
 
 import json
+import pickle
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -71,10 +72,50 @@ CREATE TABLE IF NOT EXISTS agent_stats (
     last_updated TEXT
 );
 
+CREATE TABLE IF NOT EXISTS ml_signal_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    action TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    entry_price REAL NOT NULL,
+    atr_pct REAL,
+    rsi_14 REAL,
+    ema_gap_pct REAL,
+    agent_count INTEGER NOT NULL DEFAULT 0,
+    resolved INTEGER NOT NULL DEFAULT 0,
+    resolved_ts TEXT,
+    horizon_minutes INTEGER,
+    outcome_return_pct REAL,
+    outcome_win INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_ml_signal_events_pending ON ml_signal_events(resolved, ts);
+
+CREATE TABLE IF NOT EXISTS ml_models (
+    name TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    trained_at TEXT NOT NULL,
+    algorithm TEXT NOT NULL,
+    metrics TEXT NOT NULL,
+    payload BLOB NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS paper_balances (
     asset TEXT PRIMARY KEY,
     qty REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS equity_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    total_usdt REAL NOT NULL,
+    cash_usdt REAL NOT NULL,
+    invested_usdt REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_equity_ts ON equity_snapshots(ts);
 """
 
 
@@ -324,6 +365,197 @@ class Storage:
             c.execute("DELETE FROM paper_balances")
             c.execute("INSERT INTO paper_balances(asset,qty) VALUES('USDT', ?)",
                       (starting_usdt,))
+
+    # ── Equity snapshots (for the equity curve) ───────────────────
+    def record_equity_snapshot(
+        self,
+        *,
+        mode: str,
+        total_usdt: float,
+        cash_usdt: float,
+        invested_usdt: float,
+    ) -> None:
+        with self._lock, self._conn() as c:
+            c.execute(
+                "INSERT INTO equity_snapshots(ts,mode,total_usdt,cash_usdt,invested_usdt) "
+                "VALUES(?,?,?,?,?)",
+                (_now(), mode, total_usdt, cash_usdt, invested_usdt),
+            )
+
+    def equity_curve(self, limit: int = 90) -> list[dict]:
+        """Most recent N equity snapshots (oldest → newest)."""
+        with self._lock, self._conn() as c:
+            rows = c.execute(
+                "SELECT ts, total_usdt, cash_usdt, invested_usdt, mode "
+                "FROM equity_snapshots ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    # ── Risk events (stop-loss / take-profit / trailing / max-hold exits) ───
+    def recent_risk_events(self, limit: int = 25) -> list[dict]:
+        """Closed trades where any contributing agent label starts with 'risk:'."""
+        with self._lock, self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM closed_trades "
+                "WHERE agents LIKE '%\"risk:%' "
+                "ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            try:
+                agents = json.loads(d["agents"] or "[]")
+            except json.JSONDecodeError:
+                agents = []
+            reason = next(
+                (a.split(":", 1)[1] for a in agents if a.startswith("risk:")),
+                "unknown",
+            )
+            d["reason"] = reason
+            out.append(d)
+        return out
+
+    # ── ML signal events / model artifacts ───────────────────────────────
+    def record_signal_event(
+        self,
+        *,
+        mode: str,
+        symbol: str,
+        timeframe: str,
+        action: str,
+        confidence: float,
+        entry_price: Decimal | float,
+        atr_pct: Optional[float] = None,
+        rsi_14: Optional[float] = None,
+        ema_gap_pct: Optional[float] = None,
+        agent_count: int = 0,
+    ) -> int:
+        """Persist one directional signal for later outcome labeling."""
+        with self._lock, self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO ml_signal_events("
+                "ts,mode,symbol,timeframe,action,confidence,entry_price,"
+                "atr_pct,rsi_14,ema_gap_pct,agent_count"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    _now(),
+                    mode,
+                    symbol,
+                    timeframe,
+                    action,
+                    float(confidence),
+                    _f(entry_price),
+                    None if atr_pct is None else float(atr_pct),
+                    None if rsi_14 is None else float(rsi_14),
+                    None if ema_gap_pct is None else float(ema_gap_pct),
+                    int(agent_count),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def pending_signal_events(self, *, older_than_iso: str, limit: int = 500) -> list[dict]:
+        """Unresolved signal events older than a cutoff timestamp."""
+        with self._lock, self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM ml_signal_events "
+                "WHERE resolved=0 AND ts <= ? "
+                "ORDER BY id ASC LIMIT ?",
+                (older_than_iso, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def resolve_signal_event(
+        self,
+        *,
+        event_id: int,
+        horizon_minutes: int,
+        outcome_return_pct: float,
+        outcome_win: bool,
+    ) -> None:
+        with self._lock, self._conn() as c:
+            c.execute(
+                "UPDATE ml_signal_events SET "
+                "resolved=1, resolved_ts=?, horizon_minutes=?, "
+                "outcome_return_pct=?, outcome_win=? "
+                "WHERE id=?",
+                (_now(), int(horizon_minutes), float(outcome_return_pct), 1 if outcome_win else 0, event_id),
+            )
+
+    def count_resolved_signal_events(self) -> int:
+        with self._lock, self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM ml_signal_events WHERE resolved=1"
+            ).fetchone()
+        return int(row["n"] if row else 0)
+
+    def training_signal_rows(self, limit: int = 50_000) -> list[dict]:
+        """Rows suitable for supervised training (resolved BUY/SELL only)."""
+        with self._lock, self._conn() as c:
+            rows = c.execute(
+                "SELECT id, mode, symbol, timeframe, action, confidence, entry_price, "
+                "atr_pct, rsi_14, ema_gap_pct, agent_count, outcome_return_pct, outcome_win "
+                "FROM ml_signal_events "
+                "WHERE resolved=1 AND action IN ('BUY','SELL') AND outcome_win IS NOT NULL "
+                "ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    def latest_model_version(self, name: str) -> int:
+        with self._lock, self._conn() as c:
+            row = c.execute("SELECT version FROM ml_models WHERE name=?", (name,)).fetchone()
+        return int(row["version"] if row else 0)
+
+    def save_model_artifact(
+        self,
+        *,
+        name: str,
+        algorithm: str,
+        metrics: dict[str, Any],
+        model: Any,
+    ) -> int:
+        version = self.latest_model_version(name) + 1
+        payload = pickle.dumps(model)
+        metrics_json = json.dumps(metrics, default=float)
+        with self._lock, self._conn() as c:
+            c.execute(
+                "INSERT INTO ml_models(name,version,trained_at,algorithm,metrics,payload) "
+                "VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(name) DO UPDATE SET "
+                "version=excluded.version, trained_at=excluded.trained_at, "
+                "algorithm=excluded.algorithm, metrics=excluded.metrics, payload=excluded.payload",
+                (name, version, _now(), algorithm, metrics_json, payload),
+            )
+        return version
+
+    def load_model_artifact(self, name: str) -> Optional[dict]:
+        with self._lock, self._conn() as c:
+            row = c.execute(
+                "SELECT name, version, trained_at, algorithm, metrics, payload "
+                "FROM ml_models WHERE name=?",
+                (name,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            model = pickle.loads(row["payload"])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("failed to load model artifact %s: %s", name, exc)
+            return None
+        try:
+            metrics = json.loads(row["metrics"])
+        except json.JSONDecodeError:
+            metrics = {}
+        return {
+            "name": row["name"],
+            "version": int(row["version"]),
+            "trained_at": row["trained_at"],
+            "algorithm": row["algorithm"],
+            "metrics": metrics,
+            "model": model,
+        }
 
 
 storage = Storage()

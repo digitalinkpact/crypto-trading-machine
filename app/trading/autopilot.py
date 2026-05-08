@@ -20,7 +20,7 @@ from decimal import Decimal
 from typing import Optional
 
 from app.agents import run_all_agents
-from app.config import get_settings
+from app.config import Timeframe, get_settings
 from app.exchange import BinanceUSClient, Order, OrderSide, OrderType
 from app.exchange.filters import filters
 from app.logging_setup import get_logger
@@ -269,6 +269,9 @@ class Autopilot:
             if not filters.is_listed(symbol):
                 continue
             try:
+                if sig.action in (SignalAction.BUY, SignalAction.SELL):
+                    await self._record_signal_event(symbol, sig)
+
                 if sig.action == SignalAction.BUY:
                     if not allow_buys:
                         continue
@@ -310,6 +313,29 @@ class Autopilot:
                 self.state.last_error = f"{symbol}: {exc}"
                 log.warning("execute failed %s: %s", symbol, exc)
 
+    async def _record_signal_event(self, symbol: str, sig) -> None:
+        """Best-effort feature snapshot used by the offline trainer."""
+        s = get_settings()
+        if not s.ml_learning_enabled:
+            return
+        try:
+            price = await self._price(symbol)
+            atr_pct, rsi_14, ema_gap_pct = await self._feature_snapshot(symbol)
+            storage.record_signal_event(
+                mode=self.state.mode,
+                symbol=symbol,
+                timeframe=getattr(sig.timeframe, "value", Timeframe.D1.value),
+                action=sig.action.value,
+                confidence=float(sig.confidence),
+                entry_price=price,
+                atr_pct=atr_pct,
+                rsi_14=rsi_14,
+                ema_gap_pct=ema_gap_pct,
+                agent_count=len(getattr(sig, "contributing_agents", ()) or ()),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("signal event capture failed %s: %s", symbol, exc)
+
     def _on_cooldown(self, symbol: str, now: datetime, cooldown: timedelta) -> bool:
         ts = self.state.cooldowns.get(symbol)
         if not ts:
@@ -336,6 +362,28 @@ class Autopilot:
         except Exception as exc:  # noqa: BLE001
             log.debug("atr_pct fetch failed for %s: %s", symbol, exc)
             return None
+
+    async def _feature_snapshot(self, symbol: str) -> tuple[Optional[float], Optional[float], Optional[float]]:
+        """Daily feature slice aligned with the signal timestamp."""
+        try:
+            from app.data import OHLCVRepository
+            from app.ta import add_indicators
+
+            df = await OHLCVRepository().get(symbol, Timeframe.D1, refresh=False)
+            df = add_indicators(df).dropna()
+            if df.empty:
+                return None, None, None
+            last = df.iloc[-1]
+            close = float(last["close"])
+            atr = float(last["atr_14"])
+            ema20 = float(last["ema_20"])
+            ema50 = float(last["ema_50"])
+            atr_pct = (atr / close) if close > 0 else None
+            ema_gap_pct = ((ema20 - ema50) / close) if close > 0 else None
+            return atr_pct, float(last["rsi_14"]), ema_gap_pct
+        except Exception as exc:  # noqa: BLE001
+            log.debug("feature snapshot failed for %s: %s", symbol, exc)
+            return None, None, None
 
     async def _price(self, symbol: str) -> Decimal:
         if self.state.mode == "paper":

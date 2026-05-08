@@ -8,6 +8,7 @@ from app.config import SYMBOLS, TIMEFRAMES, get_settings
 from app.credentials import (
     credentials_present,
     save_binance_credentials,
+    save_risk_settings,
     save_trading_mode,
 )
 from app.storage import storage
@@ -195,6 +196,68 @@ async def dashboard() -> str:
             "to start building a track record.</div></div>"
         )
 
+    # ── Risk events card ─────────────────────────────────────────────
+    risk_events = storage.recent_risk_events(limit=10)
+    if risk_events:
+        rows = "".join(
+            f"<tr><td>{e['exit_ts'][:16].replace('T',' ')}</td>"
+            f"<td>{e['symbol']}</td>"
+            f"<td><span class='pill'>{e['reason']}</span></td>"
+            f"<td class='num {'win' if e['pnl']>=0 else 'loss'}'>"
+            f"${float(e['pnl']):,.2f} ({float(e['pnl_pct']):+.2f}%)</td></tr>"
+            for e in risk_events
+        )
+        risk_card = f"""
+<div class='card'>
+  <h2>Risk gate exits</h2>
+  <div class='muted'>Forced exits from stop-loss, take-profit, trailing stop, or max-hold. These prove the safety rails are firing.</div>
+  <table style='margin-top:0.75rem;'>
+    <thead><tr><th>Time</th><th>Symbol</th><th>Reason</th><th class='num'>P&amp;L</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</div>
+        """
+    else:
+        risk_card = (
+            "<div class='card'><h2>Risk gate exits</h2>"
+            "<div class='muted'>No risk-gate exits yet. They appear here when "
+            "stop-loss, take-profit, trailing-stop, or max-hold force a position out.</div></div>"
+        )
+
+    # ── Equity curve card (last 30 snapshots, ascii sparkline) ───────
+    curve = storage.equity_curve(limit=30)
+    if len(curve) >= 2:
+        values = [c["total_usdt"] for c in curve]
+        lo, hi = min(values), max(values)
+        spark_chars = "▁▂▃▄▅▆▇█"
+        if hi > lo:
+            sparks = "".join(
+                spark_chars[min(7, int((v - lo) / (hi - lo) * 7))]
+                for v in values
+            )
+        else:
+            sparks = spark_chars[3] * len(values)
+        first, last = values[0], values[-1]
+        delta = last - first
+        delta_pct = (delta / first * 100) if first else 0
+        delta_color = "#5be29a" if delta >= 0 else "#ff7a8a"
+        delta_sign = "+" if delta >= 0 else ""
+        equity_card = f"""
+<div class='card'>
+  <h2>Equity curve <span class='muted' style='font-weight:400;'>(last {len(values)} snapshots)</span></h2>
+  <div style='font-size:1.5rem; letter-spacing:1px; color:#7aa6ff; padding:0.5rem 0;'>{sparks}</div>
+  <div class='row'><span>Range</span><b>${lo:,.2f} &mdash; ${hi:,.2f}</b></div>
+  <div class='row'><span>Change over period</span>
+    <b style='color:{delta_color};'>{delta_sign}${delta:,.2f} ({delta_sign}{delta_pct:.2f}%)</b>
+  </div>
+</div>
+        """
+    else:
+        equity_card = (
+            "<div class='card'><h2>Equity curve</h2>"
+            "<div class='muted'>Snapshots are recorded hourly. Curve will appear once a few are collected.</div></div>"
+        )
+
     last_tick = st.last_tick_at.strftime("%Y-%m-%d %H:%M UTC") if st.last_tick_at else "&mdash;"
     started = st.started_at.strftime("%Y-%m-%d %H:%M UTC") if st.started_at else "&mdash;"
     last_err = (
@@ -226,7 +289,9 @@ async def dashboard() -> str:
   </form>
 </div>
 {balance_card}
+{equity_card}
 {agent_card}
+{risk_card}
 <div class='card'>
   <h2>Universe</h2>
   <div class='muted'>{len(SYMBOLS)} symbols &middot; {len(TIMEFRAMES)} timeframes
@@ -295,17 +360,53 @@ async def trades_page() -> str:
 
 
 @router.get("/settings", response_class=HTMLResponse, include_in_schema=False)
-async def settings_page(saved: int = 0, mode_saved: int = 0) -> str:
+async def settings_page(saved: int = 0, mode_saved: int = 0, risk_saved: int = 0) -> str:
     s = get_settings()
     creds = credentials_present()
     saved_banner = "<div class='banner ok'>API keys saved.</div>" if saved else ""
     if mode_saved:
         saved_banner += "<div class='banner ok'>Trading mode updated.</div>"
+    if risk_saved:
+        saved_banner += "<div class='banner ok'>Risk settings saved &mdash; restart not required.</div>"
     status = "API keys are set." if creds else "No API keys saved yet."
 
     is_paper = s.paper_trading
     paper_checked = "checked" if is_paper else ""
     live_checked = "" if is_paper else "checked"
+
+    risk_form = f"""
+<div class='card'>
+  <h2>Risk gates</h2>
+  <div class='muted'>Hard rules evaluated every tick. Tighten on losing streaks; loosen if you're being chopped out too quickly.</div>
+  <form method='post' action='/settings/risk'>
+    <label>Stop-loss % (decimal, e.g. 0.02 = 2%)
+      <input type='text' name='stop_loss_pct' value='{s.stop_loss_pct}' />
+    </label>
+    <label>Take-profit %
+      <input type='text' name='take_profit_pct' value='{s.take_profit_pct}' />
+    </label>
+    <label>Trailing-stop % (from peak after position is up half the take-profit)
+      <input type='text' name='trailing_stop_pct' value='{s.trailing_stop_pct}' />
+    </label>
+    <label>Max hold (hours)
+      <input type='text' name='max_hold_hours' value='{s.max_hold_hours}' />
+    </label>
+    <label>Drawdown circuit breaker % (halt new BUYs when total P&amp;L below this)
+      <input type='text' name='drawdown_circuit_breaker_pct' value='{s.drawdown_circuit_breaker_pct}' />
+    </label>
+    <label>Min signal confidence (0&ndash;1)
+      <input type='text' name='min_signal_confidence' value='{s.min_signal_confidence}' />
+    </label>
+    <label>Max position % per trade
+      <input type='text' name='max_position_pct' value='{s.max_position_pct}' />
+    </label>
+    <label>Max concurrent open positions
+      <input type='text' name='max_open_positions' value='{s.max_open_positions}' />
+    </label>
+    <button class='btn btn-mode' style='margin-top:1rem;'>Save risk settings</button>
+  </form>
+</div>
+"""
 
     body = f"""
 {saved_banner}
@@ -328,6 +429,7 @@ async def settings_page(saved: int = 0, mode_saved: int = 0) -> str:
     >Save mode</button>
   </form>
 </div>
+{risk_form}
 <div class='card'>
   <h2>Binance.US API credentials</h2>
   <div class='muted'>{status} Keys are written to .env (gitignored)
@@ -365,6 +467,33 @@ async def save_mode(mode: str = Form(...)):
     save_trading_mode(paper=(mode == "paper"))
     autopilot.state.mode = mode
     return RedirectResponse(url="/settings?mode_saved=1", status_code=303)
+
+
+@router.post("/settings/risk", include_in_schema=False)
+async def save_risk(
+    stop_loss_pct: str = Form(""),
+    take_profit_pct: str = Form(""),
+    trailing_stop_pct: str = Form(""),
+    max_hold_hours: str = Form(""),
+    drawdown_circuit_breaker_pct: str = Form(""),
+    min_signal_confidence: str = Form(""),
+    max_position_pct: str = Form(""),
+    max_open_positions: str = Form(""),
+):
+    try:
+        save_risk_settings({
+            "stop_loss_pct": stop_loss_pct,
+            "take_profit_pct": take_profit_pct,
+            "trailing_stop_pct": trailing_stop_pct,
+            "max_hold_hours": max_hold_hours,
+            "drawdown_circuit_breaker_pct": drawdown_circuit_breaker_pct,
+            "min_signal_confidence": min_signal_confidence,
+            "max_position_pct": max_position_pct,
+            "max_open_positions": max_open_positions,
+        })
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse(url="/settings?risk_saved=1", status_code=303)
 
 
 @router.post("/autopilot/start", include_in_schema=False)
