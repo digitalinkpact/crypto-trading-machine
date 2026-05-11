@@ -83,7 +83,7 @@ class PaperExchange:
         price = await self._live.ticker_price(symbol)
         notional = quantity * price
         fee = notional * PAPER_FEE_RATE
-        base = symbol.replace("USDT", "")
+        base = symbol.removesuffix("USDT")
 
         if side is OrderSide.BUY:
             usdt_needed = notional + fee

@@ -304,7 +304,7 @@ class Autopilot:
                         long_exposure_pct + float(per_trade_usdt / total_eq) if total_eq > 0 else 0,
                     )
                 elif sig.action == SignalAction.SELL:
-                    base = symbol.replace("USDT", "")
+                    base = symbol.removesuffix("USDT")
                     free = balances.get(base, Decimal("0"))
                     if free > 0:
                         await self._place_sell(symbol, sig, free)

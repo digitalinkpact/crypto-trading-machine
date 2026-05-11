@@ -139,8 +139,9 @@ class BinanceUSClient:
     async def liquidate_all(self, quote: str = "USDT") -> list[Order]:
         """Market-sell every non-quote balance into `quote`.
 
-        Used by the Autopilot Stop button. Bypasses the dry_run / paper_trading
-        gate intentionally — the user has explicitly asked to flatten.
+        Used by the Autopilot Stop button. Honors `dry_run` — if dry_run is on,
+        this is a no-op that just logs what *would* happen. The user has to
+        turn dry_run off explicitly to actually liquidate live.
         """
         account = await asyncio.to_thread(self._spot.account)
         results: list[Order] = []
@@ -151,6 +152,23 @@ class BinanceUSClient:
                 continue
             symbol = f"{asset}{quote}"
             coid = _new_client_order_id("liq")
+            if self._settings.dry_run:
+                log.warning(
+                    "[DRY-RUN] liquidate %s qty=%s coid=%s",
+                    symbol, free, coid,
+                )
+                results.append(
+                    Order(
+                        symbol=symbol,
+                        side=OrderSide.SELL,
+                        type=OrderType.MARKET,
+                        quantity=free,
+                        client_order_id=coid,
+                        status=OrderStatus.DRY_RUN,
+                        submitted_at=datetime.now(timezone.utc),
+                    )
+                )
+                continue
             params = {
                 "symbol": symbol,
                 "side": OrderSide.SELL.value,

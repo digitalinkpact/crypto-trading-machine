@@ -28,6 +28,8 @@ def _provider_config() -> tuple[str, str, str, Optional[str]]:
         return p, s.groq_base_url, s.groq_model, s.groq_api_key.get_secret_value() or None
     if p == "gemini":
         return p, s.gemini_base_url, s.gemini_model, s.gemini_api_key.get_secret_value() or None
+    if p == "github":
+        return p, s.github_base_url, s.github_model, s.github_token.get_secret_value() or None
     if p == "openai":
         return p, "https://api.openai.com/v1", s.openai_model, s.openai_api_key.get_secret_value() or None
     return "none", "", "", None

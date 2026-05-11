@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr = SecretStr("")
     openai_model: str = "gpt-4o-mini"
 
-    # LLM provider — "deepseek" | "openai" | "groq" | "gemini" | "none"
+    # LLM provider — "deepseek" | "openai" | "groq" | "gemini" | "github" | "none"
     llm_provider: str = "deepseek"
     deepseek_api_key: SecretStr = SecretStr("")
     deepseek_base_url: str = "https://api.deepseek.com"
@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     gemini_api_key: SecretStr = SecretStr("")
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
     gemini_model: str = "gemini-2.0-flash"
+    # GitHub Models — free tier (rate-limited). PAT with `models:read` scope.
+    # Endpoint is OpenAI-compatible. Catalog: https://github.com/marketplace/models
+    github_token: SecretStr = SecretStr("")
+    github_base_url: str = "https://models.github.ai/inference"
+    github_model: str = "openai/gpt-4o"
 
     # Runtime
     env: str = "dev"
