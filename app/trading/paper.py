@@ -10,13 +10,16 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
+from app.config import get_settings
 from app.exchange import BinanceUSClient, Order, OrderSide, OrderStatus, OrderType
 from app.logging_setup import get_logger
 from app.storage import storage
 
 log = get_logger(__name__)
 
-PAPER_FEE_RATE = Decimal("0.001")  # 0.1% per side, conservative
+# Paper market orders pay the Binance.US taker fee (configured in app.config).
+# Kept as a module fallback for callers that import it directly.
+PAPER_FEE_RATE = Decimal(str(get_settings().binance_taker_fee))
 DEFAULT_PAPER_USDT = Decimal("10000")
 
 
@@ -82,7 +85,8 @@ class PaperExchange:
         """Simulate a market order using the current live ticker price."""
         price = await self._live.ticker_price(symbol)
         notional = quantity * price
-        fee = notional * PAPER_FEE_RATE
+        fee_rate = Decimal(str(get_settings().binance_taker_fee))
+        fee = notional * fee_rate
         base = symbol.removesuffix("USDT")
 
         if side is OrderSide.BUY:
@@ -103,7 +107,7 @@ class PaperExchange:
             qty = min(quantity, base_have)
             if qty <= 0:
                 raise RuntimeError(f"no {base} to sell in paper account")
-            proceeds = qty * price - (qty * price * PAPER_FEE_RATE)
+            proceeds = qty * price - (qty * price * fee_rate)
             storage.paper_balance_add(base, -qty)
             storage.paper_balance_add("USDT", proceeds)
             storage.close_position(symbol=symbol, exit_price=price)

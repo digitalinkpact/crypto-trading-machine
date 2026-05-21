@@ -79,9 +79,38 @@ class Settings(BaseSettings):
     env: str = "dev"
     log_level: str = "INFO"
 
-    # Optional dashboard/API guard. If either value is blank, auth is disabled.
-    app_basic_auth_user: str = ""
-    app_basic_auth_password: SecretStr = SecretStr("")
+    # ── Auth / sessions / email ──────────────────────────────────────
+    # Public base URL used inside emailed links (verify + reset).
+    # Example: https://bot.example.com
+    base_url: str = "http://localhost:8000"
+    # Long random string. Required in production; if empty, a volatile
+    # per-process value is generated (sessions die on every restart).
+    session_secret: SecretStr = SecretStr("")
+    # Cookie lifetime when user ticks "remember me" (days).
+    auth_remember_days: int = Field(30, ge=1, le=365)
+    # Default cookie lifetime (hours) when "remember me" is unchecked.
+    auth_session_hours: int = Field(12, ge=1, le=720)
+    # Lockout after N consecutive failures, for M minutes.
+    auth_max_failed: int = Field(5, ge=1, le=50)
+    auth_lockout_minutes: int = Field(15, ge=1, le=1440)
+    # Verify/reset token validity (minutes).
+    auth_token_minutes: int = Field(60, ge=5, le=1440)
+    # IPs (comma-separated, exact match) that bypass the login wall.
+    # Useful for a private LAN, a jump host, or your own static IP.
+    # Empty = no bypass. Supports IPv4 only for simplicity.
+    auth_ip_allowlist: str = ""
+    # Force HTTPS-only cookies + redirect HTTP→HTTPS. Enable when
+    # behind a reverse proxy that terminates TLS (nginx/caddy/cloudflare).
+    force_https: bool = False
+
+    # SMTP — used for email verification + password resets.
+    # Gmail example: smtp.gmail.com / 587 / starttls=true / app password.
+    smtp_host: str = ""
+    smtp_port: int = Field(587, ge=1, le=65535)
+    smtp_user: str = ""
+    smtp_password: SecretStr = SecretStr("")
+    smtp_from: str = ""        # e.g. "Crypto Bot <bot@example.com>"
+    smtp_starttls: bool = True
 
     # Safety toggles — default to safe values
     dry_run: bool = True
@@ -137,6 +166,12 @@ class Settings(BaseSettings):
     # Binance.US REST endpoint — never point this at binance.com
     binance_base_url: str = "https://api.binance.us"
     binance_ws_url: str = "wss://stream.binance.us:9443"
+
+    # Binance.US spot trading fees (tier 0 defaults).
+    # See https://www.binance.us/fees — adjust via .env if your tier differs.
+    # Market orders pay taker; limit orders that rest on the book pay maker.
+    binance_maker_fee: float = Field(0.0040, ge=0.0, le=0.01)
+    binance_taker_fee: float = Field(0.0040, ge=0.0, le=0.01)
 
 
 @lru_cache(maxsize=1)

@@ -10,17 +10,22 @@ from typing import Any
 import pandas as pd
 import vectorbt as vbt  # type: ignore[import-untyped]
 
+from app.config import get_settings
+
 
 def run_vectorbt_backtest(
     df: pd.DataFrame,
     entries: pd.Series,
     exits: pd.Series,
     init_cash: float = 10_000.0,
-    fees: float = 0.001,
+    fees: float | None = None,
     sl_stop: float | None = None,
     tp_stop: float | None = None,
     freq: str | None = None,
 ) -> dict[str, Any]:
+    if fees is None:
+        # Market entries/exits — charge taker on both sides.
+        fees = get_settings().binance_taker_fee
     kwargs: dict[str, Any] = {
         "close": df["close"],
         "entries": entries,

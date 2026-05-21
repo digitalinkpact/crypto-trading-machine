@@ -80,7 +80,7 @@ async def _run_one(
         entries=entries,
         exits=exits,
         init_cash=10_000.0,
-        fees=0.001,
+        fees=settings.binance_taker_fee,
         sl_stop=settings.stop_loss_pct,
         tp_stop=settings.take_profit_pct,
     )

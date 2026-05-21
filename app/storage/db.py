@@ -116,6 +116,48 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
     invested_usdt REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_equity_ts ON equity_snapshots(ts);
+
+-- ── Auth: single-owner login, sessions, tokens, audit log ───────────
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    email_verified INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    last_login_at TEXT,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until TEXT
+);
+
+CREATE TABLE IF NOT EXISTS auth_tokens (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    purpose TEXT NOT NULL,            -- 'verify' | 'reset'
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_auth_tokens_user ON auth_tokens(user_id, purpose);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    ip TEXT,
+    user_agent TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    user_id INTEGER,
+    ip TEXT,
+    action TEXT NOT NULL,
+    detail TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts);
 """
 
 
@@ -556,6 +598,180 @@ class Storage:
             "metrics": metrics,
             "model": model,
         }
+
+    # ── Auth: users ──────────────────────────────────────────────────
+    def user_count(self) -> int:
+        with self._lock, self._conn() as c:
+            row = c.execute("SELECT COUNT(*) AS n FROM users").fetchone()
+        return int(row["n"] if row else 0)
+
+    def create_user(self, *, email: str, password_hash: str) -> int:
+        with self._lock, self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO users(email,password_hash,email_verified,created_at) "
+                "VALUES(?,?,?,?)",
+                (email.lower(), password_hash, 0, _now()),
+            )
+            return int(cur.lastrowid or 0)
+
+    def get_user_by_email(self, email: str) -> Optional[dict]:
+        with self._lock, self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM users WHERE email=? COLLATE NOCASE", (email.lower(),)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_user(self, user_id: int) -> Optional[dict]:
+        with self._lock, self._conn() as c:
+            row = c.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def update_user_password(self, user_id: int, password_hash: str) -> None:
+        with self._lock, self._conn() as c:
+            c.execute(
+                "UPDATE users SET password_hash=?, failed_attempts=0, locked_until=NULL "
+                "WHERE id=?",
+                (password_hash, user_id),
+            )
+
+    def mark_email_verified(self, user_id: int) -> None:
+        with self._lock, self._conn() as c:
+            c.execute("UPDATE users SET email_verified=1 WHERE id=?", (user_id,))
+
+    def record_login_success(self, user_id: int) -> None:
+        with self._lock, self._conn() as c:
+            c.execute(
+                "UPDATE users SET last_login_at=?, failed_attempts=0, locked_until=NULL "
+                "WHERE id=?",
+                (_now(), user_id),
+            )
+
+    def record_login_failure(
+        self, user_id: int, *, max_failed: int, lockout_minutes: int
+    ) -> dict:
+        from datetime import timedelta
+
+        with self._lock, self._conn() as c:
+            row = c.execute(
+                "SELECT failed_attempts FROM users WHERE id=?", (user_id,)
+            ).fetchone()
+            attempts = int((row["failed_attempts"] if row else 0) or 0) + 1
+            locked_until = None
+            if attempts >= max_failed:
+                locked_until = (
+                    datetime.now(timezone.utc) + timedelta(minutes=lockout_minutes)
+                ).isoformat()
+            c.execute(
+                "UPDATE users SET failed_attempts=?, locked_until=? WHERE id=?",
+                (attempts, locked_until, user_id),
+            )
+        return {"attempts": attempts, "locked_until": locked_until}
+
+    # ── Auth: tokens (email verify / password reset) ─────────────────
+    def create_auth_token(
+        self,
+        *,
+        user_id: int,
+        purpose: str,
+        token_hash: str,
+        expires_at: str,
+    ) -> None:
+        with self._lock, self._conn() as c:
+            # Invalidate any prior tokens of the same purpose for this user.
+            c.execute(
+                "DELETE FROM auth_tokens WHERE user_id=? AND purpose=?",
+                (user_id, purpose),
+            )
+            c.execute(
+                "INSERT INTO auth_tokens(token_hash,user_id,purpose,created_at,expires_at,used) "
+                "VALUES(?,?,?,?,?,0)",
+                (token_hash, user_id, purpose, _now(), expires_at),
+            )
+
+    def consume_auth_token(self, *, token_hash: str, purpose: str) -> Optional[int]:
+        """Return user_id if token is valid+unused+unexpired; mark used. Else None."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._conn() as c:
+            row = c.execute(
+                "SELECT user_id, expires_at, used FROM auth_tokens "
+                "WHERE token_hash=? AND purpose=?",
+                (token_hash, purpose),
+            ).fetchone()
+            if not row:
+                return None
+            if int(row["used"]) == 1:
+                return None
+            if row["expires_at"] <= now:
+                return None
+            c.execute(
+                "UPDATE auth_tokens SET used=1 WHERE token_hash=?", (token_hash,)
+            )
+            return int(row["user_id"])
+
+    # ── Auth: sessions ───────────────────────────────────────────────
+    def create_session(
+        self,
+        *,
+        token_hash: str,
+        user_id: int,
+        expires_at: str,
+        ip: Optional[str],
+        user_agent: Optional[str],
+    ) -> None:
+        with self._lock, self._conn() as c:
+            c.execute(
+                "INSERT INTO sessions(token_hash,user_id,created_at,expires_at,ip,user_agent) "
+                "VALUES(?,?,?,?,?,?)",
+                (token_hash, user_id, _now(), expires_at, ip, user_agent),
+            )
+
+    def get_session(self, token_hash: str) -> Optional[dict]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM sessions WHERE token_hash=? AND expires_at > ?",
+                (token_hash, now),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_session(self, token_hash: str) -> None:
+        with self._lock, self._conn() as c:
+            c.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash,))
+
+    def delete_user_sessions(self, user_id: int) -> None:
+        with self._lock, self._conn() as c:
+            c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+
+    def purge_expired_sessions(self) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._conn() as c:
+            c.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
+            c.execute("DELETE FROM auth_tokens WHERE expires_at <= ?", (now,))
+
+    # ── Auth: audit log ──────────────────────────────────────────────
+    def record_audit(
+        self,
+        *,
+        action: str,
+        user_id: Optional[int] = None,
+        ip: Optional[str] = None,
+        detail: Optional[str] = None,
+    ) -> None:
+        with self._lock, self._conn() as c:
+            c.execute(
+                "INSERT INTO audit_log(ts,user_id,ip,action,detail) VALUES(?,?,?,?,?)",
+                (_now(), user_id, ip, action, detail),
+            )
+
+    def recent_audit(self, limit: int = 100) -> list[dict]:
+        with self._lock, self._conn() as c:
+            rows = c.execute(
+                "SELECT a.id, a.ts, a.user_id, a.ip, a.action, a.detail, u.email "
+                "FROM audit_log a LEFT JOIN users u ON u.id=a.user_id "
+                "ORDER BY a.id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
 storage = Storage()

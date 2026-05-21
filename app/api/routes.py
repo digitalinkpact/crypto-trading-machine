@@ -74,9 +74,25 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 def _layout(title: str, body: str, active: str = "home") -> str:
     nav = []
-    for slug, label in (("home", "Dashboard"), ("trades", "Trades"), ("settings", "Settings")):
+    for slug, label in (
+        ("home", "Dashboard"),
+        ("trades", "Trades"),
+        ("settings", "Settings"),
+        ("audit", "Audit"),
+        ("account", "Account"),
+        ("logout", "Sign out"),
+    ):
         cls = "active" if active == slug else ""
-        href = "/" if slug == "home" else f"/{slug}"
+        if slug == "home":
+            href = "/"
+        elif slug == "audit":
+            href = "/auth/audit"
+        elif slug == "account":
+            href = "/auth/password"
+        elif slug == "logout":
+            href = "/auth/logout"
+        else:
+            href = f"/{slug}"
         nav.append(f"<a class='{cls}' href='{href}'>{label}</a>")
     return (
         "<!doctype html><html><head><meta charset='utf-8'/>"
