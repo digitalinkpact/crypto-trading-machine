@@ -181,7 +181,7 @@ class Autopilot:
 
             # 3. Agent signals → execute (skip BUYs if breaker tripped).
             try:
-                signals = await run_all_agents(use_llm=False)
+                signals = await run_all_agents(use_llm=get_settings().llm_in_trading_loop)
             except Exception as exc:  # noqa: BLE001
                 self.state.last_error = f"agent run failed: {exc}"
                 log.exception("autopilot agent run failed")

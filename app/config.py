@@ -74,6 +74,15 @@ class Settings(BaseSettings):
     github_token: SecretStr = SecretStr("")
     github_base_url: str = "https://models.github.ai/inference"
     github_model: str = "openai/gpt-4o"
+    # Optional web context for the LLM reasoner (off by default).
+    # When enabled, the LLM agent fetches a small internet snapshot
+    # (CoinGecko + DuckDuckGo instant answers) and appends it to the prompt.
+    llm_web_enabled: bool = False
+    llm_web_timeout_seconds: float = Field(6.0, ge=1.0, le=30.0)
+    llm_web_cache_ttl_seconds: int = Field(900, ge=60, le=86_400)
+    # When true, the autopilot tick includes the LLM reasoner in the vote.
+    # Default off — LLM is non-deterministic and rate-limited.
+    llm_in_trading_loop: bool = False
 
     # Runtime
     env: str = "dev"

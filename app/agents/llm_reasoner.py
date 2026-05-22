@@ -5,7 +5,9 @@ order-placement code path; it runs in the scheduler tick alongside the others.
 """
 from __future__ import annotations
 
+from app.config import get_settings
 from app.llm import LLMReasoner
+from app.llm.web_context import get_symbol_web_context
 from app.signals import Signal, SignalAction
 
 from .base import AgentContext
@@ -37,6 +39,10 @@ class LLMReasonerAgent:
             f"ema200={float(last['ema_200']):.4f} "
             f"macd_hist={float(last['macd_hist']):.6f} atr14={float(last['atr_14']):.4f}"
         )
+        if get_settings().llm_web_enabled:
+            web_ctx = await get_symbol_web_context(ctx.symbol)
+            if web_ctx:
+                user = f"{user}\nweb_context:\n{web_ctx}"
         out = await self._reasoner.reason(_SYSTEM, user)
         try:
             action = SignalAction(out.get("action", "HOLD"))
