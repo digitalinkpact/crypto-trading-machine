@@ -315,10 +315,14 @@ class Autopilot:
                     atr_pct = await self._atr_pct(symbol)
                     eff_pct = risk.volatility_scaled_pct(s.max_position_pct, atr_pct)
                     per_trade_usdt = usdt_free * Decimal(str(eff_pct))
-                    if per_trade_usdt <= 1:
-                        _bump("insufficient_usdt", symbol,
-                              f"per_trade={per_trade_usdt:.4f} cash={usdt_free:.2f} eff={eff_pct:.4f}")
-                        continue
+                    # Enforce $10 minimum per trade
+                    if per_trade_usdt < 10:
+                        if usdt_free >= 10:
+                            per_trade_usdt = Decimal("10")
+                        else:
+                            _bump("insufficient_usdt", symbol,
+                                  f"per_trade={per_trade_usdt:.4f} cash={usdt_free:.2f} eff={eff_pct:.4f}")
+                            continue
 
                     placed = await self._place_buy(symbol, sig, per_trade_usdt)
                     if not placed:
