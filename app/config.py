@@ -153,7 +153,7 @@ class Settings(BaseSettings):
     # Demote noisy agents, promote regime + trend-follower.
     agent_weight_trend_follower: float = Field(1.2, ge=0.0, le=3.0)
     agent_weight_mean_reversion: float = Field(1.1, ge=0.0, le=3.0)
-    agent_weight_breakout: float = Field(1.0, ge=0.0, le=3.0)
+    agent_weight_breakout: float = Field(0.5, ge=0.0, le=3.0)    # demoted — net negative PnL in paper
     agent_weight_momentum: float = Field(0.5, ge=0.0, le=3.0)    # demoted — too noisy
     agent_weight_volatility: float = Field(0.8, ge=0.0, le=3.0)
     agent_weight_regime_overlay: float = Field(1.5, ge=0.0, le=3.0)  # promoted

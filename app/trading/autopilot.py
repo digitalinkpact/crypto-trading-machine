@@ -14,6 +14,7 @@ Each tick:
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -33,6 +34,8 @@ from app.trading.portfolio import portfolio_snapshot
 log = get_logger(__name__)
 
 _STATE_KEY = "autopilot_state"
+_SKIP_STATS_KEY = "autopilot_skip_stats"
+_LAST_TICK_DEBUG_KEY = "autopilot_last_tick_debug"
 
 
 @dataclass
@@ -237,7 +240,18 @@ class Autopilot:
 
     # ── execution ──────────────────────────────────────────────────────
     async def _execute(self, signals, *, allow_buys: bool = True) -> None:
+        skip_counter: Counter[str] = Counter()
+        tick_debug: dict[str, dict] = {}
+
+        def _bump(reason: str, sym: str = "", detail: str = "") -> None:
+            skip_counter[reason] += 1
+            if sym:
+                tick_debug[sym] = {"reason": reason, "detail": detail}
+
         if not signals:
+            _bump("no_signals")
+            self._persist_skip_stats(skip_counter, tick_debug, total=0)
+            log.info("autopilot tick: no aggregated signals produced")
             return
         s = get_settings()
         try:
@@ -264,9 +278,15 @@ class Autopilot:
         cooldown = timedelta(minutes=s.buy_cooldown_minutes)
 
         for symbol, sig in signals.items():
+            if sig.action == SignalAction.HOLD:
+                _bump("action_hold", symbol, f"conf={sig.confidence:.2f}")
+                continue
             if sig.confidence < s.min_signal_confidence:
+                _bump("low_confidence", symbol,
+                      f"{sig.action.value} conf={sig.confidence:.2f} < {s.min_signal_confidence}")
                 continue
             if not filters.is_listed(symbol):
+                _bump("not_listed", symbol)
                 continue
             try:
                 if sig.action in (SignalAction.BUY, SignalAction.SELL):
@@ -274,16 +294,20 @@ class Autopilot:
 
                 if sig.action == SignalAction.BUY:
                     if not allow_buys:
+                        _bump("breaker_tripped", symbol)
                         continue
                     if symbol in held_symbols:
+                        _bump("already_held", symbol)
                         continue  # don't pyramid into existing position
                     if self._on_cooldown(symbol, now, cooldown):
+                        _bump("cooldown", symbol)
                         continue
                     ok, why = risk.can_open_new_position(
                         open_positions=open_count,
                         long_exposure_pct=long_exposure_pct,
                     )
                     if not ok:
+                        _bump("risk_cap", symbol, why)
                         log.info("skip %s BUY: %s", symbol, why)
                         continue
 
@@ -292,12 +316,18 @@ class Autopilot:
                     eff_pct = risk.volatility_scaled_pct(s.max_position_pct, atr_pct)
                     per_trade_usdt = usdt_free * Decimal(str(eff_pct))
                     if per_trade_usdt <= 1:
+                        _bump("insufficient_usdt", symbol,
+                              f"per_trade={per_trade_usdt:.4f} cash={usdt_free:.2f} eff={eff_pct:.4f}")
                         continue
 
-                    await self._place_buy(symbol, sig, per_trade_usdt)
+                    placed = await self._place_buy(symbol, sig, per_trade_usdt)
+                    if not placed:
+                        _bump("filter_reject_buy", symbol)
+                        continue
                     self.state.cooldowns[symbol] = now.isoformat()
                     open_count += 1
                     held_symbols.add(symbol)
+                    skip_counter["executed_buy"] += 1
                     # Approximate exposure update so subsequent BUYs see the new total.
                     long_exposure_pct = min(
                         1.0,
@@ -307,11 +337,19 @@ class Autopilot:
                     base = symbol.removesuffix("USDT")
                     free = balances.get(base, Decimal("0"))
                     if free > 0:
-                        await self._place_sell(symbol, sig, free)
-                        risk.clear_hwm(symbol)
+                        placed = await self._place_sell(symbol, sig, free)
+                        if placed:
+                            skip_counter["executed_sell"] += 1
+                            risk.clear_hwm(symbol)
+                        else:
+                            _bump("filter_reject_sell", symbol)
+                    else:
+                        _bump("sell_no_balance", symbol)
             except Exception as exc:  # noqa: BLE001
                 self.state.last_error = f"{symbol}: {exc}"
                 log.warning("execute failed %s: %s", symbol, exc)
+                _bump("exception", symbol, str(exc))
+        self._persist_skip_stats(skip_counter, tick_debug, total=len(signals))
 
     async def _record_signal_event(self, symbol: str, sig) -> None:
         """Best-effort feature snapshot used by the offline trainer."""
@@ -344,6 +382,31 @@ class Autopilot:
         if not last:
             return False
         return (now - last) < cooldown
+
+    def _persist_skip_stats(
+        self,
+        counter: Counter,
+        tick_debug: dict,
+        *,
+        total: int,
+    ) -> None:
+        """Persist per-tick reason breakdown so /diagnose and operators can see why."""
+        try:
+            storage.kv_set(_SKIP_STATS_KEY, dict(counter))
+            storage.kv_set(_LAST_TICK_DEBUG_KEY, {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "total_signals": total,
+                "by_reason": dict(counter),
+                "per_symbol": tick_debug,
+            })
+        except Exception as exc:  # noqa: BLE001
+            log.debug("skip-stats persist failed: %s", exc)
+        if counter:
+            log.info(
+                "autopilot tick result: signals=%d %s",
+                total,
+                ", ".join(f"{k}={v}" for k, v in counter.most_common()),
+            )
 
     async def _atr_pct(self, symbol: str) -> Optional[float]:
         """Best-effort ATR% from cached daily OHLCV. None on any failure."""
@@ -390,24 +453,26 @@ class Autopilot:
             return await paper_exchange.ticker_price(symbol)
         return await BinanceUSClient().ticker_price(symbol)
 
-    async def _place_buy(self, symbol: str, sig, per_trade_usdt: Decimal) -> None:
+    async def _place_buy(self, symbol: str, sig, per_trade_usdt: Decimal) -> bool:
         price = await self._price(symbol)
         raw_qty = per_trade_usdt / price
         qty = filters.round_qty(symbol, raw_qty)
         if qty <= 0 or not filters.meets_min(symbol, qty, price):
             log.info("skip %s BUY: filters reject qty=%s price=%s", symbol, qty, price)
-            return
+            return False
         agents = list(getattr(sig, "contributing_agents", []) or [])
         await self._submit(symbol, OrderSide.BUY, qty, agents)
+        return True
 
-    async def _place_sell(self, symbol: str, sig, free: Decimal) -> None:
+    async def _place_sell(self, symbol: str, sig, free: Decimal) -> bool:
         price = await self._price(symbol)
         qty = filters.round_qty(symbol, free)
         if qty <= 0 or not filters.meets_min(symbol, qty, price):
             log.info("skip %s SELL: filters reject qty=%s", symbol, qty)
-            return
+            return False
         agents = list(getattr(sig, "contributing_agents", []) or [])
         await self._submit(symbol, OrderSide.SELL, qty, agents)
+        return True
 
     async def _submit(
         self, symbol: str, side: OrderSide, qty: Decimal, agents: list[str]

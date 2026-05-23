@@ -46,3 +46,42 @@ async def test_live_order_uses_client_order_id(monkeypatch):
     kwargs = c._spot.new_order.call_args.kwargs
     assert kwargs["newClientOrderId"] == "ctm-test-123"
     assert kwargs["symbol"] == "BTCUSDT"
+
+
+@pytest.mark.asyncio
+async def test_live_order_sets_avg_fill_price_from_fills():
+    settings = Settings(dry_run=False, paper_trading=False)
+    c = BinanceUSClient(settings=settings)
+    c._spot = MagicMock()
+    c._spot.new_order.return_value = {
+        "status": "FILLED",
+        "orderId": 99,
+        "executedQty": "2",
+        "fills": [
+            {"price": "100", "qty": "1"},
+            {"price": "102", "qty": "1"},
+        ],
+    }
+    order = await c.place_order(
+        "BTCUSDT", OrderSide.BUY, OrderType.MARKET, Decimal("2"),
+        client_order_id="ctm-test-fills",
+    )
+    assert order.avg_fill_price == Decimal("101")
+
+
+@pytest.mark.asyncio
+async def test_live_order_sets_avg_fill_price_from_cum_quote():
+    settings = Settings(dry_run=False, paper_trading=False)
+    c = BinanceUSClient(settings=settings)
+    c._spot = MagicMock()
+    c._spot.new_order.return_value = {
+        "status": "FILLED",
+        "orderId": 100,
+        "executedQty": "2",
+        "cummulativeQuoteQty": "202",
+    }
+    order = await c.place_order(
+        "BTCUSDT", OrderSide.BUY, OrderType.MARKET, Decimal("2"),
+        client_order_id="ctm-test-cumquote",
+    )
+    assert order.avg_fill_price == Decimal("101")

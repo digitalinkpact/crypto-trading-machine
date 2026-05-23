@@ -27,6 +27,48 @@ def _new_client_order_id(prefix: str = "ctm") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:24]}"
 
 
+def _extract_avg_fill_price(raw: dict[str, Any]) -> Optional[Decimal]:
+    """Best-effort average fill price from Binance order payload.
+
+    Priority:
+      1) Weighted average from fills[] (price * qty / sum(qty))
+      2) cummulativeQuoteQty / executedQty
+      3) explicit price field
+    """
+    fills = raw.get("fills")
+    if isinstance(fills, list) and fills:
+        total_qty = Decimal("0")
+        total_quote = Decimal("0")
+        for fill in fills:
+            try:
+                qty = Decimal(str(fill.get("qty", "0")))
+                px = Decimal(str(fill.get("price", "0")))
+            except Exception:  # noqa: BLE001
+                continue
+            if qty <= 0 or px <= 0:
+                continue
+            total_qty += qty
+            total_quote += (qty * px)
+        if total_qty > 0:
+            return total_quote / total_qty
+
+    try:
+        executed_qty = Decimal(str(raw.get("executedQty", "0")))
+        cum_quote = Decimal(str(raw.get("cummulativeQuoteQty", "0")))
+        if executed_qty > 0 and cum_quote > 0:
+            return cum_quote / executed_qty
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        px = Decimal(str(raw.get("price", "0")))
+        if px > 0:
+            return px
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 class BinanceUSClient:
     """Thin async wrapper around binance-connector's Spot client."""
 
@@ -119,6 +161,7 @@ class BinanceUSClient:
                 "status": OrderStatus(raw.get("status", "NEW")),
                 "exchange_order_id": str(raw.get("orderId")),
                 "filled_quantity": Decimal(str(raw.get("executedQty", "0"))),
+                "avg_fill_price": _extract_avg_fill_price(raw),
                 "raw": raw,
             }
         )
@@ -192,6 +235,7 @@ class BinanceUSClient:
                     exchange_order_id=str(raw.get("orderId")),
                     submitted_at=datetime.now(timezone.utc),
                     filled_quantity=Decimal(str(raw.get("executedQty", "0"))),
+                    avg_fill_price=_extract_avg_fill_price(raw),
                     raw=raw,
                 )
             )
