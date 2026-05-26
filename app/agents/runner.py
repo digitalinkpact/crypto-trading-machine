@@ -55,10 +55,52 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
     llm_tasks: list[asyncio.Task[Signal | None]] = []
     llm_sem = asyncio.Semaphore(_LLM_CONCURRENCY)
 
+
+    # --- ML model gating for LLM signals ---
+    from app.storage import storage
+    import numpy as np
+    ML_MODEL_NAME = "signal_quality_v1"
+    ML_CONFIDENCE_THRESHOLD = 0.65
+    ml_model_artifact = storage.load_model_artifact(ML_MODEL_NAME)
+    ml_model = ml_model_artifact["model"] if ml_model_artifact else None
+
+    def _llm_features_from_signal(sig: Signal, ctx: AgentContext) -> np.ndarray:
+        # Features must match those in _rows_to_xy in regime/trainer.py
+        last = ctx.df.dropna().iloc[-1]
+        tf_weight = {
+            "1h": 1.0,
+            "4h": 1.5,
+            "1d": 2.5,
+            "1w": 4.0,
+        }.get(ctx.timeframe.value, 1.0)
+        ema_gap = float(last["ema_20"]) - float(last["ema_50"])
+        ema_gap_pct = ema_gap / float(last["close"]) if float(last["close"]) else 0.0
+        atr_pct = float(last["atr_14"]) / float(last["close"]) if float(last["close"]) else 0.0
+        features = [
+            float(sig.confidence),
+            atr_pct,
+            float(last["rsi_14"]),
+            ema_gap_pct,
+            1.0,  # agent_count (LLM is always 1)
+            tf_weight,
+            1.0 if sig.action == "BUY" else 0.0,
+        ]
+        return np.asarray(features, dtype=float).reshape(1, -1)
+
     async def _llm_call(c: AgentContext) -> Signal | None:
         async with llm_sem:
             try:
-                return await LLM_AGENT.analyze_async(c)
+                sig = await LLM_AGENT.analyze_async(c)
+                if sig is None or ml_model is None:
+                    return sig
+                # Only allow if ML model predicts high win probability
+                features = _llm_features_from_signal(sig, c)
+                proba = ml_model.predict_proba(features)[0, 1]
+                if proba >= ML_CONFIDENCE_THRESHOLD:
+                    return sig
+                else:
+                    log.info(f"LLM signal for {c.symbol}/{c.timeframe.value} filtered by ML model: proba={proba:.2f} < {ML_CONFIDENCE_THRESHOLD}")
+                    return None
             except Exception as exc:  # noqa: BLE001
                 log.warning("llm agent failed %s/%s: %s", c.symbol, c.timeframe.value, exc)
                 return None
