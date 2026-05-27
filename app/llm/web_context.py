@@ -9,7 +9,10 @@ import asyncio
 import time
 from typing import Any
 
+
 import httpx
+from decimal import Decimal
+from app.exchange.client import BinanceUSClient
 
 from app.config import get_settings
 from app.logging_setup import get_logger
@@ -24,6 +27,18 @@ def _base_asset(symbol: str) -> str:
     return symbol.removesuffix("USDT").strip().upper()
 
 
+# Fetch price from Binance.US using our exchange client
+async def _binanceus_snapshot(base: str) -> str:
+    symbol = f"{base}USDT"
+    try:
+        client = BinanceUSClient()
+        price = await client.ticker_price(symbol)
+        return f"binanceus: price_usd={price}"
+    except Exception as exc:
+        log.debug("binanceus web context failed for %s: %s", base, exc)
+        return ""
+
+
 def _pick_coin_id(search_payload: dict[str, Any], base: str) -> str | None:
     coins = search_payload.get("coins") or []
     if not coins:
@@ -36,37 +51,7 @@ def _pick_coin_id(search_payload: dict[str, Any], base: str) -> str | None:
     return cid or None
 
 
-async def _coingecko_snapshot(client: httpx.AsyncClient, base: str) -> str:
-    try:
-        sr = await client.get(
-            "https://api.coingecko.com/api/v3/search",
-            params={"query": base},
-        )
-        sr.raise_for_status()
-        coin_id = _pick_coin_id(sr.json(), base)
-        if not coin_id:
-            return ""
 
-        mr = await client.get(
-            "https://api.coingecko.com/api/v3/coins/markets",
-            params={
-                "vs_currency": "usd",
-                "ids": coin_id,
-                "price_change_percentage": "24h",
-            },
-        )
-        mr.raise_for_status()
-        rows = mr.json() or []
-        if not rows:
-            return ""
-        row = rows[0]
-        price = row.get("current_price")
-        chg = row.get("price_change_percentage_24h")
-        mcap = row.get("market_cap")
-        return f"coingecko: price_usd={price} change_24h_pct={chg} market_cap={mcap}"
-    except Exception as exc:  # noqa: BLE001
-        log.debug("coingecko web context failed for %s: %s", base, exc)
-        return ""
 
 
 async def _duckduckgo_snapshot(client: httpx.AsyncClient, base: str) -> str:
@@ -125,15 +110,16 @@ async def get_symbol_web_context(symbol: str) -> str:
         headers = {"User-Agent": "crypto-trading-machine/1.0"}
         try:
             async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-                cg, ddg = await asyncio.gather(
-                    _coingecko_snapshot(client, base),
+                # Only DuckDuckGo needs httpx now
+                binanceus, ddg = await asyncio.gather(
+                    _binanceus_snapshot(base),
                     _duckduckgo_snapshot(client, base),
                 )
         except Exception as exc:  # noqa: BLE001
             log.debug("web context fetch failed for %s: %s", base, exc)
             return ""
 
-        parts = [p for p in (cg, ddg) if p]
+        parts = [p for p in (binanceus, ddg) if p]
         text = "\n".join(parts)
         _CACHE[base] = (time.time(), text)
         return text
