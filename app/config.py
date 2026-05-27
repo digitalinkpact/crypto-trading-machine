@@ -22,11 +22,10 @@ class Timeframe(str, Enum):
     W1 = "1w"
 
 
+
 # ── Universe ─────────────────────────────────────────────────────────────
-# 25 symbols traded on Binance.US (USDT pairs). Adjust as listings change.
-# NOTE: Binance.US has fewer listings than Binance.com — verify with
-# GET /api/v3/exchangeInfo before adding new symbols.
-SYMBOLS: tuple[str, ...] = (
+# Static fallback list for USDT pairs (used if dynamic fetch fails)
+STATIC_SYMBOLS: tuple[str, ...] = (
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
     "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "DOTUSDT", "LINKUSDT",
     "MATICUSDT", "LTCUSDT", "BCHUSDT", "ATOMUSDT", "UNIUSDT",
@@ -43,6 +42,16 @@ TIMEFRAMES: tuple[Timeframe, ...] = (
 
 
 class Settings(BaseSettings):
+        # Dynamic symbol discovery
+        use_dynamic_symbols: bool = True
+        symbols_cache_minutes: int = Field(60, ge=1, le=1440)
+        static_symbols: tuple[str, ...] = STATIC_SYMBOLS
+        # Enhanced risk management
+        max_total_exposure_percentage: float = Field(50.0, ge=1.0, le=100.0)
+        max_position_size_percent: float = Field(10.0, ge=1.0, le=100.0)
+        # API rate limit/backoff
+        api_retry_attempts: int = Field(3, ge=1, le=10)
+        api_retry_backoff_base: int = Field(2, ge=1, le=10)
     """Environment-driven settings. Loaded from .env via pydantic-settings."""
 
     model_config = SettingsConfigDict(
