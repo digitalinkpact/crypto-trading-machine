@@ -135,6 +135,13 @@ class Autopilot:
         self.state.last_action = f"started ({self.state.mode})"
         log.warning("AUTOPILOT STARTED — mode=%s", self.state.mode)
         self._save()
+        # Kick an immediate tick in the background so the user doesn't wait up
+        # to 15 min for the next cron slot before any trade can fire.
+        try:
+            asyncio.create_task(self.tick())
+            log.info("autopilot first tick scheduled immediately after Start")
+        except RuntimeError as exc:  # no running loop — extremely unlikely here
+            log.warning("could not schedule immediate tick: %s", exc)
         return self.state
 
     async def stop_and_liquidate(self) -> AutopilotState:
