@@ -1,9 +1,10 @@
+
+from __future__ import annotations
 """Application configuration — single source of truth.
 
 Symbols, timeframes, and risk caps are defined here. Agents, indicators, and
 scripts must import from this module rather than hardcoding values.
 """
-from __future__ import annotations
 
 from enum import Enum
 from functools import lru_cache
@@ -33,6 +34,9 @@ STATIC_SYMBOLS: tuple[str, ...] = (
     "OPUSDT", "SHIBUSDT", "SUIUSDT", "RNDRUSDT", "AAVEUSDT",
 )
 
+# Back-compat alias — some modules import SYMBOLS directly.
+SYMBOLS = STATIC_SYMBOLS
+
 TIMEFRAMES: tuple[Timeframe, ...] = (
     Timeframe.H1,
     Timeframe.H4,
@@ -41,18 +45,19 @@ TIMEFRAMES: tuple[Timeframe, ...] = (
 )
 
 
+
 class Settings(BaseSettings):
-        # Dynamic symbol discovery
-        use_dynamic_symbols: bool = True
-        symbols_cache_minutes: int = Field(60, ge=1, le=1440)
-        static_symbols: tuple[str, ...] = STATIC_SYMBOLS
-        # Enhanced risk management
-        max_total_exposure_percentage: float = Field(50.0, ge=1.0, le=100.0)
-        max_position_size_percent: float = Field(10.0, ge=1.0, le=100.0)
-        # API rate limit/backoff
-        api_retry_attempts: int = Field(3, ge=1, le=10)
-        api_retry_backoff_base: int = Field(2, ge=1, le=10)
     """Environment-driven settings. Loaded from .env via pydantic-settings."""
+    # Dynamic symbol discovery
+    use_dynamic_symbols: bool = True
+    symbols_cache_minutes: int = Field(60, ge=1, le=1440)
+    static_symbols: tuple[str, ...] = STATIC_SYMBOLS
+    # Enhanced risk management
+    max_total_exposure_percentage: float = Field(50.0, ge=1.0, le=100.0)
+    max_position_size_percent: float = Field(10.0, ge=1.0, le=100.0)
+    # API rate limit/backoff
+    api_retry_attempts: int = Field(3, ge=1, le=10)
+    api_retry_backoff_base: int = Field(2, ge=1, le=10)
 
     model_config = SettingsConfigDict(
         env_file=".env",
