@@ -284,6 +284,18 @@ class Autopilot:
         now = datetime.now(timezone.utc)
         cooldown = timedelta(minutes=s.buy_cooldown_minutes)
 
+        # ML quality gate — load the learned model once per tick. Trades whose
+        # predicted win-probability is below the threshold are skipped. Loaded
+        # lazily so a freshly retrained model is picked up next tick.
+        ml_model = None
+        if s.ml_gate_enabled:
+            try:
+                artifact = storage.load_model_artifact("signal_quality_v1")
+                ml_model = artifact["model"] if artifact else None
+            except Exception as exc:  # noqa: BLE001
+                log.debug("ml gate model load failed: %s", exc)
+                ml_model = None
+
         for symbol, sig in signals.items():
             if sig.action == SignalAction.HOLD:
                 _bump("action_hold", symbol, f"conf={sig.confidence:.2f}")
@@ -292,6 +304,12 @@ class Autopilot:
                 _bump("low_confidence", symbol,
                       f"{sig.action.value} conf={sig.confidence:.2f} < {s.min_signal_confidence}")
                 continue
+            if ml_model is not None and sig.action in (SignalAction.BUY, SignalAction.SELL):
+                proba = await self._ml_win_proba(ml_model, symbol, sig)
+                if proba is not None and proba < s.ml_gate_threshold:
+                    _bump("ml_gate", symbol,
+                          f"{sig.action.value} proba={proba:.2f} < {s.ml_gate_threshold}")
+                    continue
             if not filters.is_listed(symbol):
                 _bump("not_listed", symbol)
                 continue
@@ -361,6 +379,32 @@ class Autopilot:
                 log.warning("execute failed %s: %s", symbol, exc)
                 _bump("exception", symbol, str(exc))
         self._persist_skip_stats(skip_counter, tick_debug, total=len(signals))
+
+    async def _ml_win_proba(self, model, symbol: str, sig) -> Optional[float]:
+        """Predicted win-probability for a signal from the learned quality model.
+
+        Feature order MUST match `_rows_to_xy` in app/regime/trainer.py:
+        [confidence, atr_pct, rsi_14, ema_gap_pct, agent_count, tf_weight, action].
+        Returns None if features can't be built (caller treats None as no opinion).
+        """
+        try:
+            import numpy as np
+            atr_pct, rsi_14, ema_gap_pct = await self._feature_snapshot(symbol)
+            tf = getattr(sig.timeframe, "value", Timeframe.D1.value)
+            tf_weight = {"1h": 1.0, "4h": 1.5, "1d": 2.5, "1w": 4.0}.get(tf, 1.0)
+            features = np.asarray([[
+                float(sig.confidence),
+                float(atr_pct if atr_pct is not None else 0.0),
+                float(rsi_14 if rsi_14 is not None else 50.0),
+                float(ema_gap_pct if ema_gap_pct is not None else 0.0),
+                float(len(getattr(sig, "contributing_agents", ()) or ())),
+                tf_weight,
+                1.0 if sig.action == SignalAction.BUY else 0.0,
+            ]], dtype=float)
+            return float(model.predict_proba(features)[0, 1])
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ml gate proba failed for %s: %s", symbol, exc)
+            return None
 
     async def _record_signal_event(self, symbol: str, sig) -> None:
         """Best-effort feature snapshot used by the offline trainer."""

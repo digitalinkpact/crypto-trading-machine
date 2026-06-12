@@ -64,6 +64,7 @@ _RISK_KEYS = {
     "min_signal_confidence":          ("MIN_SIGNAL_CONFIDENCE",          float, (0.0, 1.0)),
     "max_position_pct":               ("MAX_POSITION_PCT",               float, (0.005, 1.0)),
     "max_open_positions":             ("MAX_OPEN_POSITIONS",             int,   (1, 25)),
+    "ml_gate_threshold":              ("ML_GATE_THRESHOLD",              float, (0.0, 1.0)),
 }
 
 

@@ -183,6 +183,13 @@ class Settings(BaseSettings):
     ml_min_training_samples: int = Field(200, ge=20, le=1_000_000)
     ml_min_new_labels: int = Field(50, ge=10, le=1_000_000)
 
+    # ML quality gate — drop trades the learned model rates below this win-prob.
+    # Closes the learning loop: realized win/loss outcomes train the model,
+    # which then filters live BUY/SELL signals. Off by default; enable once the
+    # model has trained on enough labeled data. Risk exits bypass this gate.
+    ml_gate_enabled: bool = False
+    ml_gate_threshold: float = Field(0.50, ge=0.0, le=1.0)
+
     # Storage
     data_cache_dir: Path = Path("./data/cache")
 
