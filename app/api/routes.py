@@ -564,3 +564,33 @@ async def config_summary() -> dict:
         },
     }
 
+
+@router.get("/metrics")
+async def metrics() -> dict:
+    """Operational metrics, including ML quality-gate stats.
+
+    `gate.cumulative` accumulates across ticks since the gate was enabled;
+    `gate.last_tick` is the most recent tick snapshot. `avg_win_prob` is the
+    mean predicted win-probability over all evaluated BUY/SELL signals.
+    """
+    s = get_settings()
+    raw = storage.kv_get("ml_gate_stats") or {}
+    cum = raw.get("cumulative", {}) if isinstance(raw, dict) else {}
+    evaluated = int(cum.get("evaluated", 0))
+    proba_sum = float(cum.get("proba_sum", 0.0))
+    return {
+        "gate": {
+            "enabled": s.ml_gate_enabled,
+            "threshold": s.ml_gate_threshold,
+            "model_version": raw.get("model_version") if isinstance(raw, dict) else None,
+            "cumulative": {
+                "evaluated": evaluated,
+                "accepted": int(cum.get("accepted", 0)),
+                "gated": int(cum.get("gated", 0)),
+                "avg_win_prob": (proba_sum / evaluated) if evaluated else None,
+            },
+            "last_tick": raw.get("last_tick") if isinstance(raw, dict) else None,
+        },
+    }
+
+

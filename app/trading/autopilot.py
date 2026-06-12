@@ -36,6 +36,7 @@ log = get_logger(__name__)
 _STATE_KEY = "autopilot_state"
 _SKIP_STATS_KEY = "autopilot_skip_stats"
 _LAST_TICK_DEBUG_KEY = "autopilot_last_tick_debug"
+_ML_GATE_STATS_KEY = "ml_gate_stats"
 
 
 @dataclass
@@ -288,13 +289,21 @@ class Autopilot:
         # predicted win-probability is below the threshold are skipped. Loaded
         # lazily so a freshly retrained model is picked up next tick.
         ml_model = None
+        ml_model_version: Optional[int] = None
         if s.ml_gate_enabled:
             try:
                 artifact = storage.load_model_artifact("signal_quality_v1")
-                ml_model = artifact["model"] if artifact else None
+                if artifact:
+                    ml_model = artifact["model"]
+                    ml_model_version = artifact.get("version")
             except Exception as exc:  # noqa: BLE001
                 log.debug("ml gate model load failed: %s", exc)
                 ml_model = None
+        # Per-tick gate telemetry (exposed via /metrics).
+        gate_evaluated = 0
+        gate_accepted = 0
+        gate_gated = 0
+        gate_proba_sum = 0.0
 
         for symbol, sig in signals.items():
             if sig.action == SignalAction.HOLD:
@@ -306,10 +315,19 @@ class Autopilot:
                 continue
             if ml_model is not None and sig.action in (SignalAction.BUY, SignalAction.SELL):
                 proba = await self._ml_win_proba(ml_model, symbol, sig)
-                if proba is not None and proba < s.ml_gate_threshold:
-                    _bump("ml_gate", symbol,
-                          f"{sig.action.value} proba={proba:.2f} < {s.ml_gate_threshold}")
-                    continue
+                if proba is not None:
+                    gate_evaluated += 1
+                    gate_proba_sum += proba
+                    if proba < s.ml_gate_threshold:
+                        gate_gated += 1
+                        log.info("[ML_GATE] SKIP %s %s proba=%.3f < %.2f",
+                                 symbol, sig.action.value, proba, s.ml_gate_threshold)
+                        _bump("ml_gate", symbol,
+                              f"{sig.action.value} proba={proba:.2f} < {s.ml_gate_threshold}")
+                        continue
+                    gate_accepted += 1
+                    log.info("[ML_GATE] PASS %s %s proba=%.3f >= %.2f",
+                             symbol, sig.action.value, proba, s.ml_gate_threshold)
             if not filters.is_listed(symbol):
                 _bump("not_listed", symbol)
                 continue
@@ -379,6 +397,15 @@ class Autopilot:
                 log.warning("execute failed %s: %s", symbol, exc)
                 _bump("exception", symbol, str(exc))
         self._persist_skip_stats(skip_counter, tick_debug, total=len(signals))
+        if s.ml_gate_enabled:
+            self._persist_gate_stats(
+                evaluated=gate_evaluated,
+                accepted=gate_accepted,
+                gated=gate_gated,
+                proba_sum=gate_proba_sum,
+                threshold=s.ml_gate_threshold,
+                model_version=ml_model_version,
+            )
 
     async def _ml_win_proba(self, model, symbol: str, sig) -> Optional[float]:
         """Predicted win-probability for a signal from the learned quality model.
@@ -428,6 +455,42 @@ class Autopilot:
             )
         except Exception as exc:  # noqa: BLE001
             log.debug("signal event capture failed %s: %s", symbol, exc)
+
+    def _persist_gate_stats(
+        self,
+        *,
+        evaluated: int,
+        accepted: int,
+        gated: int,
+        proba_sum: float,
+        threshold: float,
+        model_version: Optional[int],
+    ) -> None:
+        """Accumulate ML-gate telemetry for the /metrics endpoint."""
+        try:
+            prev = storage.kv_get(_ML_GATE_STATS_KEY) or {}
+            cum = prev.get("cumulative", {}) if isinstance(prev, dict) else {}
+            cum = {
+                "evaluated": int(cum.get("evaluated", 0)) + evaluated,
+                "accepted": int(cum.get("accepted", 0)) + accepted,
+                "gated": int(cum.get("gated", 0)) + gated,
+                "proba_sum": float(cum.get("proba_sum", 0.0)) + proba_sum,
+            }
+            last = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "evaluated": evaluated,
+                "accepted": accepted,
+                "gated": gated,
+                "avg_proba": (proba_sum / evaluated) if evaluated else None,
+            }
+            storage.kv_set(_ML_GATE_STATS_KEY, {
+                "threshold": threshold,
+                "model_version": model_version,
+                "cumulative": cum,
+                "last_tick": last,
+            })
+        except Exception as exc:  # noqa: BLE001
+            log.debug("gate-stats persist failed: %s", exc)
 
     def _on_cooldown(self, symbol: str, now: datetime, cooldown: timedelta) -> bool:
         ts = self.state.cooldowns.get(symbol)
