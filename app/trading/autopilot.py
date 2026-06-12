@@ -101,6 +101,8 @@ class Autopilot:
         # Always sync mode with current settings on boot.
         self.state.mode = "paper" if get_settings().paper_trading else "live"
         self._lock = asyncio.Lock()
+        # Last ML-gate model version we logged (avoids per-tick log spam).
+        self._ml_logged_version: Optional[int] = None
 
     # ── persistence ────────────────────────────────────────────────────
     def _save(self) -> None:
@@ -296,6 +298,28 @@ class Autopilot:
                 if artifact:
                     ml_model = artifact["model"]
                     ml_model_version = artifact.get("version")
+                    # Log once per distinct version so retrains are visible
+                    # without spamming every tick.
+                    if ml_model_version != self._ml_logged_version:
+                        metrics = artifact.get("metrics") or {}
+                        log.info(
+                            "[ML_GATE] model loaded: version=%s algo=%s trained=%s "
+                            "samples=%s auc=%.3f threshold=%.2f",
+                            ml_model_version,
+                            artifact.get("algorithm"),
+                            artifact.get("trained_at"),
+                            metrics.get("samples"),
+                            float(metrics.get("roc_auc", 0.0)),
+                            s.ml_gate_threshold,
+                        )
+                        self._ml_logged_version = ml_model_version
+                else:
+                    if self._ml_logged_version != -1:
+                        log.warning(
+                            "[ML_GATE] enabled but no trained model found "
+                            "(signal_quality_v1) — gate is fail-open, all signals pass"
+                        )
+                        self._ml_logged_version = -1
             except Exception as exc:  # noqa: BLE001
                 log.debug("ml gate model load failed: %s", exc)
                 ml_model = None
