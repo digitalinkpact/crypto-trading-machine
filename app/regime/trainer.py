@@ -23,6 +23,7 @@ from app.trading.paper import paper_exchange
 log = get_logger(__name__)
 
 _MODEL_NAME = "signal_quality_v1"
+_LAST_TRAINED_RESOLVED_KEY = "ml_last_trained_resolved_count"
 
 
 def _event_return_pct(action: str, entry: float, current: float) -> float:
@@ -178,10 +179,31 @@ async def run_learning_cycle() -> dict[str, float | int | str]:
         "labeled": int(labeled),
         "new_labels": int(new_labels),
     }
-    if new_labels < s.ml_min_new_labels:
+    total_resolved = int(after)
+    latest_version = int(storage.latest_model_version(_MODEL_NAME))
+    last_trained_resolved = int(
+        storage.kv_get(_LAST_TRAINED_RESOLVED_KEY, default=0) or 0
+    )
+    since_last_train = max(0, total_resolved - last_trained_resolved)
+
+    # Train first model as soon as we have enough data, even if each pass only
+    # contributes a small number of new labels.
+    if latest_version == 0:
+        rows = storage.training_signal_rows(limit=100_000)
+        if len(rows) < s.ml_min_training_samples:
+            result["total_resolved"] = total_resolved
+            result["since_last_train"] = since_last_train
+            return result
+    elif since_last_train < s.ml_min_new_labels:
+        result["total_resolved"] = total_resolved
+        result["since_last_train"] = since_last_train
         return result
 
     train_result = train_signal_quality_model()
     train_result["labeled"] = int(labeled)
     train_result["new_labels"] = int(new_labels)
+    train_result["total_resolved"] = total_resolved
+    train_result["since_last_train"] = since_last_train
+    if train_result.get("status") == "ok":
+        storage.kv_set(_LAST_TRAINED_RESOLVED_KEY, total_resolved)
     return train_result

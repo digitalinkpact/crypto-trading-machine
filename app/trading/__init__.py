@@ -1,5 +1,8 @@
-"""Auto-pilot trading controller."""
-from .autopilot import autopilot, Autopilot
-from .portfolio import portfolio_snapshot
+"""Trading package marker.
 
-__all__ = ["autopilot", "Autopilot", "portfolio_snapshot"]
+Do not re-export heavy runtime objects here. Import from concrete modules:
+- `app.trading.autopilot` for the singleton controller
+- `app.trading.portfolio` for portfolio helpers
+"""
+
+__all__: list[str] = []

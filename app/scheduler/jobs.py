@@ -14,7 +14,7 @@ from app.llm import LLMReasoner
 from app.logging_setup import get_logger
 from app.regime import run_learning_cycle
 from app.storage import storage
-from app.trading import autopilot
+from app.trading.autopilot import autopilot
 from app.trading.portfolio import portfolio_snapshot
 
 log = get_logger(__name__)

@@ -12,7 +12,8 @@ from app.credentials import (
     save_trading_mode,
 )
 from app.storage import storage
-from app.trading import autopilot, portfolio_snapshot
+from app.trading.autopilot import autopilot
+from app.trading.portfolio import portfolio_snapshot
 
 router = APIRouter()
 
