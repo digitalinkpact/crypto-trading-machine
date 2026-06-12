@@ -27,6 +27,8 @@ ta==0.11.0
 
 # ── Backtesting ────────────────────────────────────────────
 vectorbt==0.26.2
+# vectorbt 0.26 references the `heatmapgl` plotly trace, removed in plotly 6.0 → pin <6
+plotly==5.24.1
 # jesse is installed separately: pip install jesse
 
 # ── Market Data ────────────────────────────────────────────
@@ -40,7 +42,8 @@ scikit-learn==1.5.0  # for regime ML classification (optional)
 
 # ── Auth / email / sessions ────────────────────────────────
 passlib[bcrypt]==1.7.4
-bcrypt==4.1.3
+# passlib 1.7.4 reads bcrypt.__about__.__version__, removed in bcrypt>=4.1 → pin to 4.0.x
+bcrypt==4.0.1
 itsdangerous==2.2.0
 aiosmtplib==3.0.1
 email-validator==2.1.1
