@@ -8,8 +8,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.agents import run_all_agents
-from app.config import SYMBOLS, TIMEFRAMES, get_settings
+from app.config import TIMEFRAMES, get_settings
 from app.data import OHLCVRepository
+from app.exchange.symbol_source import get_symbols
 from app.llm import LLMReasoner
 from app.logging_setup import get_logger
 from app.regime import run_learning_cycle
@@ -25,7 +26,8 @@ _LLM_META_KEY = "llm_meta"
 
 async def refresh_market_data() -> None:
     repo = OHLCVRepository()
-    for symbol in SYMBOLS:
+    symbols = await get_symbols()
+    for symbol in symbols:
         for tf in TIMEFRAMES:
             try:
                 await repo.get(symbol, tf, refresh=True)

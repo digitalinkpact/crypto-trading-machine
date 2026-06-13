@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     use_dynamic_symbols: bool = True
     symbols_cache_minutes: int = Field(60, ge=1, le=1440)
     static_symbols: tuple[str, ...] = STATIC_SYMBOLS
+    # Universe filters (applied when use_dynamic_symbols=True). Trade every
+    # USDT pair on Binance.US except the ones below.
+    #  - Leveraged ETF tokens (…UP/DOWN/BULL/BEAR-USDT) are excluded: they decay
+    #    and are unsuitable for this strategy.
+    #  - Stablecoin→stablecoin pairs (USDCUSDT, …) are excluded: no edge.
+    #  - min_quote_volume_usdt is a 24h liquidity floor; 0 = no floor (all coins).
+    #    Raise it (e.g. 1_000_000) to skip thin coins with high slippage risk.
+    exclude_leveraged_tokens: bool = True
+    min_quote_volume_usdt: float = Field(0.0, ge=0.0)
     # Enhanced risk management
     max_total_exposure_percentage: float = Field(50.0, ge=1.0, le=100.0)
     max_position_size_percent: float = Field(10.0, ge=1.0, le=100.0)

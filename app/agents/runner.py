@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import asyncio
 
-from app.config import SYMBOLS, TIMEFRAMES, Timeframe
+from app.config import TIMEFRAMES, Timeframe
 from app.data import OHLCVRepository
+from app.exchange.symbol_source import get_symbols
 from app.logging_setup import get_logger
 from app.regime import RegimeClassifier
 from app.signals import Signal, SignalAggregator
@@ -105,7 +106,8 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
                 log.warning("llm agent failed %s/%s: %s", c.symbol, c.timeframe.value, exc)
                 return None
 
-    for symbol in SYMBOLS:
+    symbols = await get_symbols()
+    for symbol in symbols:
         for tf in TIMEFRAMES:
             try:
                 df = await repo.get(symbol, tf, refresh=False)
