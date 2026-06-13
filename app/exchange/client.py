@@ -109,6 +109,14 @@ class BinanceUSClient:
         data = await asyncio.to_thread(self._spot.ticker_price, symbol)
         return Decimal(str(data["price"]))
 
+    async def order_book(self, symbol: str, limit: int = 10) -> dict[str, Any]:
+        """Fetch the L2 order book (top `limit` levels each side).
+
+        Public endpoint — no auth required. Returns the raw Binance.US payload
+        with `bids` and `asks` as lists of [price, qty] string pairs.
+        """
+        return await asyncio.to_thread(self._spot.depth, symbol, limit=limit)
+
     async def account(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._spot.account)
 

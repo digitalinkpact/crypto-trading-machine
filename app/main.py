@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from app.api import router
 from app.auth import auth_guard, auth_router
 from app.exchange.filters import filters
+from app.exchange.ws_stream import live_prices
 from app.logging_setup import configure_logging, get_logger
 from app.scheduler import build_scheduler
 from app.storage import storage
@@ -35,6 +36,12 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001
         log.exception("paper account seed failed: %s", exc)
 
+    # Start the live price websocket cache (best-effort; falls back to REST).
+    try:
+        live_prices.start()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("live price stream start failed: %s", exc)
+
     scheduler = None
     try:
         scheduler = build_scheduler()
@@ -46,6 +53,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        try:
+            await live_prices.stop()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("live price stream stop failed: %s", exc)
         if scheduler is not None:
             scheduler.shutdown(wait=False)
             log.info("scheduler stopped")

@@ -23,8 +23,12 @@ from typing import Optional
 from app.agents import run_all_agents
 from app.config import Timeframe, get_settings
 from app.exchange import BinanceUSClient, Order, OrderSide, OrderType
+from app.exchange.derivatives import derivatives
 from app.exchange.filters import filters
+from app.exchange.orderbook import liquidity_gate
+from app.exchange.ws_stream import live_prices
 from app.logging_setup import get_logger
+from app.regime import online_regime
 from app.signals import SignalAction
 from app.storage import storage
 from app.trading import risk
@@ -273,6 +277,18 @@ class Autopilot:
 
         usdt_free = Decimal(str(snap["usdt_cash"]))
         total_eq = Decimal(str(snap["total_usdt"]))
+
+        # Dynamic confidence bar — the online regime model leans the entry
+        # threshold up (risk-off) or down (risk-on), bounded so it can't
+        # override the technicals-based core. Computed once per tick.
+        min_conf = s.min_signal_confidence
+        if s.dynamic_threshold_enabled:
+            delta, info = online_regime.threshold_delta()
+            min_conf = max(0.0, min(1.0, s.min_signal_confidence + delta))
+            log.info(
+                "[REGIME] dynamic min_confidence=%.3f (base=%.2f) %s",
+                min_conf, s.min_signal_confidence, info,
+            )
         long_exposure_pct = float(
             (total_eq - usdt_free) / total_eq if total_eq > 0 else Decimal("0")
         )
@@ -333,9 +349,9 @@ class Autopilot:
             if sig.action == SignalAction.HOLD:
                 _bump("action_hold", symbol, f"conf={sig.confidence:.2f}")
                 continue
-            if sig.confidence < s.min_signal_confidence:
+            if sig.confidence < min_conf:
                 _bump("low_confidence", symbol,
-                      f"{sig.action.value} conf={sig.confidence:.2f} < {s.min_signal_confidence}")
+                      f"{sig.action.value} conf={sig.confidence:.2f} < {min_conf:.2f}")
                 continue
             if ml_model is not None and sig.action in (SignalAction.BUY, SignalAction.SELL):
                 proba = await self._ml_win_proba(ml_model, symbol, sig)
@@ -390,6 +406,29 @@ class Autopilot:
                             _bump("insufficient_usdt", symbol,
                                   f"per_trade={per_trade_usdt:.4f} cash={usdt_free:.2f} eff={eff_pct:.4f}")
                             continue
+
+                    # Derivatives context gate (funding too negative → skip long).
+                    fund_ok, fund_why = await self._funding_gate(symbol)
+                    if not fund_ok:
+                        _bump("funding_gate", symbol, fund_why)
+                        log.info("skip %s BUY: %s", symbol, fund_why)
+                        continue
+
+                    # On-chain whale-flow gate (exchange inflow spike → skip long).
+                    flow_ok, flow_why = await self._onchain_gate(symbol)
+                    if not flow_ok:
+                        _bump("onchain_gate", symbol, flow_why)
+                        log.info("skip %s BUY: %s", symbol, flow_why)
+                        continue
+
+                    # Order-book liquidity gate (reject thin/wide books).
+                    ob_ok, ob_why = await liquidity_gate(
+                        symbol, SignalAction.BUY, per_trade_usdt
+                    )
+                    if not ob_ok:
+                        _bump("orderbook_gate", symbol, ob_why)
+                        log.info("skip %s BUY: order book %s", symbol, ob_why)
+                        continue
 
                     placed = await self._place_buy(symbol, sig, per_trade_usdt)
                     if not placed:
@@ -591,9 +630,86 @@ class Autopilot:
             return None, None, None
 
     async def _price(self, symbol: str) -> Decimal:
+        # Prefer the live websocket last-price when it's fresh; this avoids
+        # pricing fills against a candle close that can be up to ~15 min old.
+        # Falls back to REST (paper uses the public ticker) on any miss.
+        if get_settings().live_price_enabled:
+            live = live_prices.get_fresh(symbol)
+            if live is not None and live > 0:
+                return live
         if self.state.mode == "paper":
             return await paper_exchange.ticker_price(symbol)
         return await BinanceUSClient().ticker_price(symbol)
+
+    async def _funding_gate(self, symbol: str) -> tuple[bool, str]:
+        """Veto new longs when perp funding is deeply negative (crowded short).
+
+        Also records OI-vs-price trend confirmation (informational, non-blocking).
+        FAIL-OPEN: disabled or unavailable derivatives data always allows the trade.
+        """
+        s = get_settings()
+        if not s.derivatives_data_enabled:
+            return True, "deriv_disabled"
+        try:
+            ctx = await derivatives.context(symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[DERIV] %s context failed (%s) — allowing", symbol, exc)
+            return True, f"deriv_unavailable:{exc}"
+        if ctx is None:
+            return True, "deriv_none"
+
+        # OI trend confirmation: rising OI + rising price = fresh-money trend.
+        try:
+            await self._log_oi_trend(symbol, ctx)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[DERIV] %s OI trend log failed: %s", symbol, exc)
+
+        if ctx.funding_rate is not None and ctx.funding_rate < s.funding_min_pct:
+            return False, (
+                f"funding {ctx.funding_rate:.4%} < {s.funding_min_pct:.4%} (crowded short)"
+            )
+        return True, f"funding={ctx.funding_rate}"
+
+    async def _log_oi_trend(self, symbol: str, ctx) -> None:
+        """Compare current OI/price to the last snapshot and log trend confirmation."""
+        if ctx.open_interest is None:
+            return
+        key = "deriv_oi_last"
+        store = storage.kv_get(key) or {}
+        prev = store.get(symbol) if isinstance(store, dict) else None
+        try:
+            price_now = float(await self._price(symbol))
+        except Exception:  # noqa: BLE001
+            price_now = None
+        if prev and price_now is not None:
+            d_oi = ctx.open_interest - float(prev.get("oi", 0.0))
+            d_px = price_now - float(prev.get("price", 0.0))
+            if d_oi > 0 and d_px > 0:
+                log.info("[DERIV] %s trend CONFIRM: OI+ price+ (fresh money long)", symbol)
+            elif d_oi < 0 and d_px > 0:
+                log.info("[DERIV] %s price+ on OI- (short-covering, weaker)", symbol)
+        if isinstance(store, dict):
+            store[symbol] = {"oi": ctx.open_interest, "price": price_now or 0.0}
+            storage.kv_set(key, store)
+
+    async def _onchain_gate(self, symbol: str) -> tuple[bool, str]:
+        """Veto new longs on an exchange-inflow spike (coins moving in to be sold).
+
+        FAIL-OPEN: disabled, no key, or unavailable on-chain data allows the trade.
+        """
+        s = get_settings()
+        if not s.onchain_enabled:
+            return True, "onchain_disabled"
+        try:
+            from app.data.onchain import inflow_spike
+
+            spiked, detail = await inflow_spike(symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[ONCHAIN] %s check failed (%s) — allowing", symbol, exc)
+            return True, f"onchain_unavailable:{exc}"
+        if spiked:
+            return False, f"exchange inflow spike ({detail})"
+        return True, detail
 
     async def _place_buy(self, symbol: str, sig, per_trade_usdt: Decimal) -> bool:
         price = await self._price(symbol)

@@ -100,12 +100,14 @@ class Settings(BaseSettings):
     # Optional web context for the LLM reasoner (off by default).
     # When enabled, the LLM agent fetches a small internet snapshot
     # (CoinGecko + DuckDuckGo instant answers) and appends it to the prompt.
-    llm_web_enabled: bool = False
+    llm_web_enabled: bool = True
     llm_web_timeout_seconds: float = Field(6.0, ge=1.0, le=30.0)
     llm_web_cache_ttl_seconds: int = Field(900, ge=60, le=86_400)
     # When true, the autopilot tick includes the LLM reasoner in the vote.
-    # Default off — LLM is non-deterministic and rate-limited.
-    llm_in_trading_loop: bool = False
+    # Non-deterministic and rate-limited, but enabled per operator request so
+    # live trades benefit from LLM reasoning. Restricted to slow timeframes
+    # (D1/W1) with bounded concurrency in app/agents/runner.py.
+    llm_in_trading_loop: bool = True
 
     # Runtime
     env: str = "dev"
@@ -196,8 +198,59 @@ class Settings(BaseSettings):
     # Closes the learning loop: realized win/loss outcomes train the model,
     # which then filters live BUY/SELL signals. Off by default; enable once the
     # model has trained on enough labeled data. Risk exits bypass this gate.
-    ml_gate_enabled: bool = False
+    ml_gate_enabled: bool = True
     ml_gate_threshold: float = Field(0.50, ge=0.0, le=1.0)
+
+    # ── Live price stream (websocket) ────────────────────────────────
+    # Maintains a sub-second last-price cache from the Binance.US combined
+    # miniTicker stream so execution prices aren't 15 minutes stale between
+    # OHLCV polls. OHLCV history (needed for indicators) still comes from REST.
+    live_price_enabled: bool = True
+    # Execution falls back to a REST ticker if the cached price is older than
+    # this many seconds (stale-guard against a dropped websocket).
+    live_price_max_age_seconds: float = Field(30.0, ge=1.0, le=900.0)
+
+    # ── Order-book / liquidity gate ──────────────────────────────────
+    # Before each entry, inspect the live order book and reject fills into thin
+    # or wide books. Fails OPEN (allows the trade) if the book can't be fetched.
+    orderbook_gate_enabled: bool = True
+    orderbook_depth_limit: int = Field(10, ge=5, le=100)
+    # Reject entry if (ask-bid)/mid exceeds this (0.0015 = 0.15%).
+    max_spread_pct: float = Field(0.0015, ge=0.0, le=0.05)
+    # Require resting depth near mid >= this multiple of the trade notional.
+    min_depth_trade_multiple: float = Field(2.0, ge=0.0, le=100.0)
+    # "Near mid" band used for the depth check (0.001 = 0.1%).
+    orderbook_near_pct: float = Field(0.001, ge=0.0001, le=0.05)
+
+    # ── Derivatives context (funding + open interest) ────────────────
+    # Binance.US is SPOT-ONLY and has no funding/OI. When enabled, this reads
+    # PUBLIC market data from Binance global futures (fapi) for reference only —
+    # it never places orders there. Off by default: may be geofenced in the US.
+    derivatives_data_enabled: bool = False
+    derivatives_base_url: str = "https://fapi.binance.com"
+    derivatives_timeout_seconds: float = Field(6.0, ge=1.0, le=30.0)
+    derivatives_cache_ttl_seconds: int = Field(300, ge=30, le=3_600)
+    # Reject new longs when funding is more negative than this (-0.0001 = -0.01%):
+    # deeply negative funding means the perp is crowded-short / squeeze-prone.
+    funding_min_pct: float = Field(-0.0001, ge=-0.01, le=0.0)
+
+    # ── Dynamic confidence threshold (online regime) ─────────────────
+    # An online logistic model learns from recently-resolved trades and nudges
+    # the min-confidence entry bar up (risk-off) or down (risk-on). Bounded so
+    # it can never override the technicals-based core by more than a small delta.
+    dynamic_threshold_enabled: bool = True
+    dynamic_threshold_max_delta: float = Field(0.10, ge=0.0, le=0.30)
+    online_regime_min_samples: int = Field(30, ge=10, le=10_000)
+
+    # ── On-chain whale flows (optional) ──────────────────────────────
+    # Exchange-inflow spikes are a bearish tell (coins moving to exchanges to
+    # be sold). Requires a Glassnode API key; off by default.
+    onchain_enabled: bool = False
+    glassnode_api_key: SecretStr = SecretStr("")
+    onchain_timeout_seconds: float = Field(6.0, ge=1.0, le=30.0)
+    onchain_cache_ttl_seconds: int = Field(1800, ge=60, le=86_400)
+    # Block new longs when 24h exchange inflow exceeds this z-score vs trailing mean.
+    onchain_inflow_spike_z: float = Field(2.0, ge=0.5, le=10.0)
 
     # Storage
     data_cache_dir: Path = Path("./data/cache")
