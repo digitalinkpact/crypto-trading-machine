@@ -102,31 +102,36 @@ class PaperExchange:
                 symbol=symbol, mode="paper", qty=quantity,
                 entry_price=price, agents=agents or [],
             )
+            filled_qty = quantity
         else:  # SELL — close any existing position
-            base_have = Decimal(str(storage.paper_balance_get(base)))
-            qty = min(quantity, base_have)
+            # Atomic, never-negative debit. Returns the quantity actually sold,
+            # which may be less than requested if the balance is short. This is
+            # the guard that stops concurrent SELLs from driving a balance below
+            # zero (the cause of the historical negative-balance corruption).
+            qty = Decimal(str(storage.paper_balance_debit(base, quantity)))
             if qty <= 0:
                 raise RuntimeError(f"no {base} to sell in paper account")
             proceeds = qty * price - (qty * price * fee_rate)
-            storage.paper_balance_add(base, -qty)
             storage.paper_balance_add("USDT", proceeds)
             storage.close_position(symbol=symbol, exit_price=price)
+            filled_qty = qty
+            fee = qty * price * fee_rate
 
         storage.record_order(
             mode="paper", symbol=symbol, side=side.value,
-            qty=quantity, price=price, fee=fee,
+            qty=filled_qty, price=price, fee=fee,
             client_order_id=client_order_id, agents=agents or [],
         )
         return Order(
             symbol=symbol,
             side=side,
             type=OrderType.MARKET,
-            quantity=quantity,
+            quantity=filled_qty,
             price=price,
             client_order_id=client_order_id or f"paper-{datetime.now().timestamp()}",
             status=OrderStatus.FILLED,
             submitted_at=datetime.now(timezone.utc),
-            filled_quantity=quantity,
+            filled_quantity=filled_qty,
             avg_fill_price=price,
             raw={"mode": "paper", "fee": str(fee)},
         )

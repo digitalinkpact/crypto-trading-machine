@@ -211,6 +211,60 @@ class Storage:
         except json.JSONDecodeError:
             return default
 
+    # ── Cross-process mutex (kv-backed) ──────────────────────────────
+    def try_acquire_lock(self, name: str, ttl_seconds: float, owner: str) -> bool:
+        """Best-effort cross-process mutex stored in the kv table.
+
+        Returns ``True`` if the lock was acquired (or a previous holder's lease
+        expired), ``False`` if another owner currently holds it. The ``BEGIN
+        IMMEDIATE`` transaction makes acquisition atomic across processes so two
+        app instances sharing this DB cannot both run a guarded section (e.g. an
+        autopilot tick) at the same time. ``ttl_seconds`` is a crash safety net;
+        callers should still release explicitly in a ``finally`` block.
+        """
+        import time
+
+        key = f"lock:{name}"
+        now = time.time()
+        with self._lock, self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                row = c.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+                if row:
+                    try:
+                        data = json.loads(row["value"])
+                        if float(data.get("expires", 0)) > now and data.get("owner") != owner:
+                            c.execute("COMMIT")
+                            return False
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        pass  # corrupt lock row — treat as free
+                payload = json.dumps({"owner": owner, "expires": now + ttl_seconds})
+                c.execute(
+                    "INSERT INTO kv(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, payload),
+                )
+                c.execute("COMMIT")
+                return True
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+
+    def release_lock(self, name: str, owner: str) -> None:
+        """Release a lock previously acquired by ``owner`` (no-op otherwise)."""
+        key = f"lock:{name}"
+        with self._lock, self._conn() as c:
+            row = c.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+            if not row:
+                return
+            try:
+                data = json.loads(row["value"])
+                if data.get("owner") != owner:
+                    return  # held by someone else — don't steal it
+            except json.JSONDecodeError:
+                pass
+            c.execute("DELETE FROM kv WHERE key=?", (key,))
+
     # ── Orders ───────────────────────────────────────────────────────
     def record_order(
         self,
@@ -390,6 +444,36 @@ class Storage:
             )
             row = c.execute("SELECT qty FROM paper_balances WHERE asset=?", (asset,)).fetchone()
         return float(row["qty"]) if row else 0.0
+
+    def paper_balance_debit(self, asset: str, amount: Decimal | float) -> float:
+        """Atomically subtract up to `amount` of `asset`, never going below zero.
+
+        Returns the quantity actually debited (``min(amount, balance)``). Uses a
+        ``BEGIN IMMEDIATE`` transaction so the read-modify-write is atomic even
+        across processes — this prevents two concurrent SELLs from both reading
+        the same balance and driving it negative.
+        """
+        amt = _f(amount)
+        if amt <= 0:
+            return 0.0
+        with self._lock, self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                row = c.execute(
+                    "SELECT qty FROM paper_balances WHERE asset=?", (asset,)
+                ).fetchone()
+                have = float(row["qty"]) if row else 0.0
+                debited = have if amt > have else amt
+                if debited > 0:
+                    c.execute(
+                        "UPDATE paper_balances SET qty=qty-? WHERE asset=?",
+                        (debited, asset),
+                    )
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        return debited
 
     def paper_balance_get(self, asset: str) -> float:
         with self._lock, self._conn() as c:

@@ -14,6 +14,8 @@ Each tick:
 from __future__ import annotations
 
 import asyncio
+import os
+import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -105,6 +107,10 @@ class Autopilot:
         # Always sync mode with current settings on boot.
         self.state.mode = "paper" if get_settings().paper_trading else "live"
         self._lock = asyncio.Lock()
+        # Per-process identity for the cross-process tick mutex. Two app
+        # instances sharing the SQLite DB get different owners, so only one can
+        # hold the lock and execute a tick at a time.
+        self._owner = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
         # Last ML-gate model version we logged (avoids per-tick log spam).
         self._ml_logged_version: Optional[int] = None
 
@@ -179,35 +185,44 @@ class Autopilot:
         if self._lock.locked():
             log.info("autopilot tick skipped — previous tick still running")
             return
+        # Cross-process guard: if another app instance (e.g. a stray dev server
+        # sharing this DB) is mid-tick, skip. This prevents the duplicate-order
+        # / negative-balance corruption that an in-process lock alone can't stop.
+        # TTL is a crash safety net; we release explicitly in `finally`.
+        if not storage.try_acquire_lock("autopilot_tick", ttl_seconds=300.0, owner=self._owner):
+            log.info("autopilot tick skipped — another process holds the tick lock")
+            return
         async with self._lock:
             self.state.last_tick_at = datetime.now(timezone.utc)
+            try:
+                # 1. Risk gates — stop-loss / take-profit / trailing / max-hold.
+                #    Run BEFORE agents so we exit losers regardless of new signals.
+                try:
+                    await self._run_risk_gates()
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("risk gate run failed: %s", exc)
 
-            # 1. Risk gates — stop-loss / take-profit / trailing / max-hold.
-            #    Run BEFORE agents so we exit losers regardless of new signals.
-            try:
-                await self._run_risk_gates()
-            except Exception as exc:  # noqa: BLE001
-                log.exception("risk gate run failed: %s", exc)
+                # 2. Drawdown circuit breaker.
+                try:
+                    breaker_tripped = await self._check_circuit_breaker()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("circuit breaker check failed: %s", exc)
+                    breaker_tripped = False
 
-            # 2. Drawdown circuit breaker.
-            try:
-                breaker_tripped = await self._check_circuit_breaker()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("circuit breaker check failed: %s", exc)
-                breaker_tripped = False
-
-            # 3. Agent signals → execute (skip BUYs if breaker tripped).
-            try:
-                signals = await run_all_agents(use_llm=get_settings().llm_in_trading_loop)
-            except Exception as exc:  # noqa: BLE001
-                self.state.last_error = f"agent run failed: {exc}"
-                log.exception("autopilot agent run failed")
-                self._save()
-                return
-            try:
-                await self._execute(signals, allow_buys=not breaker_tripped)
+                # 3. Agent signals → execute (skip BUYs if breaker tripped).
+                try:
+                    signals = await run_all_agents(use_llm=get_settings().llm_in_trading_loop)
+                except Exception as exc:  # noqa: BLE001
+                    self.state.last_error = f"agent run failed: {exc}"
+                    log.exception("autopilot agent run failed")
+                    self._save()
+                    return
+                try:
+                    await self._execute(signals, allow_buys=not breaker_tripped)
+                finally:
+                    self._save()
             finally:
-                self._save()
+                storage.release_lock("autopilot_tick", owner=self._owner)
 
     # ── risk gates ─────────────────────────────────────────────────────
     async def _run_risk_gates(self) -> None:
