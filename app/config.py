@@ -29,9 +29,9 @@ class Timeframe(str, Enum):
 STATIC_SYMBOLS: tuple[str, ...] = (
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
     "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "DOTUSDT", "LINKUSDT",
-    "MATICUSDT", "LTCUSDT", "BCHUSDT", "ATOMUSDT", "UNIUSDT",
+    "POLUSDT", "LTCUSDT", "BCHUSDT", "ATOMUSDT", "UNIUSDT",
     "ETCUSDT", "FILUSDT", "NEARUSDT", "APTUSDT", "ARBUSDT",
-    "OPUSDT", "SHIBUSDT", "SUIUSDT", "RNDRUSDT", "AAVEUSDT",
+    "OPUSDT", "SHIBUSDT", "SUIUSDT", "FETUSDT", "AAVEUSDT",
 )
 
 # Back-compat alias — some modules import SYMBOLS directly.

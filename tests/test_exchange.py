@@ -85,3 +85,31 @@ async def test_live_order_sets_avg_fill_price_from_cum_quote():
         client_order_id="ctm-test-cumquote",
     )
     assert order.avg_fill_price == Decimal("101")
+
+
+def _filters_with(step: str, min_qty: str = "0"):
+    from app.exchange.filters import SymbolFilters
+
+    f = SymbolFilters()
+    f._info = {
+        "X": {"status": "TRADING", "step_size": Decimal(step), "min_qty": Decimal(min_qty)}
+    }
+    return f
+
+
+@pytest.mark.parametrize(
+    "step, raw, expected",
+    [
+        ("1", "500000.9", "500000"),       # large qty must NOT become "5E+5"
+        ("0.00001", "0.00018837", "0.00018"),
+        ("0.1", "5.92", "5.9"),
+        ("1", "3", "3"),
+    ],
+)
+def test_round_qty_never_scientific(step, raw, expected):
+    f = _filters_with(step)
+    q = f.round_qty("X", Decimal(raw))
+    assert q == Decimal(expected)
+    # Binance rejects scientific notation with -1100; the string form must be plain.
+    assert "E" not in str(q) and "e" not in str(q)
+

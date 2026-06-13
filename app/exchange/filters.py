@@ -17,6 +17,17 @@ from app.logging_setup import get_logger
 log = get_logger(__name__)
 
 
+def _plain(qty: Decimal) -> Decimal:
+    """Strip trailing zeros but never return scientific notation.
+
+    `Decimal.normalize()` yields e.g. Decimal('5E+5') for 500000, whose str()
+    is "5E+5" — Binance rejects that with -1100 "illegal characters". For any
+    value with a positive exponent we requantize to exponent 0 instead.
+    """
+    n = qty.normalize()
+    return n.quantize(Decimal("1")) if n.as_tuple().exponent > 0 else n
+
+
 class SymbolFilters:
     def __init__(self) -> None:
         self._info: dict[str, dict[str, Any]] = {}
@@ -58,7 +69,11 @@ class SymbolFilters:
         step: Optional[Decimal] = info.get("step_size")
         if step and step > 0:
             qty = (qty / step).quantize(Decimal("1"), rounding=ROUND_DOWN) * step
-        return qty.normalize()
+            # Re-quantize to the step's own exponent so the result keeps a plain
+            # fixed-point representation (e.g. step=1 → "500000", not "5E+5").
+            # Binance rejects scientific notation with -1100 "illegal characters".
+            qty = qty.quantize(step) if step >= 1 else qty
+        return _plain(qty)
 
     def meets_min(self, symbol: str, qty: Decimal, price: Decimal) -> bool:
         info = self._info.get(symbol) or {}
