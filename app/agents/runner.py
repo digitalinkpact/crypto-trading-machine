@@ -42,6 +42,11 @@ LLM_TIMEFRAMES = (Timeframe.D1, Timeframe.W1)
 # Cap concurrent LLM calls. Free tiers throttle aggressively at higher fan-out.
 _LLM_CONCURRENCY = 4
 
+# Minimum candles before indicators are computable. The `ta` ATR/RSI windows
+# (14) raise on shorter frames; newly-listed coins are skipped until they have
+# enough history.
+_MIN_BARS = 30
+
 
 async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
     """Run every agent over every (symbol, timeframe), return aggregated signals.
@@ -114,7 +119,15 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
             except Exception as exc:  # noqa: BLE001
                 log.warning("data fetch failed %s/%s: %s", symbol, tf.value, exc)
                 continue
-            df = add_indicators(df)
+            # Newly-listed coins can have very few candles; the indicator stack
+            # (ATR/RSI window=14) raises on short frames. Skip them quietly.
+            if df is None or len(df) < _MIN_BARS:
+                continue
+            try:
+                df = add_indicators(df)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("indicators failed %s/%s: %s", symbol, tf.value, exc)
+                continue
             try:
                 regime = classifier.classify(df)
             except Exception as exc:  # noqa: BLE001
