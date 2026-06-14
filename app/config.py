@@ -10,8 +10,12 @@ from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_ENV_PATH = _REPO_ROOT / ".env"
 
 
 class Timeframe(str, Enum):
@@ -69,7 +73,7 @@ class Settings(BaseSettings):
     api_retry_backoff_base: int = Field(2, ge=1, le=10)
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_ENV_PATH,
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
@@ -147,14 +151,24 @@ class Settings(BaseSettings):
     smtp_starttls: bool = True
 
     # Safety toggles — default to safe values
+    # Explicit live-mode override. When true, this process is forced to trade
+    # live regardless of stale PAPER_TRADING / DRY_RUN values in older envs.
+    live_mode: bool = False
     dry_run: bool = True
     paper_trading: bool = True
+
+    @model_validator(mode="after")
+    def _apply_live_mode_override(self) -> "Settings":
+        if self.live_mode:
+            self.paper_trading = False
+            self.dry_run = False
+        return self
 
     # Risk caps
     max_position_pct: float = Field(0.05, ge=0.0, le=1.0)        # was 0.10 — safer with 25 coins
     max_portfolio_risk_pct: float = Field(0.25, ge=0.0, le=1.0)
     kelly_fraction_cap: float = Field(0.25, ge=0.0, le=1.0)
-    max_open_positions: int = Field(6, ge=1, le=25)              # cap concurrent positions
+    max_open_positions: int = Field(25, ge=1, le=25)             # cap concurrent positions
     max_long_exposure_pct: float = Field(0.60, ge=0.0, le=1.0)   # ≤ 60% of equity in non-USDT
 
     # Exit gates (hard rules, evaluated every risk-tick)

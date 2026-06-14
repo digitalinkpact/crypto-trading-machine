@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+from app.config import get_settings
 from app.trading import risk
 
 
@@ -87,9 +88,16 @@ def test_volatility_scaled_pct():
 
 
 def test_max_open_positions_cap():
-    ok, _ = risk.can_open_new_position(open_positions=5, long_exposure_pct=0.20)
+    s = get_settings()
+    ok, _ = risk.can_open_new_position(
+        open_positions=max(0, s.max_open_positions - 1),
+        long_exposure_pct=0.20,
+    )
     assert ok is True
-    blocked, why = risk.can_open_new_position(open_positions=6, long_exposure_pct=0.20)
+    blocked, why = risk.can_open_new_position(
+        open_positions=s.max_open_positions,
+        long_exposure_pct=0.20,
+    )
     assert blocked is False
     assert "max_open_positions" in why
 

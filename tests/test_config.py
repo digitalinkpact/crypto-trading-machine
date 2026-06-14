@@ -27,3 +27,20 @@ def test_runtime_settings_loadable():
     # The cached runtime settings (from .env if present) must at least parse.
     s = get_settings()
     assert 0.0 < s.kelly_fraction_cap <= 1.0
+
+
+def test_live_mode_forces_live_flags():
+    s = Settings(_env_file=None, live_mode=True, paper_trading=True, dry_run=True)
+    assert s.live_mode is True
+    assert s.paper_trading is False
+    assert s.dry_run is False
+
+
+def test_live_mode_from_env_forces_live(monkeypatch):
+    monkeypatch.setenv("LIVE_MODE", "true")
+    monkeypatch.setenv("PAPER_TRADING", "true")
+    monkeypatch.setenv("DRY_RUN", "true")
+    s = Settings(_env_file=None)
+    assert s.live_mode is True
+    assert s.paper_trading is False
+    assert s.dry_run is False

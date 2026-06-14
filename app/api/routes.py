@@ -553,6 +553,7 @@ async def config_summary() -> dict:
     s = get_settings()
     return {
         "env": s.env,
+        "live_mode": s.live_mode,
         "dry_run": s.dry_run,
         "paper_trading": s.paper_trading,
         "mode": "paper" if s.paper_trading else "live",
