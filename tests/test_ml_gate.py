@@ -123,3 +123,43 @@ async def test_fail_open_when_model_predict_raises(autopilot):
 
     proba = await autopilot._ml_win_proba(_BadModel(), "BTCUSDT", _signal())
     assert proba is None
+
+
+# ── staleness guard ─────────────────────────────────────────────────────
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from app.trading.autopilot import _model_age_hours  # noqa: E402
+
+
+def test_model_age_hours_recent():
+    ts = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+    age = _model_age_hours(ts)
+    assert age is not None
+    assert 4.9 < age < 5.1
+
+
+def test_model_age_hours_stale():
+    ts = (datetime.now(timezone.utc) - timedelta(days=17)).isoformat()
+    age = _model_age_hours(ts)
+    assert age is not None
+    assert age > 72  # trips the default fail-open window
+
+
+def test_model_age_hours_naive_timestamp_treated_as_utc():
+    # Persisted timestamps may lack tzinfo; must not raise and must compute.
+    ts = (
+        (datetime.now(timezone.utc) - timedelta(hours=10))
+        .replace(tzinfo=None)
+        .isoformat()
+    )
+    age = _model_age_hours(ts)
+    assert age is not None
+    assert 9.5 < age < 10.5
+
+
+def test_model_age_hours_none_and_garbage_fail_safe():
+    # Missing/unparseable stamps return None so staleness can only relax, never
+    # tighten, the gate (caller treats None as "fresh").
+    assert _model_age_hours(None) is None
+    assert _model_age_hours("") is None
+    assert _model_age_hours("not-a-date") is None

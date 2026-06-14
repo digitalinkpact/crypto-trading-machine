@@ -200,6 +200,11 @@ class Settings(BaseSettings):
     # model has trained on enough labeled data. Risk exits bypass this gate.
     ml_gate_enabled: bool = True
     ml_gate_threshold: float = Field(0.50, ge=0.0, le=1.0)
+    # Safety valve: an auxiliary quality model trained on a past market regime
+    # must not veto trades forever. If the loaded model is older than this many
+    # hours, the gate goes advisory (fail-open) so a stale, single-regime model
+    # can't permanently freeze entries while the learning loop catches up.
+    ml_gate_max_model_age_hours: int = Field(72, ge=1, le=8760)
 
     # ── Live price stream (websocket) ────────────────────────────────
     # Maintains a sub-second last-price cache from the Binance.US combined

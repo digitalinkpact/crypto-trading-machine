@@ -97,6 +97,20 @@ def _parse_dt(v: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _model_age_hours(trained_at: Optional[str]) -> Optional[float]:
+    """Age in hours of a model artifact from its ISO ``trained_at`` stamp.
+
+    Returns None if the timestamp is missing or unparseable (caller then treats
+    the model as fresh — staleness can only relax, never tighten, the gate).
+    """
+    dt = _parse_dt(trained_at)
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+
+
 class Autopilot:
     """Singleton trading controller."""
 
@@ -329,9 +343,23 @@ class Autopilot:
                 if artifact:
                     ml_model = artifact["model"]
                     ml_model_version = artifact.get("version")
+                    # Staleness guard: a model trained in a past market regime
+                    # must not hold an indefinite veto. If it's older than the
+                    # configured window, go advisory (fail-open) so entries
+                    # aren't frozen forever while the learning loop retrains.
+                    age_h = _model_age_hours(artifact.get("trained_at"))
+                    if age_h is not None and age_h > s.ml_gate_max_model_age_hours:
+                        if self._ml_logged_version != -2:
+                            log.warning(
+                                "[ML_GATE] model v%s is stale (%.1fh > %dh) — gate "
+                                "is fail-open until a fresher model trains",
+                                ml_model_version, age_h, s.ml_gate_max_model_age_hours,
+                            )
+                            self._ml_logged_version = -2
+                        ml_model = None
                     # Log once per distinct version so retrains are visible
                     # without spamming every tick.
-                    if ml_model_version != self._ml_logged_version:
+                    elif ml_model_version != self._ml_logged_version:
                         metrics = artifact.get("metrics") or {}
                         log.info(
                             "[ML_GATE] model loaded: version=%s algo=%s trained=%s "
@@ -368,6 +396,15 @@ class Autopilot:
                 _bump("low_confidence", symbol,
                       f"{sig.action.value} conf={sig.confidence:.2f} < {min_conf:.2f}")
                 continue
+            # Record the candidate signal for ML training BEFORE the quality gate.
+            # The gate filters EXECUTION, but must never censor LEARNING: if we
+            # only recorded gate-approved signals, a model biased against one
+            # side (e.g. all BUYs in a downtrend) would starve itself of that
+            # side's outcomes and could never relearn — a permanent one-way lock.
+            # Recording every confidence-qualifying signal keeps the learning
+            # loop fed with counterfactual outcomes so the gate can self-correct.
+            if sig.action in (SignalAction.BUY, SignalAction.SELL):
+                await self._record_signal_event(symbol, sig)
             if ml_model is not None and sig.action in (SignalAction.BUY, SignalAction.SELL):
                 proba = await self._ml_win_proba(ml_model, symbol, sig)
                 if proba is not None:
@@ -387,9 +424,6 @@ class Autopilot:
                 _bump("not_listed", symbol)
                 continue
             try:
-                if sig.action in (SignalAction.BUY, SignalAction.SELL):
-                    await self._record_signal_event(symbol, sig)
-
                 if sig.action == SignalAction.BUY:
                     if not allow_buys:
                         _bump("breaker_tripped", symbol)
