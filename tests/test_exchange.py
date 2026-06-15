@@ -180,3 +180,55 @@ async def test_fetch_dynamic_symbols_caps_to_top_n_by_volume(monkeypatch):
     # Top 3 by volume are EEE/DDD/CCC; output is sorted alphabetically.
     assert result == ["CCCUSDT", "DDDUSDT", "EEEUSDT"]
 
+
+@pytest.mark.asyncio
+async def test_fetch_liquid_universe_filters_and_caps(monkeypatch):
+    import pandas as pd
+    from app.exchange import symbols as sym_mod
+
+    bases = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+    exchange_info = {
+        "symbols": [{"symbol": f"{b}USDT", "status": "TRADING"} for b in bases]
+    }
+    # Volume desc: EEE > DDD > CCC > BBB > AAA; AAA below the $5M floor.
+    ticker_24hr = [
+        {"symbol": "AAAUSDT", "quoteVolume": "1000000"},     # dropped: < $5M
+        {"symbol": "BBBUSDT", "quoteVolume": "6000000"},
+        {"symbol": "CCCUSDT", "quoteVolume": "7000000"},
+        {"symbol": "DDDUSDT", "quoteVolume": "8000000"},
+        {"symbol": "EEEUSDT", "quoteVolume": "9000000"},
+    ]
+
+    def _factory(*args, **kwargs):
+        return _FakeAsyncClient(exchange_info, ticker_24hr, *args, **kwargs)
+
+    monkeypatch.setattr(sym_mod.httpx, "AsyncClient", _factory)
+
+    class _FakeClient:
+        # EEE has a wide 0.50% spread; DDD is too new (5 daily candles).
+        spreads = {"BBBUSDT": (100.0, 100.05), "CCCUSDT": (100.0, 100.1),
+                   "DDDUSDT": (100.0, 100.1), "EEEUSDT": (100.0, 100.5)}
+        ages = {"BBBUSDT": 30, "CCCUSDT": 30, "DDDUSDT": 5, "EEEUSDT": 30}
+
+        async def order_book(self, symbol, limit=5):
+            bid, ask = self.spreads[symbol]
+            return {"bids": [[str(bid), "10"]], "asks": [[str(ask), "10"]]}
+
+        async def klines(self, symbol, timeframe, limit=500):
+            n = min(self.ages[symbol], limit)
+            return pd.DataFrame({"close": list(range(n))})
+
+    sym_mod._LIQUID_CACHE = {"symbols": None, "timestamp": 0.0}
+    monkeypatch.setattr(
+        sym_mod, "get_settings",
+        lambda: Settings(
+            liquidity_pairlist_enabled=True, universe_size=5,
+            min_24h_volume=5_000_000.0, max_spread_percent=0.20,
+            min_days_listed=15, final_pairlist_size=10,
+        ),
+    )
+
+    result = await sym_mod.fetch_liquid_universe(client=_FakeClient())
+    # AAA (low vol), DDD (too new), EEE (spread 0.50% > 0.20%) all dropped.
+    assert result == ["BBBUSDT", "CCCUSDT"]
+

@@ -70,6 +70,32 @@ class Settings(BaseSettings):
     exclude_leveraged_tokens: bool = True
     min_quote_volume_usdt: float = Field(0.0, ge=0.0)
     max_symbols: int = Field(100, ge=0, le=1000)
+
+    # ── Liquidity-ranked pairlist (multi-stage universe filter) ──────────
+    # When `liquidity_pairlist_enabled` is True, the tradable universe is built
+    # by a staged pipeline instead of the simple top-N above:
+    #   1. take the top `universe_size` USDT pairs by 24h `volume_sort_key`
+    #   2. drop pairs with 24h volume < `min_24h_volume` (USDT)
+    #   3. drop pairs with fewer than `min_days_listed` days of history
+    #   4. drop pairs whose top-of-book spread exceeds `max_spread_percent`
+    #   5. keep the top `final_pairlist_size` survivors (volume-ranked)
+    # Refreshed every `volume_refresh_seconds`; falls back to
+    # fetch_dynamic_symbols then the static list on any API failure.
+    #
+    # UNIT FOOTGUN: `max_spread_percent` is a PERCENT (0.20 = 0.20%), whereas the
+    # execution-time `max_spread_pct` below is a FRACTION (0.0015 = 0.15%). The
+    # universe filter is a coarse compute-saver; the execution gate is the hard
+    # money-guard and is intentionally kept stricter.
+    liquidity_pairlist_enabled: bool = True
+    universe_size: int = Field(75, ge=1, le=1000)
+    min_24h_volume: float = Field(5_000_000.0, ge=0.0)
+    max_spread_percent: float = Field(0.20, ge=0.0, le=100.0)
+    min_days_listed: int = Field(15, ge=0, le=10_000)
+    final_pairlist_size: int = Field(50, ge=1, le=1000)
+    volume_sort_key: str = "quoteVolume"
+    volume_refresh_seconds: int = Field(1800, ge=30, le=86_400)
+    # Max concurrent per-symbol liquidity probes (depth + listing age).
+    liquidity_probe_concurrency: int = Field(8, ge=1, le=50)
     # API rate limit/backoff
     api_retry_attempts: int = Field(3, ge=1, le=10)
     api_retry_backoff_base: int = Field(2, ge=1, le=10)
