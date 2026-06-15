@@ -1,6 +1,9 @@
 """Credential & settings persistence — writes config to .env without duplicates."""
 from __future__ import annotations
 
+import contextlib
+import os
+import tempfile
 from pathlib import Path
 from typing import Iterable
 
@@ -20,7 +23,22 @@ def _write_env(updates: dict[str, str], drop: Iterable[str] = ()) -> None:
             existing.append(line)
     for k, v in updates.items():
         existing.append(f"{k}={v}")
-    _ENV_PATH.write_text("\n".join(existing).rstrip() + "\n")
+    content = "\n".join(existing).rstrip() + "\n"
+    # Atomic write with restrictive perms: .env holds API secrets, so it must
+    # never be world-readable, and a crash mid-write must not truncate it.
+    directory = _ENV_PATH.resolve().parent
+    fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=".env.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, _ENV_PATH)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
     get_settings.cache_clear()
 
 
@@ -55,16 +73,24 @@ def credentials_present() -> bool:
 # ── Tunable risk knobs (written to .env so they survive restarts) ──────────
 
 
+def _to_int(raw: str) -> int:
+    """Parse an int, tolerating whole-number decimals like '6.0' from form inputs."""
+    f = float(raw)
+    if not f.is_integer():
+        raise ValueError(f"expected a whole number, got {raw!r}")
+    return int(f)
+
+
 _RISK_KEYS = {
-    "stop_loss_pct":                  ("STOP_LOSS_PCT",                  float, (0.005, 0.20)),
-    "take_profit_pct":                ("TAKE_PROFIT_PCT",                float, (0.005, 0.50)),
-    "trailing_stop_pct":              ("TRAILING_STOP_PCT",              float, (0.005, 0.20)),
-    "max_hold_hours":                 ("MAX_HOLD_HOURS",                 int,   (1, 10000)),
-    "drawdown_circuit_breaker_pct":   ("DRAWDOWN_CIRCUIT_BREAKER_PCT",   float, (0.01, 0.50)),
-    "min_signal_confidence":          ("MIN_SIGNAL_CONFIDENCE",          float, (0.0, 1.0)),
-    "max_position_pct":               ("MAX_POSITION_PCT",               float, (0.005, 1.0)),
-    "max_open_positions":             ("MAX_OPEN_POSITIONS",             int,   (1, 25)),
-    "ml_gate_threshold":              ("ML_GATE_THRESHOLD",              float, (0.0, 1.0)),
+    "stop_loss_pct":                  ("STOP_LOSS_PCT",                  float,   (0.005, 0.20)),
+    "take_profit_pct":                ("TAKE_PROFIT_PCT",                float,   (0.005, 0.50)),
+    "trailing_stop_pct":              ("TRAILING_STOP_PCT",              float,   (0.005, 0.20)),
+    "max_hold_hours":                 ("MAX_HOLD_HOURS",                 _to_int, (1, 10000)),
+    "drawdown_circuit_breaker_pct":   ("DRAWDOWN_CIRCUIT_BREAKER_PCT",   float,   (0.01, 0.50)),
+    "min_signal_confidence":          ("MIN_SIGNAL_CONFIDENCE",          float,   (0.0, 1.0)),
+    "max_position_pct":               ("MAX_POSITION_PCT",               float,   (0.005, 1.0)),
+    "max_open_positions":             ("MAX_OPEN_POSITIONS",             _to_int, (1, 25)),
+    "ml_gate_threshold":              ("ML_GATE_THRESHOLD",              float,   (0.0, 1.0)),
 }
 
 

@@ -1,10 +1,10 @@
 
-from __future__ import annotations
 """Application configuration — single source of truth.
 
 Symbols, timeframes, and risk caps are defined here. Agents, indicators, and
 scripts must import from this module rather than hardcoding values.
 """
+from __future__ import annotations
 
 from enum import Enum
 from functools import lru_cache
@@ -65,9 +65,6 @@ class Settings(BaseSettings):
     #    Raise it (e.g. 1_000_000) to skip thin coins with high slippage risk.
     exclude_leveraged_tokens: bool = True
     min_quote_volume_usdt: float = Field(0.0, ge=0.0)
-    # Enhanced risk management
-    max_total_exposure_percentage: float = Field(50.0, ge=1.0, le=100.0)
-    max_position_size_percent: float = Field(10.0, ge=1.0, le=100.0)
     # API rate limit/backoff
     api_retry_attempts: int = Field(3, ge=1, le=10)
     api_retry_backoff_base: int = Field(2, ge=1, le=10)
@@ -101,7 +98,7 @@ class Settings(BaseSettings):
     github_token: SecretStr = SecretStr("")
     github_base_url: str = "https://models.github.ai/inference"
     github_model: str = "openai/gpt-4o"
-    # Optional web context for the LLM reasoner (off by default).
+    # Optional web context for the LLM reasoner (enabled per operator request).
     # When enabled, the LLM agent fetches a small internet snapshot
     # (CoinGecko + DuckDuckGo instant answers) and appends it to the prompt.
     llm_web_enabled: bool = True
@@ -164,10 +161,10 @@ class Settings(BaseSettings):
             self.dry_run = False
         return self
 
-    # Risk caps
-    max_position_pct: float = Field(0.05, ge=0.0, le=1.0)        # was 0.10 — safer with 25 coins
+    # Risk caps — fraction-of-equity, single source of truth for sizing/exposure.
+    max_position_pct: float = Field(0.05, ge=0.005, le=1.0)      # per-position sizing cap
     max_portfolio_risk_pct: float = Field(0.25, ge=0.0, le=1.0)
-    kelly_fraction_cap: float = Field(0.25, ge=0.0, le=1.0)
+    kelly_fraction_cap: float = Field(0.25, ge=0.005, le=1.0)
     max_open_positions: int = Field(25, ge=1, le=25)             # cap concurrent positions
     max_long_exposure_pct: float = Field(0.60, ge=0.0, le=1.0)   # ≤ 60% of equity in non-USDT
 
@@ -210,8 +207,9 @@ class Settings(BaseSettings):
 
     # ML quality gate — drop trades the learned model rates below this win-prob.
     # Closes the learning loop: realized win/loss outcomes train the model,
-    # which then filters live BUY/SELL signals. Off by default; enable once the
-    # model has trained on enough labeled data. Risk exits bypass this gate.
+    # which then filters live BUY/SELL signals. Enabled; until the model has
+    # trained on enough labeled data the gate fails open (see max_model_age
+    # below). Risk exits bypass this gate.
     ml_gate_enabled: bool = True
     ml_gate_threshold: float = Field(0.50, ge=0.0, le=1.0)
     # Safety valve: an auxiliary quality model trained on a past market regime

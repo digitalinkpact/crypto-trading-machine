@@ -7,8 +7,10 @@ from fastapi import FastAPI
 
 from app.api import router
 from app.auth import auth_guard, auth_router
+from app.config import get_settings
 from app.exchange.filters import filters
 from app.exchange.ws_stream import live_prices
+from app.llm import LLMReasoner
 from app.logging_setup import configure_logging, get_logger
 from app.scheduler import build_scheduler
 from app.storage import storage
@@ -20,6 +22,22 @@ log = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
+    settings = get_settings()
+    # Fail loud if the LLM is wired into the trading loop but disabled (e.g. the
+    # configured provider has no API key/token on this host). Without this guard
+    # a missing GITHUB_TOKEN/DEEPSEEK_API_KEY silently turns every LLM vote into
+    # HOLD/0.0 while the operator believes LLM reasoning is active.
+    if settings.llm_in_trading_loop:
+        reasoner = LLMReasoner()
+        if not reasoner.enabled:
+            log.warning(
+                "LLM_IN_TRADING_LOOP is true but the LLM reasoner is DISABLED "
+                "(provider=%s has no API key/token). LLM votes will be HOLD/0.0. "
+                "Set a key for this provider or unset LLM_IN_TRADING_LOOP.",
+                reasoner.provider,
+            )
+        else:
+            log.info("LLM reasoner active in trading loop; provider=%s", reasoner.provider)
     # Drop expired sessions/tokens on boot.
     try:
         storage.purge_expired_sessions()
@@ -57,9 +75,12 @@ async def lifespan(app: FastAPI):
             await live_prices.stop()
         except Exception as exc:  # noqa: BLE001
             log.warning("live price stream stop failed: %s", exc)
-        if scheduler is not None:
-            scheduler.shutdown(wait=False)
-            log.info("scheduler stopped")
+        if scheduler is not None and scheduler.running:
+            try:
+                scheduler.shutdown(wait=False)
+                log.info("scheduler stopped")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("scheduler shutdown failed: %s", exc)
 
 
 app = FastAPI(title="AI Crypto Trading Machine", lifespan=lifespan)
