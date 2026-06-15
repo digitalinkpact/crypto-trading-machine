@@ -82,14 +82,20 @@ class Settings(BaseSettings):
     # Refreshed every `volume_refresh_seconds`; falls back to
     # fetch_dynamic_symbols then the static list on any API failure.
     #
-    # UNIT FOOTGUN: `max_spread_percent` is a PERCENT (0.20 = 0.20%), whereas the
+    # UNIT FOOTGUN: `max_spread_percent` is a PERCENT (0.50 = 0.50%), whereas the
     # execution-time `max_spread_pct` below is a FRACTION (0.0015 = 0.15%). The
     # universe filter is a coarse compute-saver; the execution gate is the hard
     # money-guard and is intentionally kept stricter.
+    #
+    # SCALE NOTE: these defaults are tuned for Binance.US, which is a *small*
+    # exchange — even BTCUSDT trades only ~$2-3M/24h and the ~50th USDT pair is
+    # under $2k/24h. binance.com-scale floors (e.g. $5M) would zero the universe.
+    # `min_24h_volume` is therefore intentionally low; the spread cap plus the
+    # execution-time order-book gate do the real liquidity protection.
     liquidity_pairlist_enabled: bool = True
     universe_size: int = Field(75, ge=1, le=1000)
-    min_24h_volume: float = Field(5_000_000.0, ge=0.0)
-    max_spread_percent: float = Field(0.20, ge=0.0, le=100.0)
+    min_24h_volume: float = Field(1_000.0, ge=0.0)
+    max_spread_percent: float = Field(0.50, ge=0.0, le=100.0)
     min_days_listed: int = Field(15, ge=0, le=10_000)
     final_pairlist_size: int = Field(50, ge=1, le=1000)
     volume_sort_key: str = "quoteVolume"

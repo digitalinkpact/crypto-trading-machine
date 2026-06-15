@@ -241,6 +241,17 @@ async def fetch_liquid_universe(
         final = survivors[:final_size]
         final.sort()  # alphabetical for stable downstream output
 
+        # Safety: never return an empty universe (a mis-tuned floor/spread would
+        # otherwise silently halt all trading). Fall back to the dynamic list.
+        if not final:
+            log.warning(
+                "[UNIVERSE] staged pipeline yielded 0 survivors "
+                "(min_24h_volume=$%.0f, max_spread=%.2f%%). Falling back to "
+                "fetch_dynamic_symbols.",
+                min_vol, max_spread,
+            )
+            return await fetch_dynamic_symbols()
+
         _LIQUID_CACHE["symbols"] = final
         _LIQUID_CACHE["timestamp"] = now
         log.info(
