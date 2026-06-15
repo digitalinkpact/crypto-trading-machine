@@ -63,8 +63,13 @@ class Settings(BaseSettings):
     #  - Stablecoin→stablecoin pairs (USDCUSDT, …) are excluded: no edge.
     #  - min_quote_volume_usdt is a 24h liquidity floor; 0 = no floor (all coins).
     #    Raise it (e.g. 1_000_000) to skip thin coins with high slippage risk.
+    #  - max_symbols caps the universe to the top-N USDT pairs ranked by 24h
+    #    quote volume (the most-liquid coins). 0 = no cap. Applied AFTER the
+    #    min_quote_volume_usdt floor. The top-N are inherently liquid, so this
+    #    doubles as a slippage guard while widening the tradeable universe.
     exclude_leveraged_tokens: bool = True
     min_quote_volume_usdt: float = Field(0.0, ge=0.0)
+    max_symbols: int = Field(100, ge=0, le=1000)
     # API rate limit/backoff
     api_retry_attempts: int = Field(3, ge=1, le=10)
     api_retry_backoff_base: int = Field(2, ge=1, le=10)

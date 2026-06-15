@@ -34,8 +34,10 @@ async def fetch_dynamic_symbols() -> List[str]:
 
     Excludes leveraged ETF tokens and stablecoin->stablecoin pairs. When
     `min_quote_volume_usdt > 0`, also drops pairs below that 24h quote-volume
-    floor (a liquidity guard against thin-book slippage). Cached for
-    `symbols_cache_minutes`. Falls back to the static list on any API failure.
+    floor (a liquidity guard against thin-book slippage). When `max_symbols > 0`,
+    caps the result to the top-N pairs ranked by 24h quote volume (most liquid).
+    Cached for `symbols_cache_minutes`. Falls back to the static list on any
+    API failure.
     """
     s = get_settings()
     cache_minutes = getattr(s, "symbols_cache_minutes", 60)
@@ -46,6 +48,7 @@ async def fetch_dynamic_symbols() -> List[str]:
     base_url = s.binance_base_url.rstrip("/")
     exclude_leveraged = getattr(s, "exclude_leveraged_tokens", True)
     floor = float(getattr(s, "min_quote_volume_usdt", 0.0) or 0.0)
+    top_n = int(getattr(s, "max_symbols", 0) or 0)
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(f"{base_url}/api/v3/exchangeInfo")
@@ -60,21 +63,27 @@ async def fetch_dynamic_symbols() -> List[str]:
                 and not _is_stable_pair(d["symbol"])
             ]
 
-            if floor > 0:
+            if floor > 0 or top_n > 0:
                 t = await client.get(f"{base_url}/api/v3/ticker/24hr")
                 t.raise_for_status()
                 vol = {
                     row["symbol"]: float(row.get("quoteVolume", 0.0) or 0.0)
                     for row in t.json()
                 }
-                symbols = [sym for sym in symbols if vol.get(sym, 0.0) >= floor]
+                if floor > 0:
+                    symbols = [sym for sym in symbols if vol.get(sym, 0.0) >= floor]
+                if top_n > 0:
+                    # Keep the top-N most-liquid pairs by 24h quote volume.
+                    symbols = sorted(
+                        symbols, key=lambda sym: vol.get(sym, 0.0), reverse=True
+                    )[:top_n]
 
             symbols.sort()
             _SYMBOLS_CACHE["symbols"] = symbols
             _SYMBOLS_CACHE["timestamp"] = now
             log.info(
-                "dynamic symbols: %d USDT pairs (leveraged_excluded=%s, vol_floor=%.0f)",
-                len(symbols), exclude_leveraged, floor,
+                "dynamic symbols: %d USDT pairs (leveraged_excluded=%s, vol_floor=%.0f, top_n=%d)",
+                len(symbols), exclude_leveraged, floor, top_n,
             )
             return symbols
     except Exception as exc:  # noqa: BLE001

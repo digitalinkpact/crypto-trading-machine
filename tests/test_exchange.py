@@ -113,3 +113,70 @@ def test_round_qty_never_scientific(step, raw, expected):
     # Binance rejects scientific notation with -1100; the string form must be plain.
     assert "E" not in str(q) and "e" not in str(q)
 
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _FakeAsyncClient:
+    """Stubs httpx.AsyncClient for fetch_dynamic_symbols — no network."""
+
+    def __init__(self, exchange_info, ticker_24hr, *args, **kwargs):
+        self._exchange_info = exchange_info
+        self._ticker_24hr = ticker_24hr
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, *args, **kwargs):
+        if "exchangeInfo" in url:
+            return _FakeResp(self._exchange_info)
+        if "ticker/24hr" in url:
+            return _FakeResp(self._ticker_24hr)
+        raise AssertionError(f"unexpected url {url}")
+
+
+@pytest.mark.asyncio
+async def test_fetch_dynamic_symbols_caps_to_top_n_by_volume(monkeypatch):
+    from app.exchange import symbols as sym_mod
+
+    bases = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+    exchange_info = {
+        "symbols": [
+            {"symbol": f"{b}USDT", "status": "TRADING"} for b in bases
+        ]
+    }
+    # Volumes ascending so AAA is least and EEE is most liquid.
+    ticker_24hr = [
+        {"symbol": "AAAUSDT", "quoteVolume": "100"},
+        {"symbol": "BBBUSDT", "quoteVolume": "200"},
+        {"symbol": "CCCUSDT", "quoteVolume": "300"},
+        {"symbol": "DDDUSDT", "quoteVolume": "400"},
+        {"symbol": "EEEUSDT", "quoteVolume": "500"},
+    ]
+
+    def _factory(*args, **kwargs):
+        return _FakeAsyncClient(exchange_info, ticker_24hr, *args, **kwargs)
+
+    monkeypatch.setattr(sym_mod.httpx, "AsyncClient", _factory)
+    # Bust the module-level cache and force a top-3 cap with no volume floor.
+    sym_mod._SYMBOLS_CACHE = {"symbols": None, "timestamp": 0.0}
+    monkeypatch.setattr(
+        sym_mod, "get_settings",
+        lambda: Settings(use_dynamic_symbols=True, min_quote_volume_usdt=0.0, max_symbols=3),
+    )
+
+    result = await sym_mod.fetch_dynamic_symbols()
+    # Top 3 by volume are EEE/DDD/CCC; output is sorted alphabetically.
+    assert result == ["CCCUSDT", "DDDUSDT", "EEEUSDT"]
+
