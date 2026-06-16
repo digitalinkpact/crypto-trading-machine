@@ -24,7 +24,7 @@ from typing import Optional
 
 from app.agents import run_all_agents
 from app.config import Timeframe, get_settings
-from app.exchange import BinanceUSClient, Order, OrderSide, OrderType
+from app.exchange import BinanceUSClient, Order, OrderSide, OrderStatus, OrderType
 from app.exchange.derivatives import derivatives
 from app.exchange.filters import filters
 from app.exchange.orderbook import liquidity_gate
