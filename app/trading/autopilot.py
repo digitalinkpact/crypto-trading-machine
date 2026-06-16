@@ -793,16 +793,40 @@ class Autopilot:
             order = await client.place_order(
                 symbol=symbol, side=side, type=OrderType.MARKET, quantity=qty,
             )
+            # Only mirror a live order into our book if the exchange actually
+            # filled it. Recording the *requested* qty on a partial fill (or a
+            # config-drift DRY_RUN) would leave a phantom/oversized position the
+            # next SELL could try to over-dump. Use the executed quantity and
+            # the real average fill price so our book matches Binance exactly.
+            filled = order.filled_quantity or Decimal("0")
+            if order.status not in (
+                OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED
+            ) or filled <= 0:
+                log.error(
+                    "LIVE order NOT filled — not recording: %s %s qty=%s status=%s "
+                    "filled=%s coid=%s",
+                    symbol, side.value, qty, order.status, filled,
+                    order.client_order_id,
+                )
+                self.state.last_error = (
+                    f"{symbol} {side.value} not filled (status={order.status})"
+                )
+                return order
+            if filled < qty:
+                log.warning(
+                    "LIVE partial fill %s %s: requested=%s filled=%s coid=%s",
+                    symbol, side.value, qty, filled, order.client_order_id,
+                )
             try:
                 price = order.avg_fill_price or order.price or await self._price(symbol)
                 storage.record_order(
                     mode="live", symbol=symbol, side=side.value,
-                    qty=qty, price=price,
+                    qty=filled, price=price,
                     client_order_id=order.client_order_id, agents=agents,
                 )
                 if side is OrderSide.BUY:
                     storage.open_position(
-                        symbol=symbol, mode="live", qty=qty,
+                        symbol=symbol, mode="live", qty=filled,
                         entry_price=price, agents=agents,
                     )
                 else:
