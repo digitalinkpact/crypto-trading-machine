@@ -243,6 +243,19 @@ class Autopilot:
         positions = [p for p in storage.all_positions() if p["mode"] == self.state.mode]
         if not positions:
             return
+        # Actual free balances — risk exits must sell what the exchange really
+        # holds, not the recorded position qty. A market BUY pays its fee out of
+        # the received base asset (book 45 XLM, free 44.991), so selling the
+        # book qty triggers a -2010 "insufficient balance" rejection on every
+        # tick and a stop-loss/take-profit can never clear. Clamp to free.
+        free_balances: dict[str, Decimal] = {}
+        try:
+            snap = await portfolio_snapshot(mode=self.state.mode)
+            free_balances = {
+                a: Decimal(str(q)) for a, q in snap["all_balances"].items()
+            }
+        except Exception as exc:  # noqa: BLE001
+            log.warning("risk-gate balance fetch failed: %s", exc)
         prices: dict[str, Decimal] = {}
         for pos in positions:
             try:
@@ -253,12 +266,30 @@ class Autopilot:
         for ex in exits:
             try:
                 price = prices.get(ex.symbol) or await self._price(ex.symbol)
-                qty = filters.round_qty(ex.symbol, ex.qty)
+                base = ex.symbol.removesuffix("USDT")
+                avail = free_balances.get(base)
+                # Clamp the exit to the real free balance when we know it.
+                sell_qty = ex.qty if avail is None else min(ex.qty, avail)
+                qty = filters.round_qty(ex.symbol, sell_qty)
                 if qty <= 0 or not filters.meets_min(ex.symbol, qty, price):
-                    log.info("risk-exit %s skipped: filters reject qty=%s", ex.symbol, qty)
+                    # Nothing sellable (dust below min-notional, or the balance
+                    # is already gone). Close the stale book position so it stops
+                    # re-triggering the gate every tick instead of erroring forever.
+                    if avail is not None and avail < ex.qty:
+                        log.warning(
+                            "risk-exit %s: book qty=%s > free=%s and remainder "
+                            "below min — closing stale position", ex.symbol, ex.qty, avail,
+                        )
+                        try:
+                            storage.close_position(symbol=ex.symbol, exit_price=price)
+                            risk.clear_hwm(ex.symbol)
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("stale close failed for %s: %s", ex.symbol, exc)
+                    else:
+                        log.info("risk-exit %s skipped: filters reject qty=%s", ex.symbol, qty)
                     continue
-                log.warning("RISK EXIT %s reason=%s qty=%s price=%s",
-                            ex.symbol, ex.reason, qty, price)
+                log.warning("RISK EXIT %s reason=%s qty=%s price=%s (book=%s free=%s)",
+                            ex.symbol, ex.reason, qty, price, ex.qty, avail)
                 await self._submit(ex.symbol, OrderSide.SELL, qty, [f"risk:{ex.reason}"])
                 risk.clear_hwm(ex.symbol)
             except Exception as exc:  # noqa: BLE001
