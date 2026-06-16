@@ -269,8 +269,10 @@ class Settings(BaseSettings):
     # or wide books. Fails OPEN (allows the trade) if the book can't be fetched.
     orderbook_gate_enabled: bool = True
     orderbook_depth_limit: int = Field(10, ge=5, le=100)
-    # Reject entry if (ask-bid)/mid exceeds this (0.0015 = 0.15%).
-    max_spread_pct: float = Field(0.0015, ge=0.0, le=0.05)
+    # Reject entry if (ask-bid)/mid exceeds this (0.005 = 0.50%). Aligned with
+    # the universe `max_spread_percent` (0.50%) — Binance.US is thin, so the old
+    # 0.15% was effectively un-satisfiable and starved the bot of entries.
+    max_spread_pct: float = Field(0.005, ge=0.0, le=0.05)
     # Require resting depth near mid >= this multiple of the trade notional.
     min_depth_trade_multiple: float = Field(2.0, ge=0.0, le=100.0)
     # "Near mid" band used for the depth check (0.001 = 0.1%).
