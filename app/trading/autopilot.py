@@ -209,6 +209,17 @@ class Autopilot:
         async with self._lock:
             self.state.last_tick_at = datetime.now(timezone.utc)
             try:
+                # 0. Ensure LOT_SIZE / MIN_NOTIONAL filters are loaded before any
+                #    order is placed. `filters.meets_min` fails OPEN when the
+                #    exchangeInfo cache is empty, so a tick that fires before the
+                #    app-startup load would submit dust SELLs that Binance rejects
+                #    with -1013 LOT_SIZE. The load is idempotent (no-op once
+                #    loaded), so this just closes the cold-start window.
+                try:
+                    await filters.load()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("filter load failed at tick start: %s", exc)
+
                 # 1. Risk gates — stop-loss / take-profit / trailing / max-hold.
                 #    Run BEFORE agents so we exit losers regardless of new signals.
                 try:
