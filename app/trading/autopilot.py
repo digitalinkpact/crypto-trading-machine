@@ -430,7 +430,15 @@ class Autopilot:
         gate_gated = 0
         gate_proba_sum = 0.0
 
-        for symbol, sig in signals.items():
+        # Rank candidates by confidence (desc) so scarce cash and the
+        # long-exposure cap are spent on the strongest signals first. Without
+        # this, the loop consumed capital in the universe's order — which is
+        # alphabetical — so it always filled the same early-alphabet coins and
+        # starved stronger signals later in the list.
+        ranked_signals = sorted(
+            signals.items(), key=lambda kv: kv[1].confidence, reverse=True
+        )
+        for symbol, sig in ranked_signals:
             if sig.action == SignalAction.HOLD:
                 _bump("action_hold", symbol, f"conf={sig.confidence:.2f}")
                 continue

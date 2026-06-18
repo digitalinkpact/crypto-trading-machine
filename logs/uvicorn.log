@@ -1,0 +1,22 @@
+nohup: ignoring input
+INFO:     Started server process [14880]
+INFO:     Waiting for application startup.
+2026-06-17T03:21:50 INFO    app.main — LLM reasoner active in trading loop; provider=deepseek
+2026-06-17T03:21:50 INFO    app.exchange.filters — loaded filters for 624 symbols
+2026-06-17T03:21:50 INFO    app.exchange.ws_stream — live price stream starting: wss://stream.binance.us:9443/ws/!miniTicker@arr
+2026-06-17T03:21:50 INFO    apscheduler.scheduler — Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2026-06-17T03:21:50 INFO    apscheduler.scheduler — Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2026-06-17T03:21:50 INFO    apscheduler.scheduler — Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2026-06-17T03:21:50 INFO    apscheduler.scheduler — Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2026-06-17T03:21:50 INFO    apscheduler.scheduler — Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2026-06-17T03:21:50 INFO    apscheduler.scheduler — Added job "refresh_market_data" to job store "default"
+2026-06-17T03:21:50 INFO    apscheduler.scheduler — Added job "autopilot_tick" to job store "default"
+2026-06-17T03:21:50 INFO    apscheduler.scheduler — Added job "llm_signal_pass" to job store "default"
+2026-06-17T03:21:50 INFO    apscheduler.scheduler — Added job "ml_learning_pass" to job store "default"
+2026-06-17T03:21:50 INFO    apscheduler.scheduler — Added job "equity_snapshot" to job store "default"
+2026-06-17T03:21:50 INFO    apscheduler.scheduler — Scheduler started
+2026-06-17T03:21:50 INFO    app.main — scheduler started; jobs=['market_data', 'autopilot', 'equity_curve', 'llm_pass', 'ml_learning']
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+2026-06-17T03:21:51 INFO    app.exchange.ws_stream — live price stream connected
+INFO:     127.0.0.1:34906 - "GET / HTTP/1.1" 303 See Other
