@@ -59,10 +59,16 @@ async def auth_guard(
         return await call_next(request)
 
     if _wants_html(request):
-        nxt = request.url.path
-        if request.url.query:
-            nxt = f"{nxt}?{request.url.query}"
-        return RedirectResponse(url=f"/auth/login?next={nxt}", status_code=303)
+        # Only round-trip the user back to GET-able pages. A POST action
+        # endpoint (e.g. /autopilot/stop) captured as `next` would be re-issued
+        # as a GET after login — hitting a POST-only route and returning 405.
+        # Send blocked non-GET actions to the dashboard instead.
+        if request.method == "GET":
+            nxt = request.url.path
+            if request.url.query:
+                nxt = f"{nxt}?{request.url.query}"
+            return RedirectResponse(url=f"/auth/login?next={nxt}", status_code=303)
+        return RedirectResponse(url="/auth/login", status_code=303)
 
     return JSONResponse(
         status_code=401,

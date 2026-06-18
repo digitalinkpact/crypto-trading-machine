@@ -85,11 +85,23 @@ def _clear_session_cookie(response) -> None:
     response.delete_cookie("session", path="/")
 
 
+# GET-able pages a user may safely be returned to after login. Action endpoints
+# (e.g. POST /autopilot/stop) are intentionally excluded: redirecting to them
+# issues a GET and 405s. Unknown targets fall back to the dashboard.
+_SAFE_NEXT_PAGES = {"/", "/trades", "/settings"}
+
+
+def _safe_next(next: str) -> str:
+    if not next.startswith("/") or next.startswith("//"):
+        return "/"
+    return next if next.split("?", 1)[0] in _SAFE_NEXT_PAGES else "/"
+
+
 # ── Login ─────────────────────────────────────────────────────────────
 @router.get("/login", response_class=HTMLResponse, include_in_schema=False)
 async def login_page(request: Request, next: str = "/", error: str = "", ok: str = "") -> str:
     if current_user(request):
-        return RedirectResponse(url=next or "/", status_code=303)
+        return RedirectResponse(url=_safe_next(next), status_code=303)
     if service.signup_open():
         return RedirectResponse(url="/auth/signup", status_code=303)
 
@@ -153,8 +165,8 @@ async def login_submit(
             url="/auth/login?error=Invalid+email+or+password", status_code=303
         )
 
-    # Treat `next` as a safe path-only redirect.
-    target = next if next.startswith("/") and not next.startswith("//") else "/"
+    # Treat `next` as a safe, GET-able path-only redirect.
+    target = _safe_next(next)
     resp = RedirectResponse(url=target, status_code=303)
     _set_session_cookie(resp, token=sess.raw_token, expires=sess.expires_at)
     return resp
