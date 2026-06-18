@@ -18,3 +18,5 @@ data/cache/
 *.sqlite
 *.db
 .ipynb_checkpoints/
+logs/
+*.log

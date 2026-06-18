@@ -206,14 +206,14 @@ class Settings(BaseSettings):
     max_long_exposure_pct: float = Field(0.60, ge=0.0, le=1.0)   # ≤ 60% of equity in non-USDT
 
     # Exit gates (hard rules, evaluated every risk-tick)
-    stop_loss_pct: float = Field(0.02, ge=0.005, le=0.20)        # 2% hard stop
+    stop_loss_pct: float = Field(0.04, ge=0.005, le=0.20)        # 4% hard stop (2% sat inside crypto noise)
     take_profit_pct: float = Field(0.05, ge=0.005, le=0.50)      # 5% take-profit
     trailing_stop_pct: float = Field(0.025, ge=0.005, le=0.20)   # 2.5% trail from HWM
     max_hold_hours: int = Field(96, ge=1, le=10000)              # force-exit after 4 days
     drawdown_circuit_breaker_pct: float = Field(0.10, ge=0.01, le=0.50)  # halt new BUYs after -10%
 
     # Entry gates
-    min_signal_confidence: float = Field(0.65, ge=0.0, le=1.0)   # was 0.6
+    min_signal_confidence: float = Field(0.72, ge=0.0, le=1.0)   # raised 0.65->0.72: only high-conviction entries
     buy_cooldown_minutes: int = Field(30, ge=0, le=1440)         # was 60
 
     # Agent thresholds (tunable without code change)

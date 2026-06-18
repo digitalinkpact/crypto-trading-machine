@@ -20,9 +20,9 @@ def _pos(symbol: str, qty: float, entry: float, hours_ago: int = 1) -> dict:
 
 
 def test_stop_loss_triggers():
-    """Position down >2% should hit stop_loss exit."""
+    """Position down past the stop band should hit stop_loss exit."""
     positions = [_pos("BTCUSDT", 1.0, 100.0)]
-    prices = {"BTCUSDT": Decimal("97")}  # -3%
+    prices = {"BTCUSDT": Decimal("95")}  # -5% (beyond the 4% hard stop)
     risk.clear_hwm("BTCUSDT")
     exits = risk.evaluate_exits(positions=positions, prices=prices)
     assert len(exits) == 1

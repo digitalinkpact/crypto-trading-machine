@@ -12,7 +12,10 @@ from app.exchange import BinanceUSClient, OrderSide, OrderStatus, OrderType
 
 @pytest.fixture
 def client(monkeypatch):
-    settings = Settings(dry_run=True, paper_trading=True)
+    # live_mode=False is pinned explicitly: a real .env with LIVE_MODE=true
+    # would otherwise trip the model_validator and force dry_run/paper_trading
+    # off, making this safety test exercise the live order path by accident.
+    settings = Settings(dry_run=True, paper_trading=True, live_mode=False)
     c = BinanceUSClient(settings=settings)
     c._spot = MagicMock()  # ensure no network call is possible
     return c
