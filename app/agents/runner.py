@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 
-from app.config import TIMEFRAMES, Timeframe
+from app.config import TIMEFRAMES, Timeframe, get_settings
 from app.data import OHLCVRepository
 from app.exchange.symbol_source import get_symbols
 from app.logging_setup import get_logger
@@ -66,7 +66,7 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
     from app.storage import storage
     import numpy as np
     ML_MODEL_NAME = "signal_quality_v1"
-    ML_CONFIDENCE_THRESHOLD = 0.65
+    ml_confidence_threshold = get_settings().ml_gate_threshold
     ml_model_artifact = storage.load_model_artifact(ML_MODEL_NAME)
     ml_model = ml_model_artifact["model"] if ml_model_artifact else None
 
@@ -102,10 +102,16 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
                 # Only allow if ML model predicts high win probability
                 features = _llm_features_from_signal(sig, c)
                 proba = ml_model.predict_proba(features)[0, 1]
-                if proba >= ML_CONFIDENCE_THRESHOLD:
+                if proba >= ml_confidence_threshold:
                     return sig
                 else:
-                    log.info(f"LLM signal for {c.symbol}/{c.timeframe.value} filtered by ML model: proba={proba:.2f} < {ML_CONFIDENCE_THRESHOLD}")
+                    log.info(
+                        "LLM signal for %s/%s filtered by ML model: proba=%.2f < %.2f",
+                        c.symbol,
+                        c.timeframe.value,
+                        proba,
+                        ml_confidence_threshold,
+                    )
                     return None
             except Exception as exc:  # noqa: BLE001
                 log.warning("llm agent failed %s/%s: %s", c.symbol, c.timeframe.value, exc)

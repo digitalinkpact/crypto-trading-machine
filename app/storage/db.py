@@ -340,8 +340,15 @@ class Storage:
             qty = float(row["qty"])
             entry = float(row["entry_price"])
             exit_p = _f(exit_price)
-            pnl = (exit_p - entry) * qty
-            pnl_pct = ((exit_p - entry) / entry * 100) if entry else 0.0
+            # Closed-trade PnL should reflect execution costs so diagnostics,
+            # adaptive weights, and win/loss labels track real net edge.
+            s = get_settings()
+            taker_fee = float(s.binance_taker_fee)
+            gross_pnl = (exit_p - entry) * qty
+            est_fees = (entry * qty * taker_fee) + (exit_p * qty * taker_fee)
+            pnl = gross_pnl - est_fees
+            entry_notional = entry * qty
+            pnl_pct = ((pnl / entry_notional) * 100) if entry_notional else 0.0
             agents_json = row["agents"]
             agents_list = json.loads(agents_json or "[]")
             entry_ts = row["entry_ts"]
