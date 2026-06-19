@@ -260,11 +260,16 @@ class Autopilot:
         # book qty triggers a -2010 "insufficient balance" rejection on every
         # tick and a stop-loss/take-profit can never clear. Clamp to free.
         free_balances: dict[str, Decimal] = {}
+        # Track whether the fetch actually succeeded. A missing key then means
+        # "the exchange holds zero of this coin" (a zombie book position) rather
+        # than "balance unknown" — the two require opposite handling below.
+        balances_known = False
         try:
             snap = await portfolio_snapshot(mode=self.state.mode)
             free_balances = {
                 a: Decimal(str(q)) for a, q in snap["all_balances"].items()
             }
+            balances_known = True
         except Exception as exc:  # noqa: BLE001
             log.warning("risk-gate balance fetch failed: %s", exc)
         prices: dict[str, Decimal] = {}
@@ -278,7 +283,16 @@ class Autopilot:
             try:
                 price = prices.get(ex.symbol) or await self._price(ex.symbol)
                 base = ex.symbol.removesuffix("USDT")
-                avail = free_balances.get(base)
+                # When the balance fetch succeeded, a missing asset means the
+                # exchange holds zero of it — a zombie book position. Use 0 so
+                # the cleanup branch below closes it instead of submitting a
+                # doomed full-qty SELL that Binance rejects with -2010 forever.
+                # Only when the fetch FAILED (balances unknown) do we fall back
+                # to the book qty.
+                if balances_known:
+                    avail = free_balances.get(base, Decimal("0"))
+                else:
+                    avail = None
                 # Clamp the exit to the real free balance when we know it.
                 sell_qty = ex.qty if avail is None else min(ex.qty, avail)
                 qty = filters.round_qty(ex.symbol, sell_qty)
