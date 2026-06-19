@@ -383,8 +383,10 @@ class Autopilot:
         open_positions = [
             p for p in storage.all_positions() if p["mode"] == self.state.mode
         ]
-        open_count = len(open_positions)
-        held_symbols = {p["symbol"] for p in open_positions}
+        open_count, held_symbols = await self._count_non_dust_positions(
+            open_positions=open_positions,
+            balances=balances,
+        )
         now = datetime.now(timezone.utc)
         cooldown = timedelta(minutes=s.buy_cooldown_minutes)
 
@@ -676,6 +678,52 @@ class Autopilot:
         if not last:
             return False
         return (now - last) < cooldown
+
+    async def _count_non_dust_positions(
+        self,
+        *,
+        open_positions: list[dict],
+        balances: dict[str, Decimal],
+    ) -> tuple[int, set[str]]:
+        """Return (count, symbols) of open positions that are not dust.
+
+        Dust (below LOT_SIZE/MIN_NOTIONAL) should not consume a position slot.
+        """
+        non_dust_symbols: set[str] = set()
+        price_cache: dict[str, Decimal] = {}
+
+        for pos in open_positions:
+            symbol = str(pos.get("symbol") or "")
+            if not symbol:
+                continue
+            base = symbol.removesuffix("USDT")
+            book_qty = Decimal(str(pos.get("qty") or "0"))
+            qty = balances.get(base, book_qty)
+            if qty <= 0:
+                continue
+
+            if symbol not in price_cache:
+                try:
+                    price_cache[symbol] = await self._price(symbol)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("non-dust price fetch failed for %s: %s", symbol, exc)
+                    try:
+                        entry = Decimal(str(pos.get("entry_price") or "0"))
+                    except Exception:  # noqa: BLE001
+                        entry = Decimal("0")
+                    if entry <= 0:
+                        continue
+                    price_cache[symbol] = entry
+
+            price = price_cache[symbol]
+            rounded = filters.round_qty(symbol, qty)
+            if rounded <= 0:
+                continue
+            if not filters.meets_min(symbol, rounded, price):
+                continue
+            non_dust_symbols.add(symbol)
+
+        return len(non_dust_symbols), non_dust_symbols
 
     def _persist_skip_stats(
         self,
