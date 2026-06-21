@@ -215,6 +215,11 @@ class Settings(BaseSettings):
     # Entry gates
     min_signal_confidence: float = Field(0.72, ge=0.0, le=1.0)   # raised 0.65->0.72: only high-conviction entries
     buy_cooldown_minutes: int = Field(30, ge=0, le=1440)         # was 60
+    # Long-term trend filter — only open longs when the latest daily close is
+    # above its 200-EMA. Spot is long-only, so buying assets in a downtrend just
+    # feeds the stop-loss gate. Backtest-validated: cuts losses ~3x and max
+    # drawdown ~half versus no filter (see scripts/param_sweep diagnosis).
+    trend_filter_enabled: bool = True
 
     # Agent thresholds (tunable without code change)
     rsi_oversold: int = Field(25, ge=5, le=50)                   # was 30

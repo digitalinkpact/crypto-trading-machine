@@ -3,8 +3,62 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pandas as pd
+
+import app.data as data_module
+import app.ta as ta_module
 from app.trading import autopilot as autopilot_module
 from app.trading.autopilot import Autopilot
+
+
+class _FakeRepo:
+    def __init__(self, df: pd.DataFrame) -> None:
+        self._df = df
+
+    async def get(self, *_a, **_k) -> pd.DataFrame:
+        return self._df
+
+
+def _trend_settings(enabled: bool = True):
+    class _S:
+        trend_filter_enabled = enabled
+
+    return _S()
+
+
+def _patch_trend_data(monkeypatch, df: pd.DataFrame, *, enabled: bool = True) -> None:
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _trend_settings(enabled))
+    monkeypatch.setattr(data_module, "OHLCVRepository", lambda: _FakeRepo(df))
+    monkeypatch.setattr(ta_module, "add_indicators", lambda d: d)
+
+
+async def test_trend_gate_blocks_downtrend(monkeypatch):
+    """A daily close below the 200-EMA must veto a new long."""
+    ap = Autopilot()
+    df = pd.DataFrame({"close": [11.0, 9.0], "ema_200": [12.0, 12.0]})
+    _patch_trend_data(monkeypatch, df)
+    ok, why = await ap._trend_gate("BTCUSDT")
+    assert ok is False
+    assert "downtrend" in why
+
+
+async def test_trend_gate_allows_uptrend(monkeypatch):
+    """A daily close at/above the 200-EMA must allow a new long."""
+    ap = Autopilot()
+    df = pd.DataFrame({"close": [11.0, 15.0], "ema_200": [12.0, 12.0]})
+    _patch_trend_data(monkeypatch, df)
+    ok, _why = await ap._trend_gate("BTCUSDT")
+    assert ok is True
+
+
+async def test_trend_gate_disabled_fail_open(monkeypatch):
+    """When the filter is disabled the gate must always allow (fail-open)."""
+    ap = Autopilot()
+    df = pd.DataFrame({"close": [9.0], "ema_200": [12.0]})  # would block if enabled
+    _patch_trend_data(monkeypatch, df, enabled=False)
+    ok, why = await ap._trend_gate("BTCUSDT")
+    assert ok is True
+    assert why == "trend_disabled"
 
 
 async def test_count_non_dust_positions_excludes_dust(monkeypatch):

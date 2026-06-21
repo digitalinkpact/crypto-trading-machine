@@ -509,6 +509,15 @@ class Autopilot:
                         log.info("skip %s BUY: %s", symbol, why)
                         continue
 
+                    # Long-term trend filter — don't buy an asset below its
+                    # 200-EMA. Spot is long-only, so a downtrend long just feeds
+                    # the stop-loss gate. Backtest-validated structural guard.
+                    trend_ok, trend_why = await self._trend_gate(symbol)
+                    if not trend_ok:
+                        _bump("trend_gate", symbol, trend_why)
+                        log.info("skip %s BUY: %s", symbol, trend_why)
+                        continue
+
                     # Volatility-scaled sizing.
                     atr_pct = await self._atr_pct(symbol)
                     eff_pct = risk.volatility_scaled_pct(s.max_position_pct, atr_pct)
@@ -852,6 +861,37 @@ class Autopilot:
         if isinstance(store, dict):
             store[symbol] = {"oi": ctx.open_interest, "price": price_now or 0.0}
             storage.kv_set(key, store)
+
+    async def _trend_gate(self, symbol: str) -> tuple[bool, str]:
+        """Veto new longs when price is below its long-term trend (200-EMA).
+
+        Binance.US spot is long-only, so buying an asset that is trending down
+        only feeds the stop-loss/take-profit gate and churns fees. Require the
+        latest daily close to be at or above the 200-EMA.
+        FAIL-OPEN: disabled or missing data always allows the trade.
+        """
+        s = get_settings()
+        if not s.trend_filter_enabled:
+            return True, "trend_disabled"
+        try:
+            from app.data import OHLCVRepository
+            from app.ta import add_indicators
+
+            df = await OHLCVRepository().get(symbol, Timeframe.D1, refresh=False)
+            df = add_indicators(df).dropna()
+            if df.empty or "ema_200" not in df.columns:
+                return True, "trend_no_data"
+            last = df.iloc[-1]
+            close = float(last["close"])
+            ema200 = float(last["ema_200"])
+            if ema200 <= 0:
+                return True, "trend_no_data"
+            if close < ema200:
+                return False, f"close {close:.6g} < ema200 {ema200:.6g} (downtrend)"
+            return True, f"close>={ema200:.6g}"
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[TREND] %s gate failed (%s) — allowing", symbol, exc)
+            return True, f"trend_unavailable:{exc}"
 
     async def _onchain_gate(self, symbol: str) -> tuple[bool, str]:
         """Veto new longs on an exchange-inflow spike (coins moving in to be sold).
