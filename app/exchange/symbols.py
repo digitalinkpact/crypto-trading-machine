@@ -16,6 +16,9 @@ log = get_logger(__name__)
 _LEVERAGED_SUFFIXES = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 
 # Stablecoin bases — trading <stable>USDT has no edge and just bleeds fees.
+# The startswith/endswith("USD") heuristic in _is_stable_pair catches the
+# long tail of newer pegs (USD1, USDUC, USDD, USDX, ...); this set covers the
+# pegs whose ticker does NOT contain "USD" (DAI, PAX, EUR, ...).
 _STABLE_BASES = {
     "USDC", "USDT", "DAI", "TUSD", "USDP", "PAX", "BUSD", "FDUSD",
     "USD", "UST", "USTC", "GUSD", "PYUSD", "EUR", "EURI",
@@ -31,7 +34,13 @@ def _is_leveraged(symbol: str) -> bool:
 
 def _is_stable_pair(symbol: str) -> bool:
     # symbol ends with "USDT"; the base is everything before it.
-    return symbol[:-4] in _STABLE_BASES
+    base = symbol[:-4]
+    if base in _STABLE_BASES:
+        return True
+    # Catch USD-pegged tokens not in the explicit set (e.g. USD1, USDUC, USDD,
+    # USDX, TUSD, PYUSD, FDUSD). A base that starts or ends with "USD" is a
+    # dollar peg, so <base>/USDT has no directional edge — just fee bleed.
+    return base.startswith("USD") or base.endswith("USD")
 
 
 async def fetch_dynamic_symbols() -> List[str]:

@@ -235,3 +235,32 @@ async def test_fetch_liquid_universe_filters_and_caps(monkeypatch):
     # AAA (low vol), DDD (too new), EEE (spread 0.50% > 0.20%) all dropped.
     assert result == ["BBBUSDT", "CCCUSDT"]
 
+
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "USD1USDT",    # World Liberty peg that leaked through before the fix
+        "USDUCUSDT",   # another newer dollar peg
+        "USDCUSDT",
+        "USDDUSDT",
+        "USDXUSDT",
+        "TUSDUSDT",
+        "PYUSDUSDT",
+        "FDUSDUSDT",
+        "DAIUSDT",
+        "EURUSDT",
+    ],
+)
+def test_is_stable_pair_excludes_pegs(symbol):
+    from app.exchange.symbols import _is_stable_pair
+
+    assert _is_stable_pair(symbol) is True
+
+
+@pytest.mark.parametrize("symbol", ["BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT"])
+def test_is_stable_pair_keeps_real_coins(symbol):
+    from app.exchange.symbols import _is_stable_pair
+
+    assert _is_stable_pair(symbol) is False
+
+

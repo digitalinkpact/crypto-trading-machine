@@ -5,12 +5,38 @@ metrics dict. Synchronous on purpose — vectorbt is CPU-bound numpy.
 """
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import pandas as pd
 import vectorbt as vbt  # type: ignore[import-untyped]
 
 from app.config import get_settings
+
+
+# pandas' infer_freq returns anchored aliases (e.g. "W-SUN" for weekly, "M" /
+# "MS" for monthly) that vectorbt cannot convert to a Timedelta — it raises a
+# KeyError deep in pandas' parse_timedelta_unit. Map those to a fixed span so
+# weekly/monthly backtests don't crash.
+def _as_timedelta_freq(freq: str) -> str:
+    try:
+        with warnings.catch_warnings():
+            # "H"/"M" lowercase deprecations warn but still convert fine; only
+            # genuinely unconvertible (anchored) aliases should fall through.
+            warnings.simplefilter("ignore")
+            pd.Timedelta(freq)
+        return freq
+    except Exception:  # noqa: BLE001 — pandas raises ValueError/KeyError by version
+        f = freq.upper()
+        if f.startswith("W"):
+            return "7D"
+        if f.startswith(("M", "BM", "MS")):
+            return "30D"
+        if f.startswith("Q"):
+            return "90D"
+        if f.startswith(("A", "Y")):
+            return "365D"
+        return "1D"
 
 
 def run_vectorbt_backtest(
@@ -32,7 +58,7 @@ def run_vectorbt_backtest(
         "exits": exits,
         "init_cash": init_cash,
         "fees": fees,
-        "freq": freq or pd.infer_freq(df.index) or "1H",
+        "freq": _as_timedelta_freq(freq or pd.infer_freq(df.index) or "1H"),
     }
     if sl_stop is not None:
         kwargs["sl_stop"] = sl_stop
