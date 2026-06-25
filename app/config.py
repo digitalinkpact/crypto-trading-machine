@@ -184,15 +184,18 @@ class Settings(BaseSettings):
     smtp_from: str = ""        # e.g. "Crypto Bot <bot@example.com>"
     smtp_starttls: bool = True
 
-    # Safety toggles — default to safe values
-    # Explicit live-mode override. When true, this process is forced to trade
-    # live regardless of stale PAPER_TRADING / DRY_RUN values in older envs.
-    live_mode: bool = False
-    dry_run: bool = True
-    paper_trading: bool = True
+    # Safety toggles — default to SAFE values (paper trading + dry_run)
+    # Explicit live-mode override. When LIVE_MODE=true in .env, this process 
+    # is forced to trade live on Binance.US with real money.
+    # DEFAULT (no .env or LIVE_MODE not set): paper_trading=True, dry_run=True
+    # LIVE MODE (.env: LIVE_MODE=true): paper_trading=False, dry_run=False
+    live_mode: bool = False  # SAFE DEFAULT: off
+    dry_run: bool = True     # SAFE DEFAULT: on
+    paper_trading: bool = True  # SAFE DEFAULT: on
 
     @model_validator(mode="after")
     def _apply_live_mode_override(self) -> "Settings":
+        """If LIVE_MODE=true in .env, disable all safety toggles."""
         if self.live_mode:
             self.paper_trading = False
             self.dry_run = False
@@ -213,7 +216,7 @@ class Settings(BaseSettings):
     drawdown_circuit_breaker_pct: float = Field(0.10, ge=0.01, le=0.50)  # halt new BUYs after -10%
 
     # Entry gates
-    min_signal_confidence: float = Field(0.72, ge=0.0, le=1.0)   # raised 0.65->0.72: only high-conviction entries
+    min_signal_confidence: float = Field(0.55, ge=0.0, le=1.0)   # lowered to 0.55: more aggressive entries for live trading
     buy_cooldown_minutes: int = Field(30, ge=0, le=1440)         # was 60
     # Long-term trend filter — only open longs when the latest daily close is
     # above its 200-EMA. Spot is long-only, so buying assets in a downtrend just

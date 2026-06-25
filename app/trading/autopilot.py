@@ -209,6 +209,13 @@ class Autopilot:
         async with self._lock:
             self.state.last_tick_at = datetime.now(timezone.utc)
             try:
+                # -1. Ensure paper mode has seeded balance (cold-start after restart).
+                if self.state.mode == "paper":
+                    try:
+                        paper_exchange.ensure_seeded()
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("paper balance ensure-seeded failed: %s", exc)
+                
                 # 0. Ensure LOT_SIZE / MIN_NOTIONAL filters are loaded before any
                 #    order is placed. `filters.meets_min` fails OPEN when the
                 #    exchangeInfo cache is empty, so a tick that fires before the
@@ -461,6 +468,9 @@ class Autopilot:
             if sig.confidence < min_conf:
                 _bump("low_confidence", symbol,
                       f"{sig.action.value} conf={sig.confidence:.2f} < {min_conf:.2f}")
+                log.info("[SIGNAL] SKIP %s %s conf=%.3f < %.2f (agents: %s)",
+                         symbol, sig.action.value, sig.confidence, min_conf,
+                         ", ".join(sig.contributing_agents) or "none")
                 continue
             # Record the candidate signal for ML training BEFORE the quality gate.
             # The gate filters EXECUTION, but must never censor LEARNING: if we
@@ -570,7 +580,11 @@ class Autopilot:
                 elif sig.action == SignalAction.SELL:
                     base = symbol.removesuffix("USDT")
                     free = balances.get(base, Decimal("0"))
-                    if free > 0:
+                    # SAFETY: Check if an open position actually exists
+                    open_pos = next((p for p in storage.all_positions()
+                                    if p["symbol"] == symbol and p["mode"] == self.state.mode),
+                                   None)
+                    if free > 0 and open_pos:
                         placed = await self._place_sell(symbol, sig, free)
                         if placed:
                             skip_counter["executed_sell"] += 1
@@ -578,7 +592,11 @@ class Autopilot:
                         else:
                             _bump("filter_reject_sell", symbol)
                     else:
-                        _bump("sell_no_balance", symbol)
+                        if not open_pos:
+                            _bump("sell_no_position", symbol,
+                                  f"no open position in {self.state.mode} mode")
+                        else:
+                            _bump("sell_no_balance", symbol)
             except Exception as exc:  # noqa: BLE001
                 self.state.last_error = f"{symbol}: {exc}"
                 log.warning("execute failed %s: %s", symbol, exc)

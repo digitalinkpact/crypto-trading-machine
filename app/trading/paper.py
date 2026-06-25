@@ -20,7 +20,7 @@ log = get_logger(__name__)
 # Paper market orders pay the Binance.US taker fee (configured in app.config).
 # Kept as a module fallback for callers that import it directly.
 PAPER_FEE_RATE = Decimal(str(get_settings().binance_taker_fee))
-DEFAULT_PAPER_USDT = Decimal("10000")
+DEFAULT_PAPER_USDT = Decimal("25000")
 
 
 class PaperExchange:
