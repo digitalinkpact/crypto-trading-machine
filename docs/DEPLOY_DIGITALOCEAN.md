@@ -25,8 +25,7 @@ On the droplet:
 ```bash
 git clone https://github.com/digitalinkpact/crypto-trading-machine.git /opt/crypto-trading-machine
 cd /opt/crypto-trading-machine
-chmod +x scripts/bootstrap_droplet.sh
-./scripts/bootstrap_droplet.sh
+bash scripts/bootstrap_droplet.sh
 ```
 
 If the repo is already cloned:
@@ -34,8 +33,7 @@ If the repo is already cloned:
 ```bash
 cd /opt/crypto-trading-machine
 git pull --ff-only origin main
-chmod +x scripts/bootstrap_droplet.sh
-./scripts/bootstrap_droplet.sh
+bash scripts/bootstrap_droplet.sh
 ```
 
 ## 4. Configure environment
@@ -90,5 +88,5 @@ Health endpoint remains open at /healthz.
 ssh root@YOUR_PUBLIC_IPV4
 cd /opt/crypto-trading-machine
 git pull --ff-only origin main
-./scripts/bootstrap_droplet.sh
+bash scripts/bootstrap_droplet.sh
 ```
