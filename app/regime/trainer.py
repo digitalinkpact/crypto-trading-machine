@@ -10,7 +10,6 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -33,6 +32,18 @@ def _event_return_pct(action: str, entry: float, current: float) -> float:
     if action == "SELL":
         raw = -raw
     return float(raw)
+
+
+def _min_win_edge(s) -> float:
+    """Minimum return a matured signal must clear to count as a win.
+
+    A market entry and its eventual exit each pay the taker fee, so the
+    break-even bar is ``2 * taker_fee``; ``ml_label_slippage_pct`` adds a
+    buffer for slippage. Returns below this are net losses and must be
+    labeled as such, otherwise the quality gate is trained on a target that
+    ignores the cost of trading.
+    """
+    return 2.0 * float(s.binance_taker_fee) + float(s.ml_label_slippage_pct)
 
 
 async def label_matured_signal_events(limit: int = 500) -> int:
@@ -62,8 +73,10 @@ async def label_matured_signal_events(limit: int = 500) -> int:
             continue
 
         ret = _event_return_pct(ev["action"], float(ev["entry_price"]), px_now)
-        # Small dead-zone avoids noisy labels around zero return.
-        win = ret > 0.001
+        # Cost-aware label: a win must clear round-trip fees plus a slippage
+        # buffer, not merely be positive. A bare > 0 dead-zone taught the gate
+        # that fee-losing trades were wins.
+        win = ret > _min_win_edge(s)
         storage.resolve_signal_event(
             event_id=int(ev["id"]),
             horizon_minutes=s.ml_signal_horizon_minutes,
@@ -125,25 +138,49 @@ def train_signal_quality_model() -> dict[str, float | int | str]:
             "class": int(classes[0]) if classes.size == 1 else -1,
         }
 
-    x_train, x_test, y_train, y_test = train_test_split(
-        x, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # Chronological holdout — `training_signal_rows` returns oldest-first, so
+    # the last 20% is the most recent data. A shuffled/stratified split would
+    # leak future outcomes into the validation set and inflate the reported
+    # AUC; the gate would then look better than it is on live, forward data.
+    split_idx = max(1, int(len(x) * 0.8))
+    x_train, x_test = x[:split_idx], x[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+
+    # The time-ordered split can land all of one class on the train side. The
+    # model still needs both classes to fit, so fall back to fitting on every
+    # row for this round rather than shipping an un-fittable model. We lose the
+    # honest holdout this time, flagged via `eval` below.
+    if np.unique(y_train).size < 2:
+        x_train, y_train = x, y
+
     model = Pipeline([
         ("scaler", StandardScaler()),
         ("clf", LogisticRegression(max_iter=1000, class_weight="balanced")),
     ])
     model.fit(x_train, y_train)
 
-    pred = model.predict(x_test)
-    proba = model.predict_proba(x_test)[:, 1]
+    # AUC is only defined when the holdout has both classes. When it doesn't,
+    # report a neutral 0.5 (no demonstrated skill) so the staleness/threshold
+    # logic downstream never treats a degenerate round as a strong model.
+    if x_test.shape[0] > 0 and np.unique(y_test).size >= 2:
+        pred = model.predict(x_test)
+        proba = model.predict_proba(x_test)[:, 1]
+        accuracy = float(accuracy_score(y_test, pred))
+        roc_auc = float(roc_auc_score(y_test, proba))
+        eval_note = "chronological_holdout"
+    else:
+        accuracy = float(y.mean())
+        roc_auc = 0.5
+        eval_note = "degenerate_holdout"
 
     metrics = {
         "samples": int(len(rows)),
         "train_samples": int(x_train.shape[0]),
         "test_samples": int(x_test.shape[0]),
-        "accuracy": float(accuracy_score(y_test, pred)),
-        "roc_auc": float(roc_auc_score(y_test, proba)),
+        "accuracy": accuracy,
+        "roc_auc": roc_auc,
         "positive_rate": float(y.mean()),
+        "eval": eval_note,
     }
     version = storage.save_model_artifact(
         name=_MODEL_NAME,

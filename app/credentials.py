@@ -62,6 +62,22 @@ def save_trading_mode(paper: bool) -> None:
         _write_env({"LIVE_MODE": "true", "PAPER_TRADING": "false", "DRY_RUN": "false"})
 
 
+def save_trade_fees(maker: float, taker: float) -> None:
+    """Persist real spot fee rates (fractions, e.g. 0.001 = 0.10%) to .env.
+
+    These feed position sizing, paper fills, closed-trade PnL, the ML win/loss
+    labels, and the backtester — so the bot trades against its actual costs.
+    """
+    for name, v in (("maker", maker), ("taker", taker)):
+        fv = float(v)
+        if not (0.0 <= fv <= 0.01):
+            raise ValueError(f"{name} fee {fv} out of range [0, 0.01]")
+    _write_env({
+        "BINANCE_MAKER_FEE": f"{float(maker):.6f}",
+        "BINANCE_TAKER_FEE": f"{float(taker):.6f}",
+    })
+
+
 def credentials_present() -> bool:
     s = get_settings()
     return bool(

@@ -90,6 +90,36 @@ async def test_live_order_sets_avg_fill_price_from_cum_quote():
     assert order.avg_fill_price == Decimal("101")
 
 
+@pytest.mark.asyncio
+async def test_trade_fees_prefers_commission_rates(client):
+    client._spot.account.return_value = {
+        "commissionRates": {"maker": "0.001", "taker": "0.001"},
+        "makerCommission": 40,
+        "takerCommission": 60,
+    }
+    fees = await client.trade_fees()
+    assert fees["maker"] == Decimal("0.001")
+    assert fees["taker"] == Decimal("0.001")
+
+
+@pytest.mark.asyncio
+async def test_trade_fees_falls_back_to_integer_commission(client):
+    client._spot.account.return_value = {
+        "makerCommission": 40,   # 40 / 10000 = 0.40%
+        "takerCommission": 60,   # 60 / 10000 = 0.60%
+    }
+    fees = await client.trade_fees()
+    assert fees["maker"] == Decimal("0.004")
+    assert fees["taker"] == Decimal("0.006")
+
+
+@pytest.mark.asyncio
+async def test_trade_fees_raises_when_missing(client):
+    client._spot.account.return_value = {"balances": []}
+    with pytest.raises(RuntimeError):
+        await client.trade_fees()
+
+
 def _filters_with(step: str, min_qty: str = "0"):
     from app.exchange.filters import SymbolFilters
 

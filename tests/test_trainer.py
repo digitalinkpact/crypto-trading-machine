@@ -83,3 +83,64 @@ async def test_run_learning_cycle_skips_when_cumulative_labels_below_threshold(
     assert result["status"] == "labeled_only"
     assert result["since_last_train"] == 25
     assert called["train"] is False
+
+
+def test_min_win_edge_clears_round_trip_fees_plus_slippage():
+    s = SimpleNamespace(binance_taker_fee=0.0040, ml_label_slippage_pct=0.0010)
+    # 2 * 0.0040 + 0.0010 = 0.0090
+    assert trainer._min_win_edge(s) == pytest.approx(0.0090)
+
+
+def test_min_win_edge_marks_fee_losing_trade_as_loss():
+    s = SimpleNamespace(binance_taker_fee=0.0040, ml_label_slippage_pct=0.0010)
+    edge = trainer._min_win_edge(s)
+    # A +0.5% move does not clear ~0.9% round-trip cost → not a win.
+    assert (0.005 > edge) is False
+    # A +1.2% move clears it → a win.
+    assert (0.012 > edge) is True
+
+
+def test_train_uses_chronological_holdout(monkeypatch):
+    monkeypatch.setattr(
+        trainer,
+        "get_settings",
+        lambda: SimpleNamespace(
+            ml_learning_enabled=True,
+            ml_min_training_samples=200,
+        ),
+    )
+
+    # Build 250 separable, time-ordered rows. High confidence + positive
+    # ema_gap → win; low confidence + negative ema_gap → loss. Alternating so
+    # both classes appear across the whole timeline (and thus in the last-20%
+    # chronological holdout).
+    rows = []
+    for i in range(250):
+        win = i % 2 == 0
+        rows.append({
+            "action": "BUY",
+            "timeframe": "1d",
+            "confidence": 0.9 if win else 0.2,
+            "atr_pct": 0.02,
+            "rsi_14": 60.0 if win else 40.0,
+            "ema_gap_pct": 0.01 if win else -0.01,
+            "agent_count": 3,
+            "outcome_win": 1 if win else 0,
+        })
+
+    monkeypatch.setattr(trainer.storage, "training_signal_rows", lambda limit=100_000: rows)
+    saved: dict = {}
+
+    def _fake_save(*, name, algorithm, metrics, model):
+        saved["metrics"] = metrics
+        return 7
+
+    monkeypatch.setattr(trainer.storage, "save_model_artifact", _fake_save)
+
+    result = trainer.train_signal_quality_model()
+
+    assert result["status"] == "ok"
+    # 80/20 chronological split, no shuffle.
+    assert result["train_samples"] == 200
+    assert result["test_samples"] == 50
+    assert result["eval"] == "chronological_holdout"

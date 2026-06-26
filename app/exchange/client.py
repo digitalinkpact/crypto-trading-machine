@@ -120,6 +120,36 @@ class BinanceUSClient:
     async def account(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._spot.account)
 
+    async def trade_fees(self) -> dict[str, Decimal]:
+        """Read this account's REAL spot maker/taker fee rates from Binance.US.
+
+        Returns fractions (e.g. ``Decimal("0.001")`` == 0.10%). Prefers the
+        ``commissionRates`` block (already decimal strings); falls back to the
+        legacy integer ``makerCommission``/``takerCommission`` fields, which are
+        expressed in units of 1/10000 (15 -> 0.0015). Signed endpoint — requires
+        API credentials. Raises if neither form is present.
+        """
+        acct = await asyncio.to_thread(self._spot.account)
+        rates = acct.get("commissionRates") or {}
+
+        def _rate(decimal_key: str, int_key: str) -> Optional[Decimal]:
+            v = rates.get(decimal_key)
+            if v is not None:
+                return Decimal(str(v))
+            iv = acct.get(int_key)
+            if iv is not None:
+                return Decimal(str(iv)) / Decimal("10000")
+            return None
+
+        maker = _rate("maker", "makerCommission")
+        taker = _rate("taker", "takerCommission")
+        if maker is None or taker is None:
+            raise RuntimeError(
+                "Binance.US account payload had no commission rates "
+                "(commissionRates / makerCommission / takerCommission missing)"
+            )
+        return {"maker": maker, "taker": taker}
+
     # ── Orders ───────────────────────────────────────────────────────────
     async def place_order(
         self,
