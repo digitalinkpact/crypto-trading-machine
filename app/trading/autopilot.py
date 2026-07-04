@@ -127,6 +127,10 @@ class Autopilot:
         self._owner = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
         # Last ML-gate model version we logged (avoids per-tick log spam).
         self._ml_logged_version: Optional[int] = None
+        # Cached BTC market-regime verdict: (allowed, reason, monotonic_ts).
+        # The regime is portfolio-wide, so it is computed once and reused for
+        # every symbol within a tick instead of refetching BTC per candidate.
+        self._market_regime_cache: Optional[tuple[bool, str, float]] = None
 
     # ── persistence ────────────────────────────────────────────────────
     def _save(self) -> None:
@@ -517,6 +521,16 @@ class Autopilot:
                     if not ok:
                         _bump("risk_cap", symbol, why)
                         log.info("skip %s BUY: %s", symbol, why)
+                        continue
+
+                    # Market-regime kill-switch — block ALL new longs while the
+                    # broad market (BTC) is in a confirmed downtrend. Spot is
+                    # long-only; walk-forward backtests show every sustained loss
+                    # happens in BTC bear regimes, so sit in cash instead.
+                    market_ok, market_why = await self._market_gate()
+                    if not market_ok:
+                        _bump("market_gate", symbol, market_why)
+                        log.info("skip %s BUY: %s", symbol, market_why)
                         continue
 
                     # Long-term trend filter — don't buy an asset below its
@@ -910,6 +924,46 @@ class Autopilot:
         except Exception as exc:  # noqa: BLE001
             log.debug("[TREND] %s gate failed (%s) — allowing", symbol, exc)
             return True, f"trend_unavailable:{exc}"
+
+    async def _market_gate(self) -> tuple[bool, str]:
+        """Portfolio-wide kill-switch: block new longs in a BTC downtrend.
+
+        Risk-OFF when BTC's 50-EMA is below its 200-EMA (a confirmed "death
+        cross"). Walk-forward backtests show every sustained loss occurs while
+        the broad market bleeds; spot is long-only so there is no edge to take
+        there — stay in cash. The verdict is identical for every symbol in a
+        tick, so it is cached briefly to avoid refetching BTC per candidate.
+        FAIL-OPEN: disabled or missing BTC data always allows trading.
+        """
+        s = get_settings()
+        if not getattr(s, "market_regime_gate_enabled", True):
+            return True, "market_gate_disabled"
+        cache = self._market_regime_cache
+        if cache is not None and (asyncio.get_event_loop().time() - cache[2]) < 300.0:
+            return cache[0], cache[1]
+        allowed, reason = True, "market_no_data"
+        try:
+            from app.data import OHLCVRepository
+            from app.ta import add_indicators
+
+            df = await OHLCVRepository().get("BTCUSDT", Timeframe.D1, refresh=False)
+            df = add_indicators(df).dropna()
+            if not df.empty and {"ema_50", "ema_200"} <= set(df.columns):
+                last = df.iloc[-1]
+                ema50 = float(last["ema_50"])
+                ema200 = float(last["ema_200"])
+                if ema200 > 0:
+                    if ema50 < ema200:
+                        allowed = False
+                        reason = f"BTC risk-off (ema50 {ema50:.0f} < ema200 {ema200:.0f})"
+                    else:
+                        allowed = True
+                        reason = f"BTC risk-on (ema50 {ema50:.0f} >= ema200 {ema200:.0f})"
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[MARKET] regime gate failed (%s) — allowing", exc)
+            reason = f"market_unavailable:{exc}"
+        self._market_regime_cache = (allowed, reason, asyncio.get_event_loop().time())
+        return allowed, reason
 
     async def _onchain_gate(self, symbol: str) -> tuple[bool, str]:
         """Veto new longs on an exchange-inflow spike (coins moving in to be sold).

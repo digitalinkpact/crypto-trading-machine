@@ -61,6 +61,49 @@ async def test_trend_gate_disabled_fail_open(monkeypatch):
     assert why == "trend_disabled"
 
 
+def _market_settings(enabled: bool = True):
+    class _S:
+        market_regime_gate_enabled = enabled
+
+    return _S()
+
+
+def _patch_market_data(monkeypatch, df: pd.DataFrame, *, enabled: bool = True) -> None:
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _market_settings(enabled))
+    monkeypatch.setattr(data_module, "OHLCVRepository", lambda: _FakeRepo(df))
+    monkeypatch.setattr(ta_module, "add_indicators", lambda d: d)
+
+
+async def test_market_gate_blocks_btc_downtrend(monkeypatch):
+    """BTC 50-EMA below 200-EMA (death cross) must veto ALL new longs."""
+    ap = Autopilot()
+    df = pd.DataFrame({"close": [100.0], "ema_50": [90.0], "ema_200": [100.0]})
+    _patch_market_data(monkeypatch, df)
+    ok, why = await ap._market_gate()
+    assert ok is False
+    assert "risk-off" in why
+
+
+async def test_market_gate_allows_btc_uptrend(monkeypatch):
+    """BTC 50-EMA at/above 200-EMA (golden cross) must allow longs."""
+    ap = Autopilot()
+    df = pd.DataFrame({"close": [100.0], "ema_50": [110.0], "ema_200": [100.0]})
+    _patch_market_data(monkeypatch, df)
+    ok, why = await ap._market_gate()
+    assert ok is True
+    assert "risk-on" in why
+
+
+async def test_market_gate_disabled_fail_open(monkeypatch):
+    """When disabled the market gate must always allow (fail-open)."""
+    ap = Autopilot()
+    df = pd.DataFrame({"close": [100.0], "ema_50": [90.0], "ema_200": [100.0]})  # would block
+    _patch_market_data(monkeypatch, df, enabled=False)
+    ok, why = await ap._market_gate()
+    assert ok is True
+    assert why == "market_gate_disabled"
+
+
 async def test_count_non_dust_positions_excludes_dust(monkeypatch):
     """Dust balances must not consume one of max_open_positions slots."""
     ap = Autopilot()

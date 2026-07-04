@@ -224,6 +224,16 @@ class Settings(BaseSettings):
     # drawdown ~half versus no filter (see scripts/param_sweep diagnosis).
     trend_filter_enabled: bool = True
 
+    # Market-regime kill-switch — block ALL new longs when the broad market
+    # (BTC) is in a confirmed downtrend (50-EMA below 200-EMA, a "death cross").
+    # Walk-forward evidence (scripts/walkforward.py): 100% of the strategy's
+    # losses occur in sustained BTC downtrends; gating the (otherwise positive)
+    # mean-reversion entries by this regime flips full-period expectancy from
+    # net-negative to net-positive and caps the bear-market drawdown. Spot is
+    # long-only, so there is no edge to capture while the market bleeds — sit
+    # in cash instead. FAIL-OPEN: missing BTC data always allows trading.
+    market_regime_gate_enabled: bool = True
+
     # Agent thresholds (tunable without code change)
     rsi_oversold: int = Field(25, ge=5, le=50)                   # was 30
     rsi_overbought: int = Field(75, ge=50, le=95)                # was 70
@@ -231,13 +241,20 @@ class Settings(BaseSettings):
     vol_contraction_threshold: float = Field(0.65, ge=0.1, le=1.5)  # was 0.7
 
     # Per-agent weights — multiplies that agent's vote in the aggregator.
-    # Demote noisy agents, promote regime + trend-follower.
-    agent_weight_trend_follower: float = Field(1.2, ge=0.0, le=3.0)
-    agent_weight_mean_reversion: float = Field(1.1, ge=0.0, le=3.0)
+    # Walk-forward evidence (scripts/walkforward.py, 25 syms / 1d / 3 folds):
+    # the mean-reversion (dip-buy) logic is the ONLY component with positive
+    # out-of-sample expectancy (+0.3%→+4.3% with the market filter, 2/3 folds),
+    # while the trend/confluence/breakout/momentum signals are all net-negative
+    # (baseline confluence ≈ -29% mean). So the aggregator now LEADS with
+    # mean-reversion and demotes the trend-following voters that drive the
+    # losing baseline entries. The 200-EMA trend gate + BTC market-regime gate
+    # still block dip-buys during confirmed downtrends (falling-knife guard).
+    agent_weight_trend_follower: float = Field(0.6, ge=0.0, le=3.0)  # demoted — net-negative out-of-sample
+    agent_weight_mean_reversion: float = Field(2.0, ge=0.0, le=3.0)  # promoted — only positive-expectancy edge
     agent_weight_breakout: float = Field(0.5, ge=0.0, le=3.0)    # demoted — net negative PnL in paper
     agent_weight_momentum: float = Field(0.5, ge=0.0, le=3.0)    # demoted — too noisy
     agent_weight_volatility: float = Field(0.8, ge=0.0, le=3.0)
-    agent_weight_regime_overlay: float = Field(1.5, ge=0.0, le=3.0)  # promoted
+    agent_weight_regime_overlay: float = Field(1.5, ge=0.0, le=3.0)  # promoted — regime filter, complements market gate
     agent_weight_llm_reasoner: float = Field(1.0, ge=0.0, le=3.0)
 
     # Adaptive: scale each agent's weight by its rolling win-rate.
