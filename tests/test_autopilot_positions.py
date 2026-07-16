@@ -7,6 +7,7 @@ import pandas as pd
 
 import app.data as data_module
 import app.ta as ta_module
+from app.exchange import Order, OrderSide, OrderStatus, OrderType
 from app.trading import autopilot as autopilot_module
 from app.trading.autopilot import Autopilot
 
@@ -152,3 +153,111 @@ async def test_count_non_dust_positions_excludes_dust(monkeypatch):
 
     assert count == 1
     assert held_symbols == {"BTCUSDT"}
+
+
+def _fake_order(status: OrderStatus, filled: str) -> Order:
+    return Order(
+        symbol="BTCUSDT",
+        side=OrderSide.SELL,
+        type=OrderType.MARKET,
+        quantity=Decimal("1"),
+        client_order_id="test-coid",
+        status=status,
+        filled_quantity=Decimal(filled),
+    )
+
+
+def test_order_filled_true_for_filled_order():
+    order = _fake_order(OrderStatus.FILLED, "1")
+    assert Autopilot._order_filled(order) is True
+
+
+def test_order_filled_true_for_partial_fill():
+    order = _fake_order(OrderStatus.PARTIALLY_FILLED, "0.5")
+    assert Autopilot._order_filled(order) is True
+
+
+def test_order_filled_false_for_rejected_order():
+    """A live order Binance never filled must NOT be reported as executed.
+
+    Regression: `_submit` can return a non-None, non-raising Order for a
+    rejected/expired live order (or a config-drift DRY_RUN). Callers must
+    check the fill status instead of assuming success.
+    """
+    order = _fake_order(OrderStatus.REJECTED, "0")
+    assert Autopilot._order_filled(order) is False
+
+
+def test_order_filled_false_for_dry_run_status():
+    order = _fake_order(OrderStatus.DRY_RUN, "0")
+    assert Autopilot._order_filled(order) is False
+
+
+def test_order_filled_false_for_zero_fill_with_filled_status():
+    """Defensive: even a FILLED status with zero quantity must not count."""
+    order = _fake_order(OrderStatus.FILLED, "0")
+    assert Autopilot._order_filled(order) is False
+
+
+def test_order_filled_false_for_none():
+    assert Autopilot._order_filled(None) is False
+
+
+class _Sig:
+    contributing_agents = ["test"]
+
+
+async def test_place_buy_returns_false_when_order_not_filled(monkeypatch):
+    """`_place_buy` must propagate a non-filled `_submit` result as failure."""
+    ap = Autopilot()
+
+    async def _fake_price(_self, _symbol: str) -> Decimal:
+        return Decimal("100")
+
+    async def _fake_submit(_self, *_a, **_k) -> Order:
+        return _fake_order(OrderStatus.REJECTED, "0")
+
+    monkeypatch.setattr(Autopilot, "_price", _fake_price, raising=True)
+    monkeypatch.setattr(Autopilot, "_submit", _fake_submit, raising=True)
+    monkeypatch.setattr(autopilot_module.filters, "round_qty", lambda s, q: q, raising=True)
+    monkeypatch.setattr(autopilot_module.filters, "meets_min", lambda s, q, p: True, raising=True)
+
+    placed = await ap._place_buy("BTCUSDT", _Sig(), Decimal("100"))
+    assert placed is False
+
+
+async def test_place_sell_returns_false_when_order_not_filled(monkeypatch):
+    """`_place_sell` must propagate a non-filled `_submit` result as failure."""
+    ap = Autopilot()
+
+    async def _fake_price(_self, _symbol: str) -> Decimal:
+        return Decimal("100")
+
+    async def _fake_submit(_self, *_a, **_k) -> Order:
+        return _fake_order(OrderStatus.REJECTED, "0")
+
+    monkeypatch.setattr(Autopilot, "_price", _fake_price, raising=True)
+    monkeypatch.setattr(Autopilot, "_submit", _fake_submit, raising=True)
+    monkeypatch.setattr(autopilot_module.filters, "round_qty", lambda s, q: q, raising=True)
+    monkeypatch.setattr(autopilot_module.filters, "meets_min", lambda s, q, p: True, raising=True)
+
+    placed = await ap._place_sell("BTCUSDT", _Sig(), Decimal("1"))
+    assert placed is False
+
+
+async def test_place_sell_returns_true_when_order_filled(monkeypatch):
+    ap = Autopilot()
+
+    async def _fake_price(_self, _symbol: str) -> Decimal:
+        return Decimal("100")
+
+    async def _fake_submit(_self, *_a, **_k) -> Order:
+        return _fake_order(OrderStatus.FILLED, "1")
+
+    monkeypatch.setattr(Autopilot, "_price", _fake_price, raising=True)
+    monkeypatch.setattr(Autopilot, "_submit", _fake_submit, raising=True)
+    monkeypatch.setattr(autopilot_module.filters, "round_qty", lambda s, q: q, raising=True)
+    monkeypatch.setattr(autopilot_module.filters, "meets_min", lambda s, q, p: True, raising=True)
+
+    placed = await ap._place_sell("BTCUSDT", _Sig(), Decimal("1"))
+    assert placed is True

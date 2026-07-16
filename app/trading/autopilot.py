@@ -326,8 +326,15 @@ class Autopilot:
                     continue
                 log.warning("RISK EXIT %s reason=%s qty=%s price=%s (book=%s free=%s)",
                             ex.symbol, ex.reason, qty, price, ex.qty, avail)
-                await self._submit(ex.symbol, OrderSide.SELL, qty, [f"risk:{ex.reason}"])
-                risk.clear_hwm(ex.symbol)
+                order = await self._submit(ex.symbol, OrderSide.SELL, qty, [f"risk:{ex.reason}"])
+                if self._order_filled(order):
+                    risk.clear_hwm(ex.symbol)
+                else:
+                    log.error(
+                        "RISK EXIT %s did NOT fill (status=%s) — position remains "
+                        "open, will retry next tick", ex.symbol,
+                        getattr(order, "status", None),
+                    )
             except Exception as exc:  # noqa: BLE001
                 log.exception("risk-exit failed for %s: %s", ex.symbol, exc)
 
@@ -992,8 +999,8 @@ class Autopilot:
             log.info("skip %s BUY: filters reject qty=%s price=%s", symbol, qty, price)
             return False
         agents = list(getattr(sig, "contributing_agents", []) or [])
-        await self._submit(symbol, OrderSide.BUY, qty, agents)
-        return True
+        order = await self._submit(symbol, OrderSide.BUY, qty, agents)
+        return self._order_filled(order)
 
     async def _place_sell(self, symbol: str, sig, free: Decimal) -> bool:
         price = await self._price(symbol)
@@ -1002,8 +1009,23 @@ class Autopilot:
             log.info("skip %s SELL: filters reject qty=%s", symbol, qty)
             return False
         agents = list(getattr(sig, "contributing_agents", []) or [])
-        await self._submit(symbol, OrderSide.SELL, qty, agents)
-        return True
+        order = await self._submit(symbol, OrderSide.SELL, qty, agents)
+        return self._order_filled(order)
+
+    @staticmethod
+    def _order_filled(order: Optional[Order]) -> bool:
+        """True only if the exchange actually filled the order (partial counts).
+
+        `_submit` can return a non-None Order that never filled — a live order
+        rejected/expired by Binance, or a config-drift DRY_RUN status — without
+        raising. Callers MUST check this before treating a BUY/SELL as executed;
+        otherwise cooldowns, position slots, and risk high-water-marks get
+        updated for a trade that never actually happened on the exchange.
+        """
+        if order is None:
+            return False
+        filled = order.filled_quantity or Decimal("0")
+        return order.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED) and filled > 0
 
     async def _submit(
         self, symbol: str, side: OrderSide, qty: Decimal, agents: list[str]
