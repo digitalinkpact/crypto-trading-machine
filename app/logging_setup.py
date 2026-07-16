@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -56,18 +57,26 @@ def configure_logging() -> None:
     root.handlers.clear()
     root.addHandler(stream_handler)
 
-    try:
-        _LOG_DIR.mkdir(parents=True, exist_ok=True)
-        file_handler = RotatingFileHandler(
-            _LOG_FILE, maxBytes=_MAX_BYTES, backupCount=_BACKUP_COUNT
-        )
-        file_handler.setFormatter(formatter)
-        root.addHandler(file_handler)
-    except OSError as exc:  # noqa: BLE001
-        # Never let a log-directory permission issue stop the trading loop.
-        logging.getLogger(__name__).warning(
-            "could not attach rotating file handler at %s: %s", _LOG_FILE, exc
-        )
+    # Never attach the shared, path-based production log file under pytest.
+    # `_LOG_FILE` is resolved from `__file__`, not cwd, so a test run in this
+    # same checkout would otherwise write test fixture noise (dummy symbols,
+    # `[DRY-RUN]` orders, fake client-order-ids) straight into the live
+    # trading log -- indistinguishable from real activity -- and risk two
+    # processes rotating/writing the same file concurrently.
+    running_under_pytest = "PYTEST_VERSION" in os.environ or "PYTEST_CURRENT_TEST" in os.environ
+    if not running_under_pytest:
+        try:
+            _LOG_DIR.mkdir(parents=True, exist_ok=True)
+            file_handler = RotatingFileHandler(
+                _LOG_FILE, maxBytes=_MAX_BYTES, backupCount=_BACKUP_COUNT
+            )
+            file_handler.setFormatter(formatter)
+            root.addHandler(file_handler)
+        except OSError as exc:  # noqa: BLE001
+            # Never let a log-directory permission issue stop the trading loop.
+            logging.getLogger(__name__).warning(
+                "could not attach rotating file handler at %s: %s", _LOG_FILE, exc
+            )
 
     root.setLevel(_resolve_level(settings.log_level))
     _CONFIGURED = True
