@@ -229,7 +229,7 @@ def main() -> None:
     p.add_argument("--tp", type=float, default=0.25, help="take-profit fraction")
     p.add_argument("--bars", type=int, default=1000, help="bars to fetch per symbol")
     p.add_argument("--market-filter", action="store_true",
-                   help="only allow entries when BTC > its 200-EMA (risk-on)")
+                   help="only allow entries when BTC 50-EMA > 200-EMA (risk-on)")
     args = p.parse_args()
     asyncio.run(main_async(Timeframe(args.timeframe), args.folds, args.sl, args.tp,
                            args.bars, args.market_filter))

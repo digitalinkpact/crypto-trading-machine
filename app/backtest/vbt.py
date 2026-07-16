@@ -9,7 +9,33 @@ import warnings
 from typing import Any
 
 import pandas as pd
-import vectorbt as vbt  # type: ignore[import-untyped]
+import plotly.graph_objects as go
+
+
+def _import_vectorbt_compat() -> Any:
+    """Import vectorbt while tolerating plotly 6 template incompatibilities.
+
+    vectorbt 0.26 registers bundled Plotly templates on import and still
+    references the removed ``heatmapgl`` trace. In environments that drift to
+    Plotly 6 despite our pin, allow Plotly to skip invalid template keys so the
+    backtest adapter remains importable.
+    """
+    template_ctor = go.layout.Template
+
+    class _CompatTemplate(template_ctor):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs.setdefault("skip_invalid", True)
+            super().__init__(*args, **kwargs)
+
+    go.layout.Template = _CompatTemplate  # type: ignore[assignment]
+    try:
+        import vectorbt as vectorbt_module  # type: ignore[import-untyped]
+    finally:
+        go.layout.Template = template_ctor  # type: ignore[assignment]
+    return vectorbt_module
+
+
+vbt = _import_vectorbt_compat()
 
 from app.config import get_settings
 
