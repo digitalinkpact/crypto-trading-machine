@@ -266,6 +266,9 @@ class Settings(BaseSettings):
     ml_signal_horizon_minutes: int = Field(240, ge=15, le=10_080)  # default 4h
     ml_min_training_samples: int = Field(200, ge=20, le=1_000_000)
     ml_min_new_labels: int = Field(50, ge=10, le=1_000_000)
+    # Slippage buffer added on top of 2x taker fee when labeling a matured
+    # signal event as a win/loss (see app/regime/trainer.py _min_win_edge).
+    ml_label_slippage_pct: float = Field(0.0010, ge=0.0, le=0.05)
 
     # ML quality gate — drop trades the learned model rates below this win-prob.
     # Closes the learning loop: realized win/loss outcomes train the model,
