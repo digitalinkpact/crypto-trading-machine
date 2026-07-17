@@ -16,6 +16,7 @@ from app.logging_setup import get_logger
 from app.regime import run_learning_cycle
 from app.storage import storage
 from app.trading.autopilot import autopilot
+from app.trading.reconcile import reconcile_positions
 from app.trading.portfolio import portfolio_snapshot
 
 log = get_logger(__name__)
@@ -114,6 +115,18 @@ async def ml_learning_pass() -> None:
     log.info("ml learning pass: %s", result)
 
 
+async def reconcile_portfolio() -> None:
+    """Reconcile stored positions with actual balances every 5 minutes."""
+    mode = autopilot.state.mode
+    try:
+        result = await reconcile_positions(mode=mode)
+        log.info("portfolio reconcile mode=%s result=%s", mode, result)
+    except Exception as e:  # noqa: BLE001
+        logger = log
+        logger.exception(f"Trade execution failure: {e}")
+        raise
+
+
 def build_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(refresh_market_data, CronTrigger(minute="*/15"), id="market_data")
@@ -121,5 +134,6 @@ def build_scheduler() -> AsyncIOScheduler:
     scheduler.add_job(llm_signal_pass, CronTrigger(minute="7"), id="llm_pass")
     scheduler.add_job(ml_learning_pass, CronTrigger(minute="12", hour="*/6"), id="ml_learning")
     scheduler.add_job(equity_snapshot, CronTrigger(minute="55"), id="equity_curve")
+    scheduler.add_job(reconcile_portfolio, CronTrigger(minute="*/5"), id="portfolio_reconcile")
     return scheduler
 

@@ -272,6 +272,7 @@ async def fetch_liquid_universe(
         log.warning("[UNIVERSE] liquid pairlist build failed: %s. Falling back.", exc)
         try:
             return await fetch_dynamic_symbols()
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            log.exception("Trade execution failure: %s", e)
             return list(getattr(s, "static_symbols", []))
 

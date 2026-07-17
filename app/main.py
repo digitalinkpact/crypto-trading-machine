@@ -15,6 +15,7 @@ from app.logging_setup import configure_logging, get_logger
 from app.scheduler import build_scheduler
 from app.storage import storage
 from app.trading.paper import paper_exchange
+from app.trading.health import start_health_monitor, startup_report, stop_health_monitor
 
 log = get_logger(__name__)
 
@@ -65,12 +66,22 @@ async def lifespan(app: FastAPI):
         scheduler = build_scheduler()
         scheduler.start()
         log.info("scheduler started; jobs=%s", [j.id for j in scheduler.get_jobs()])
+        start_health_monitor(scheduler)
     except Exception as exc:  # noqa: BLE001
         log.exception("scheduler start failed: %s", exc)
 
     try:
+        await startup_report()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("startup report failed: %s", exc)
+
+    try:
         yield
     finally:
+        try:
+            await stop_health_monitor()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("health monitor stop failed: %s", exc)
         try:
             await live_prices.stop()
         except Exception as exc:  # noqa: BLE001

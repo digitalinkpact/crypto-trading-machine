@@ -43,7 +43,7 @@ def _extract_avg_fill_price(raw: dict[str, Any]) -> Optional[Decimal]:
             try:
                 qty = Decimal(str(fill.get("qty", "0")))
                 px = Decimal(str(fill.get("price", "0")))
-            except Exception:  # noqa: BLE001
+            except (ValueError, TypeError, ArithmeticError):  # noqa: BLE001
                 continue
             if qty <= 0 or px <= 0:
                 continue
@@ -57,14 +57,14 @@ def _extract_avg_fill_price(raw: dict[str, Any]) -> Optional[Decimal]:
         cum_quote = Decimal(str(raw.get("cummulativeQuoteQty", "0")))
         if executed_qty > 0 and cum_quote > 0:
             return cum_quote / executed_qty
-    except Exception:  # noqa: BLE001
+    except (ValueError, TypeError, ArithmeticError):  # noqa: BLE001
         pass
 
     try:
         px = Decimal(str(raw.get("price", "0")))
         if px > 0:
             return px
-    except Exception:  # noqa: BLE001
+    except (ValueError, TypeError, ArithmeticError):  # noqa: BLE001
         pass
     return None
 

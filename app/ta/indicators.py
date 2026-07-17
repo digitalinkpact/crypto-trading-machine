@@ -6,11 +6,15 @@ unstable in the 0.3.14b beta.
 from __future__ import annotations
 
 import pandas as pd
+from app.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 try:
     import pandas_ta as pta  # type: ignore[import-untyped]
     _HAS_PTA = True
-except Exception:  # pragma: no cover - optional/buggy beta
+except ModuleNotFoundError as e:  # pragma: no cover - optional dependency
+    log.warning("pandas_ta unavailable, using ta fallback: %s", e)
     _HAS_PTA = False
 
 from ta.momentum import RSIIndicator
@@ -46,8 +50,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
                 out["bb_upper"] = bb.iloc[:, 2]
             out["atr_14"] = pta.atr(high, low, close, length=14)
             return out
-        except Exception:  # fall through to `ta`
-            pass
+        except (ValueError, TypeError, KeyError) as e:  # fall through to `ta`
+            log.warning("pandas_ta indicator pipeline failed, using ta fallback: %s", e)
 
     out["ema_20"] = EMAIndicator(close=close, window=20).ema_indicator()
     out["ema_50"] = EMAIndicator(close=close, window=50).ema_indicator()

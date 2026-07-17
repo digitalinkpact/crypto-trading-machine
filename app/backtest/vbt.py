@@ -52,7 +52,10 @@ def _as_timedelta_freq(freq: str) -> str:
             warnings.simplefilter("ignore")
             pd.Timedelta(freq)
         return freq
-    except Exception:  # noqa: BLE001 — pandas raises ValueError/KeyError by version
+    except Exception as e:  # noqa: BLE001 — pandas raises ValueError/KeyError by version
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning("frequency conversion fallback for '%s': %s", freq, e)
         f = freq.upper()
         if f.startswith("W"):
             return "7D"

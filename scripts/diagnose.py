@@ -73,8 +73,11 @@ def main() -> None:
     for r in rows:
         try:
             agents = json.loads(r["agents"] or "[]")
-        except Exception:
-            agents = []
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.exception(f"Trade execution failure: {e}")
+            raise
         reason = next((a.split(":", 1)[1] for a in agents if a.startswith("risk:")), "signal")
         buckets.setdefault(reason, []).append(float(r["pnl_pct"]))
     if not buckets:

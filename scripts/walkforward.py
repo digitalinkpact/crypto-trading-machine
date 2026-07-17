@@ -106,8 +106,11 @@ async def _load(repo: OHLCVRepository, tf: Timeframe, bars: int) -> dict[str, pd
     for sym in SYMBOLS:
         try:
             df = await repo.get(sym, tf, limit=bars, refresh=True)
-        except Exception:
-            continue
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.exception(f"Trade execution failure: {e}")
+            raise
         if df is None or len(df) < 220:
             continue
         df = add_indicators(df).dropna()

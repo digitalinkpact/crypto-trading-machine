@@ -1,6 +1,7 @@
 """HTTP routes — dashboard, settings, autopilot controls, trades log."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from html import escape
 
 from fastapi import APIRouter, Form, HTTPException
@@ -16,6 +17,7 @@ from app.credentials import (
 from app.storage import storage
 from app.trading.autopilot import autopilot
 from app.trading.portfolio import portfolio_snapshot
+from app.exchange.ws_stream import live_prices
 
 router = APIRouter()
 
@@ -398,6 +400,17 @@ async def dashboard() -> str:
 {agent_card}
 {risk_card}
 <div class='card'>
+    <h2>LIVE trading monitor</h2>
+    <div class='row'><span>Last signal</span><b>{escape(str((storage.recent_trade_audit(limit=1)[0]['signal'] if storage.recent_trade_audit(limit=1) else '—')))}</b></div>
+    <div class='row'><span>Last order</span><b>{escape(str((storage.recent_orders(limit=1)[0]['side'] + ' ' + storage.recent_orders(limit=1)[0]['symbol'] if storage.recent_orders(limit=1) else '—')))}</b></div>
+    <div class='row'><span>Last Binance response</span><b>{escape(str((storage.recent_trade_audit(limit=1)[0]['binance_response'] if storage.recent_trade_audit(limit=1) else '—')))}</b></div>
+    <div class='row'><span>Last exception</span><b>{escape(str((storage.recent_trade_audit(limit=1)[0]['exception'] if storage.recent_trade_audit(limit=1) and storage.recent_trade_audit(limit=1)[0]['exception'] else st.last_error or '—')))}</b></div>
+    <div class='row'><span>Open positions</span><b>{len([p for p in storage.all_positions() if p['mode'] == st.mode])}</b></div>
+    <div class='row'><span>Account balances</span><b>{escape(str(len((await portfolio_snapshot(mode=st.mode)).get('all_balances', {}))))} assets</b></div>
+    <div class='row'><span>Bot uptime</span><b>{escape(str((datetime.now(timezone.utc) - st.started_at) if st.started_at else '—'))}</b></div>
+    <div class='row'><span>Scheduler uptime</span><b>{escape(str((storage.kv_get('health_status') or {}).get('timestamp') or '—'))}</b></div>
+</div>
+<div class='card'>
   <h2>Universe</h2>
   <div class='muted'>{len(SYMBOLS)} symbols &middot; {len(TIMEFRAMES)} timeframes
     ({", ".join(t.value for t in TIMEFRAMES)})</div>
@@ -681,6 +694,19 @@ async def metrics() -> dict:
             },
             "last_tick": raw.get("last_tick") if isinstance(raw, dict) else None,
         },
+    }
+
+
+@router.get("/live/diagnostics")
+async def live_diagnostics() -> dict:
+    health = storage.kv_get("health_status") or {}
+    startup = storage.kv_get("startup_report") or {}
+    audit = storage.recent_trade_audit(limit=25)
+    return {
+        "health": health,
+        "startup_report": startup,
+        "websocket": live_prices.status(),
+        "trade_audit": audit,
     }
 
 

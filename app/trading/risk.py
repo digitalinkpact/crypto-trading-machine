@@ -53,7 +53,8 @@ def get_hwm(symbol: str) -> Optional[Decimal]:
         return None
     try:
         return Decimal(str(cur))
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log.exception("Trade execution failure: %s", e)
         return None
 
 
@@ -115,8 +116,9 @@ def evaluate_exits(
                 entry_ts = entry_ts.replace(tzinfo=timezone.utc)
             if now - entry_ts > timedelta(hours=s.max_hold_hours):
                 out.append(ExitDecision(symbol, qty, "max_hold"))
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            log.exception("Trade execution failure: %s", e)
+            continue
 
     return out
 

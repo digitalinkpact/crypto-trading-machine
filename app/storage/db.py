@@ -159,6 +159,26 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts);
+
+CREATE TABLE IF NOT EXISTS trade_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    signal TEXT NOT NULL,
+    confidence REAL,
+    risk_passed INTEGER,
+    position_exists INTEGER,
+    available_balance REAL,
+    min_notional_passed INTEGER,
+    execution_attempted INTEGER,
+    binance_response TEXT,
+    exception TEXT,
+    final_outcome TEXT NOT NULL,
+    detail TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_trade_audit_ts ON trade_audit(ts);
+CREATE INDEX IF NOT EXISTS ix_trade_audit_symbol_ts ON trade_audit(symbol, ts);
 """
 
 
@@ -270,7 +290,9 @@ class Storage:
                 )
                 c.execute("COMMIT")
                 return True
-            except Exception:
+            except Exception as e:
+                logger = log
+                logger.exception(f"Trade execution failure: {e}")
                 c.execute("ROLLBACK")
                 raise
 
@@ -515,10 +537,64 @@ class Storage:
                         (debited, asset),
                     )
                 c.execute("COMMIT")
-            except Exception:
+            except Exception as e:
+                logger = log
+                logger.exception(f"Trade execution failure: {e}")
                 c.execute("ROLLBACK")
                 raise
         return debited
+
+    # ── Trade audit trail ─────────────────────────────────────────────
+    def record_trade_audit(
+        self,
+        *,
+        mode: str,
+        symbol: str,
+        signal: str,
+        confidence: Optional[float],
+        risk_passed: Optional[bool],
+        position_exists: Optional[bool],
+        available_balance: Optional[Decimal | float],
+        min_notional_passed: Optional[bool],
+        execution_attempted: bool,
+        binance_response: str,
+        exception: Optional[str],
+        final_outcome: str,
+        detail: Optional[dict[str, Any]] = None,
+    ) -> int:
+        with self._lock, self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO trade_audit("
+                "ts,mode,symbol,signal,confidence,risk_passed,position_exists,"
+                "available_balance,min_notional_passed,execution_attempted,"
+                "binance_response,exception,final_outcome,detail"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    _now(),
+                    mode,
+                    symbol,
+                    signal,
+                    None if confidence is None else float(confidence),
+                    None if risk_passed is None else (1 if risk_passed else 0),
+                    None if position_exists is None else (1 if position_exists else 0),
+                    None if available_balance is None else _f(available_balance),
+                    None if min_notional_passed is None else (1 if min_notional_passed else 0),
+                    1 if execution_attempted else 0,
+                    binance_response,
+                    exception,
+                    final_outcome,
+                    json.dumps(detail or {}, default=str),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def recent_trade_audit(self, limit: int = 100) -> list[dict]:
+        with self._lock, self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM trade_audit ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def paper_balance_get(self, asset: str) -> float:
         with self._lock, self._conn() as c:

@@ -79,7 +79,10 @@ def _load_win_rates() -> dict[str, float]:
     try:
         from app.storage import storage
         return storage.agent_win_rates(min_trades=5)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.exception("Trade execution failure: %s", e)
         return {}
 
 

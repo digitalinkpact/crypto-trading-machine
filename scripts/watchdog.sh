@@ -87,8 +87,11 @@ try:
     row = conn.execute("SELECT value FROM kv WHERE key='autopilot_state'").fetchone()
     if row:
         print(json.loads(row[0]).get("last_tick_at") or "")
-except Exception:
-    pass
+except Exception as e:
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.exception(f"Trade execution failure: {e}")
+    raise
 PY
 )"
 
