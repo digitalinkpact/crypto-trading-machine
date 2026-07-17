@@ -58,3 +58,23 @@ def test_tick_lock_expires(tmp_path):
     assert s.try_acquire_lock("autopilot_tick", ttl_seconds=-1, owner="proc-a") is True
     # Lease already expired → another owner can acquire.
     assert s.try_acquire_lock("autopilot_tick", ttl_seconds=300, owner="proc-b") is True
+
+
+def test_positions_are_isolated_by_mode(tmp_path):
+    s = _fresh_storage(tmp_path)
+
+    s.open_position(symbol="BTCUSDT", mode="paper", qty=1.0, entry_price=100.0, agents=[])
+    s.open_position(symbol="BTCUSDT", mode="live", qty=2.0, entry_price=200.0, agents=[])
+
+    positions = sorted(s.all_positions(), key=lambda p: p["mode"])
+    assert len(positions) == 2
+    assert positions[0]["mode"] == "live"
+    assert positions[0]["qty"] == 2.0
+    assert positions[1]["mode"] == "paper"
+    assert positions[1]["qty"] == 1.0
+
+    closed = s.close_position(symbol="BTCUSDT", mode="live", exit_price=250.0)
+    assert closed is not None
+    remaining = s.all_positions()
+    assert len(remaining) == 1
+    assert remaining[0]["mode"] == "paper"

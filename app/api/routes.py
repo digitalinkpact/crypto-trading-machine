@@ -1,6 +1,8 @@
 """HTTP routes — dashboard, settings, autopilot controls, trades log."""
 from __future__ import annotations
 
+from html import escape
+
 from fastapi import APIRouter, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -111,6 +113,82 @@ def _mode_pill() -> str:
     return "<span class='pill real'>LIVE &mdash; REAL MONEY</span>"
 
 
+def _render_tick_diagnostics() -> tuple[str, str]:
+    data = storage.kv_get("autopilot_last_tick_debug") or {}
+    reasons = data.get("by_reason") or {}
+    per_symbol = data.get("per_symbol") or {}
+    market_hits = int(reasons.get("market_gate", 0) or 0)
+    banner = ""
+    if market_hits > 0:
+        banner = (
+            "<div class='banner warn'>"
+            f"Last tick blocked {market_hits} BUY signal(s) at the BTC market-regime gate. "
+            "Review the diagnostics card below to confirm the regime and downstream sizing checks."
+            "</div>"
+        )
+
+    if not data:
+        return banner, (
+            "<div class='card'><h2>Last tick diagnostics</h2>"
+            "<div class='muted'>No tick diagnostics recorded yet.</div></div>"
+        )
+
+    reason_rows = "".join(
+        f"<div class='row'><span>{escape(str(reason))}</span><b>{int(count)}</b></div>"
+        for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:8]
+    ) or "<div class='row muted'><span>No skip reasons</span><span>&mdash;</span></div>"
+
+    buy_entries = [
+        (symbol, info) for symbol, info in per_symbol.items()
+        if isinstance(info, dict) and info.get("action") == "BUY"
+    ]
+    buy_rows = ""
+    for symbol, info in buy_entries[:8]:
+        filters_info = info.get("filters") or {}
+        market = filters_info.get("market_regime") or {}
+        min_check = filters_info.get("min_notional") or {}
+        sizing = info.get("sizing") or {}
+        qty = escape(str(sizing.get("rounded_qty", "-")))
+        notional = escape(str(sizing.get("notional", "-")))
+        final_reason = escape(str(info.get("final_reason") or info.get("reason") or "-"))
+        detail = escape(str(info.get("detail") or ""))
+        market_detail = escape(str(market.get("detail") or "not evaluated"))
+        min_detail = escape(str(min_check.get("detail") or "not evaluated"))
+        submitted = "yes" if info.get("submitted") else "no"
+        buy_rows += (
+            "<tr>"
+            f"<td>{escape(symbol)}</td>"
+            f"<td class='num'>{float(info.get('confidence', 0.0)):.2f}</td>"
+            f"<td>{market_detail}</td>"
+            f"<td class='num'>{qty}</td>"
+            f"<td class='num'>{notional}</td>"
+            f"<td>{min_detail}</td>"
+            f"<td>{submitted}</td>"
+            f"<td>{final_reason}<br/><span class='muted'>{detail}</span></td>"
+            "</tr>"
+        )
+    if buy_rows:
+        buy_table = (
+            "<table style='margin-top:0.75rem;'><thead><tr>"
+            "<th>BUY symbol</th><th class='num'>Conf</th><th>Market regime</th>"
+            "<th class='num'>Qty</th><th class='num'>Notional</th><th>Min check</th>"
+            "<th>Submitted</th><th>Final</th></tr></thead>"
+            f"<tbody>{buy_rows}</tbody></table>"
+        )
+    else:
+        buy_table = "<div class='muted' style='margin-top:0.75rem;'>No BUY traces recorded on the last tick.</div>"
+
+    card = f"""
+<div class='card'>
+  <h2>Last tick diagnostics</h2>
+  <div class='muted'>Signals: {int(data.get('total_signals', 0) or 0)} &middot; Timestamp: {escape(str(data.get('ts') or '&mdash;'))}</div>
+  {reason_rows}
+  {buy_table}
+</div>
+"""
+    return banner, card
+
+
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def dashboard() -> str:
     s = get_settings()
@@ -119,6 +197,7 @@ async def dashboard() -> str:
     st = autopilot.state
     pill_class = "live" if st.running else "off"
     pill_text = "RUNNING" if st.running else "STOPPED"
+    diag_banner, diag_card = _render_tick_diagnostics()
 
     if is_paper:
         creds_banner = (
@@ -138,11 +217,17 @@ async def dashboard() -> str:
         )
 
     balance_card = ""
+    low_cash_banner = ""
     try:
         snap = await portfolio_snapshot()
         total = snap["total_usdt"]
         cash = snap["usdt_cash"]
         invested = total - cash
+        if not is_paper and cash < 10:
+            low_cash_banner = (
+                "<div class='banner warn'>LIVE mode has less than 10 USDT free. "
+                "New BUYs will fail the minimum trade sizing check until more USDT is available.</div>"
+            )
         baseline = st.starting_balance_usdt
         if baseline and baseline > 0:
             pnl = total - baseline
@@ -289,6 +374,8 @@ async def dashboard() -> str:
 
     body = f"""
 {creds_banner}
+{diag_banner}
+{low_cash_banner}
 <div class='card'>
   <h2>Autopilot <span class='pill {pill_class}'>{pill_text}</span> {_mode_pill()}</h2>
   <div class='muted'>Trading runs automatically every 15 minutes once started.
@@ -306,6 +393,7 @@ async def dashboard() -> str:
   </form>
 </div>
 {balance_card}
+{diag_card}
 {equity_card}
 {agent_card}
 {risk_card}

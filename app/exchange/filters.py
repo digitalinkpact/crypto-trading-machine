@@ -85,5 +85,26 @@ class SymbolFilters:
             return False
         return True
 
+    def diagnostics(self, symbol: str, qty: Decimal, price: Decimal) -> dict[str, Any]:
+        """Detailed qty/notional check for operator diagnostics."""
+        info = self._info.get(symbol) or {}
+        min_qty: Optional[Decimal] = info.get("min_qty")
+        min_notional: Optional[Decimal] = info.get("min_notional")
+        notional = qty * price
+        qty_ok = not (min_qty and qty < min_qty)
+        notional_ok = not (min_notional and notional < min_notional)
+        return {
+            "loaded": self._loaded,
+            "status": info.get("status"),
+            "qty": qty,
+            "price": price,
+            "notional": notional,
+            "min_qty": min_qty,
+            "min_notional": min_notional,
+            "qty_ok": qty_ok,
+            "notional_ok": notional_ok,
+            "meets_min": qty_ok and notional_ok,
+        }
+
 
 filters = SymbolFilters()

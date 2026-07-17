@@ -14,6 +14,7 @@ Each tick:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from collections import Counter
@@ -109,6 +110,16 @@ def _model_age_hours(trained_at: Optional[str]) -> Optional[float]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+
+
+def _jsonable(value):
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
 
 
 class Autopilot:
@@ -363,7 +374,36 @@ class Autopilot:
         def _bump(reason: str, sym: str = "", detail: str = "") -> None:
             skip_counter[reason] += 1
             if sym:
-                tick_debug[sym] = {"reason": reason, "detail": detail}
+                entry = tick_debug.setdefault(sym, {})
+                entry["reason"] = reason
+                entry["detail"] = detail
+
+        def _entry(sym: str, sig=None) -> dict:
+            entry = tick_debug.setdefault(sym, {})
+            if sig is not None:
+                entry.setdefault("action", getattr(sig.action, "value", str(sig.action)))
+                entry.setdefault("confidence", float(sig.confidence))
+                entry.setdefault(
+                    "agents", list(getattr(sig, "contributing_agents", []) or [])
+                )
+            entry.setdefault("filters", {})
+            return entry
+
+        def _set_filter(sym: str, name: str, ok: bool, detail: str, sig=None) -> None:
+            entry = _entry(sym, sig)
+            entry["filters"][name] = {"ok": ok, "detail": detail}
+
+        def _set_sizing(sym: str, payload: dict, sig=None) -> None:
+            entry = _entry(sym, sig)
+            entry["sizing"] = _jsonable(payload)
+
+        def _finish(sym: str, reason: str, detail: str, *, submitted: bool, sig=None) -> None:
+            entry = _entry(sym, sig)
+            entry["final_reason"] = reason
+            entry["submitted"] = submitted
+            _bump(reason, sym, detail)
+            if entry.get("action") == SignalAction.BUY.value:
+                log.info("[BUY_TRACE] %s %s", sym, json.dumps(_jsonable(entry), sort_keys=True))
 
         if not signals:
             _bump("no_signals")
@@ -476,9 +516,26 @@ class Autopilot:
             if sig.action == SignalAction.HOLD:
                 _bump("action_hold", symbol, f"conf={sig.confidence:.2f}")
                 continue
+            if sig.action == SignalAction.BUY:
+                _set_filter(
+                    symbol,
+                    "signal_confidence",
+                    sig.confidence >= min_conf,
+                    f"conf={sig.confidence:.3f} threshold={min_conf:.3f}",
+                    sig,
+                )
             if sig.confidence < min_conf:
-                _bump("low_confidence", symbol,
-                      f"{sig.action.value} conf={sig.confidence:.2f} < {min_conf:.2f}")
+                if sig.action == SignalAction.BUY:
+                    _finish(
+                        symbol,
+                        "low_confidence",
+                        f"{sig.action.value} conf={sig.confidence:.2f} < {min_conf:.2f}",
+                        submitted=False,
+                        sig=sig,
+                    )
+                else:
+                    _bump("low_confidence", symbol,
+                          f"{sig.action.value} conf={sig.confidence:.2f} < {min_conf:.2f}")
                 log.info("[SIGNAL] SKIP %s %s conf=%.3f < %.2f (agents: %s)",
                          symbol, sig.action.value, sig.confidence, min_conf,
                          ", ".join(sig.contributing_agents) or "none")
@@ -501,42 +558,101 @@ class Autopilot:
                         gate_gated += 1
                         log.info("[ML_GATE] SKIP %s %s proba=%.3f < %.2f",
                                  symbol, sig.action.value, proba, s.ml_gate_threshold)
-                        _bump("ml_gate", symbol,
-                              f"{sig.action.value} proba={proba:.2f} < {s.ml_gate_threshold}")
+                        if sig.action == SignalAction.BUY:
+                            _set_filter(
+                                symbol,
+                                "ml_gate",
+                                False,
+                                f"proba={proba:.3f} threshold={s.ml_gate_threshold:.3f}",
+                                sig,
+                            )
+                            _finish(
+                                symbol,
+                                "ml_gate",
+                                f"{sig.action.value} proba={proba:.2f} < {s.ml_gate_threshold}",
+                                submitted=False,
+                                sig=sig,
+                            )
+                        else:
+                            _bump("ml_gate", symbol,
+                                  f"{sig.action.value} proba={proba:.2f} < {s.ml_gate_threshold}")
                         continue
                     gate_accepted += 1
                     log.info("[ML_GATE] PASS %s %s proba=%.3f >= %.2f",
                              symbol, sig.action.value, proba, s.ml_gate_threshold)
+                    if sig.action == SignalAction.BUY:
+                        _set_filter(
+                            symbol,
+                            "ml_gate",
+                            True,
+                            f"proba={proba:.3f} threshold={s.ml_gate_threshold:.3f}",
+                            sig,
+                        )
             if not filters.is_listed(symbol):
-                _bump("not_listed", symbol)
+                if sig.action == SignalAction.BUY:
+                    _set_filter(symbol, "listed", False, "symbol not trading on Binance.US", sig)
+                    _finish(symbol, "not_listed", "symbol not trading on Binance.US", submitted=False, sig=sig)
+                else:
+                    _bump("not_listed", symbol)
                 continue
+            if sig.action == SignalAction.BUY:
+                _set_filter(symbol, "listed", True, "symbol trading on Binance.US", sig)
             try:
                 if sig.action == SignalAction.BUY:
                     if not allow_buys:
-                        _bump("breaker_tripped", symbol)
+                        _set_filter(symbol, "drawdown_breaker", False, "new BUYs halted by circuit breaker", sig)
+                        _finish(symbol, "breaker_tripped", "new BUYs halted by circuit breaker", submitted=False, sig=sig)
                         continue
+                    _set_filter(symbol, "drawdown_breaker", True, "circuit breaker allows BUY", sig)
                     if symbol in held_symbols:
-                        _bump("already_held", symbol)
+                        _set_filter(symbol, "already_held", False, "existing position already held", sig)
+                        _finish(symbol, "already_held", "existing position already held", submitted=False, sig=sig)
                         continue  # don't pyramid into existing position
+                    _set_filter(symbol, "already_held", True, "position not currently held", sig)
                     if self._on_cooldown(symbol, now, cooldown):
-                        _bump("cooldown", symbol)
+                        _set_filter(symbol, "cooldown", False, f"cooldown={cooldown}", sig)
+                        _finish(symbol, "cooldown", f"cooldown={cooldown}", submitted=False, sig=sig)
                         continue
+                    _set_filter(symbol, "cooldown", True, f"cooldown window clear ({cooldown})", sig)
                     ok, why = risk.can_open_new_position(
                         open_positions=open_count,
                         long_exposure_pct=long_exposure_pct,
                     )
+                    _set_filter(symbol, "risk_cap", ok, why, sig)
                     if not ok:
-                        _bump("risk_cap", symbol, why)
+                        _finish(symbol, "risk_cap", why, submitted=False, sig=sig)
                         log.info("skip %s BUY: %s", symbol, why)
                         continue
+
+                    atr_pct = await self._atr_pct(symbol)
+                    eff_pct = risk.volatility_scaled_pct(s.max_position_pct, atr_pct)
+                    per_trade_usdt = usdt_free * Decimal(str(eff_pct))
+                    if per_trade_usdt < 10 and usdt_free >= 10:
+                        per_trade_usdt = Decimal("10")
+                    buy_plan = await self._buy_order_plan(symbol, per_trade_usdt)
+                    buy_plan["atr_pct"] = atr_pct
+                    buy_plan["effective_position_pct"] = eff_pct
+                    buy_plan["usdt_free"] = usdt_free
+                    _set_sizing(symbol, buy_plan, sig)
+                    _set_filter(
+                        symbol,
+                        "min_notional",
+                        bool(buy_plan["meets_min"]),
+                        (
+                            f"qty={buy_plan['rounded_qty']} notional={buy_plan['notional']} "
+                            f"min_qty={buy_plan['min_qty']} min_notional={buy_plan['min_notional']}"
+                        ),
+                        sig,
+                    )
 
                     # Market-regime kill-switch — block ALL new longs while the
                     # broad market (BTC) is in a confirmed downtrend. Spot is
                     # long-only; walk-forward backtests show every sustained loss
                     # happens in BTC bear regimes, so sit in cash instead.
                     market_ok, market_why = await self._market_gate()
+                    _set_filter(symbol, "market_regime", market_ok, market_why, sig)
                     if not market_ok:
-                        _bump("market_gate", symbol, market_why)
+                        _finish(symbol, "market_gate", market_why, submitted=False, sig=sig)
                         log.info("skip %s BUY: %s", symbol, market_why)
                         continue
 
@@ -544,35 +660,46 @@ class Autopilot:
                     # 200-EMA. Spot is long-only, so a downtrend long just feeds
                     # the stop-loss gate. Backtest-validated structural guard.
                     trend_ok, trend_why = await self._trend_gate(symbol)
+                    _set_filter(symbol, "trend_gate", trend_ok, trend_why, sig)
                     if not trend_ok:
-                        _bump("trend_gate", symbol, trend_why)
+                        _finish(symbol, "trend_gate", trend_why, submitted=False, sig=sig)
                         log.info("skip %s BUY: %s", symbol, trend_why)
                         continue
-
-                    # Volatility-scaled sizing.
-                    atr_pct = await self._atr_pct(symbol)
-                    eff_pct = risk.volatility_scaled_pct(s.max_position_pct, atr_pct)
-                    per_trade_usdt = usdt_free * Decimal(str(eff_pct))
                     # Enforce $10 minimum per trade
                     if per_trade_usdt < 10:
                         if usdt_free >= 10:
                             per_trade_usdt = Decimal("10")
                         else:
-                            _bump("insufficient_usdt", symbol,
-                                  f"per_trade={per_trade_usdt:.4f} cash={usdt_free:.2f} eff={eff_pct:.4f}")
+                            _set_filter(
+                                symbol,
+                                "cash_available",
+                                False,
+                                f"per_trade={per_trade_usdt:.4f} cash={usdt_free:.2f} eff={eff_pct:.4f}",
+                                sig,
+                            )
+                            _finish(
+                                symbol,
+                                "insufficient_usdt",
+                                f"per_trade={per_trade_usdt:.4f} cash={usdt_free:.2f} eff={eff_pct:.4f}",
+                                submitted=False,
+                                sig=sig,
+                            )
                             continue
+                    _set_filter(symbol, "cash_available", True, f"usdt_free={usdt_free}", sig)
 
                     # Derivatives context gate (funding too negative → skip long).
                     fund_ok, fund_why = await self._funding_gate(symbol)
+                    _set_filter(symbol, "funding_gate", fund_ok, fund_why, sig)
                     if not fund_ok:
-                        _bump("funding_gate", symbol, fund_why)
+                        _finish(symbol, "funding_gate", fund_why, submitted=False, sig=sig)
                         log.info("skip %s BUY: %s", symbol, fund_why)
                         continue
 
                     # On-chain whale-flow gate (exchange inflow spike → skip long).
                     flow_ok, flow_why = await self._onchain_gate(symbol)
+                    _set_filter(symbol, "onchain_gate", flow_ok, flow_why, sig)
                     if not flow_ok:
-                        _bump("onchain_gate", symbol, flow_why)
+                        _finish(symbol, "onchain_gate", flow_why, submitted=False, sig=sig)
                         log.info("skip %s BUY: %s", symbol, flow_why)
                         continue
 
@@ -580,19 +707,30 @@ class Autopilot:
                     ob_ok, ob_why = await liquidity_gate(
                         symbol, SignalAction.BUY, per_trade_usdt
                     )
+                    _set_filter(symbol, "orderbook_gate", ob_ok, ob_why, sig)
                     if not ob_ok:
-                        _bump("orderbook_gate", symbol, ob_why)
+                        _finish(symbol, "orderbook_gate", ob_why, submitted=False, sig=sig)
                         log.info("skip %s BUY: order book %s", symbol, ob_why)
                         continue
 
                     placed = await self._place_buy(symbol, sig, per_trade_usdt)
                     if not placed:
-                        _bump("filter_reject_buy", symbol)
+                        _finish(symbol, "filter_reject_buy", "exchange filters rejected computed qty", submitted=False, sig=sig)
                         continue
                     self.state.cooldowns[symbol] = now.isoformat()
                     open_count += 1
                     held_symbols.add(symbol)
                     skip_counter["executed_buy"] += 1
+                    _finish(
+                        symbol,
+                        "executed_buy",
+                        (
+                            f"submitted qty={buy_plan['rounded_qty']} notional={buy_plan['notional']} "
+                            f"price={buy_plan['price']}"
+                        ),
+                        submitted=True,
+                        sig=sig,
+                    )
                     # Approximate exposure update so subsequent BUYs see the new total.
                     long_exposure_pct = min(
                         1.0,
@@ -605,7 +743,7 @@ class Autopilot:
                     open_pos = next((p for p in storage.all_positions()
                                     if p["symbol"] == symbol and p["mode"] == self.state.mode),
                                    None)
-                    if free > 0 and open_pos:
+                    if free > 0:
                         placed = await self._place_sell(symbol, sig, free)
                         if placed:
                             skip_counter["executed_sell"] += 1
@@ -992,15 +1130,33 @@ class Autopilot:
         return True, detail
 
     async def _place_buy(self, symbol: str, sig, per_trade_usdt: Decimal) -> bool:
-        price = await self._price(symbol)
-        raw_qty = per_trade_usdt / price
-        qty = filters.round_qty(symbol, raw_qty)
-        if qty <= 0 or not filters.meets_min(symbol, qty, price):
+        plan = await self._buy_order_plan(symbol, per_trade_usdt)
+        price = plan["price"]
+        qty = plan["rounded_qty"]
+        if qty <= 0 or not plan["meets_min"]:
             log.info("skip %s BUY: filters reject qty=%s price=%s", symbol, qty, price)
             return False
         agents = list(getattr(sig, "contributing_agents", []) or [])
         order = await self._submit(symbol, OrderSide.BUY, qty, agents)
         return self._order_filled(order)
+
+    async def _buy_order_plan(self, symbol: str, per_trade_usdt: Decimal) -> dict[str, Decimal | bool | None]:
+        price = await self._price(symbol)
+        raw_qty = (per_trade_usdt / price) if price > 0 else Decimal("0")
+        rounded_qty = filters.round_qty(symbol, raw_qty)
+        min_check = filters.diagnostics(symbol, rounded_qty, price)
+        return {
+            "price": price,
+            "per_trade_usdt": per_trade_usdt,
+            "raw_qty": raw_qty,
+            "rounded_qty": rounded_qty,
+            "notional": rounded_qty * price,
+            "min_qty": min_check.get("min_qty"),
+            "min_notional": min_check.get("min_notional"),
+            "meets_min": bool(min_check.get("meets_min")),
+            "qty_ok": bool(min_check.get("qty_ok")),
+            "notional_ok": bool(min_check.get("notional_ok")),
+        }
 
     async def _place_sell(self, symbol: str, sig, free: Decimal) -> bool:
         price = await self._price(symbol)
@@ -1076,7 +1232,7 @@ class Autopilot:
                         entry_price=price, agents=agents,
                     )
                 else:
-                    storage.close_position(symbol=symbol, exit_price=price)
+                    storage.close_position(symbol=symbol, mode="live", exit_price=price)
             except Exception as exc:  # noqa: BLE001
                 log.warning("storage write failed for live order %s: %s", symbol, exc)
         self.state.trades_executed += 1

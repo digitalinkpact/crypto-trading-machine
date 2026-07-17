@@ -41,12 +41,13 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE INDEX IF NOT EXISTS ix_orders_ts ON orders(ts);
 
 CREATE TABLE IF NOT EXISTS positions (
-    symbol TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
     mode TEXT NOT NULL,
     qty REAL NOT NULL,
     entry_price REAL NOT NULL,
     entry_ts TEXT NOT NULL,
-    agents TEXT NOT NULL
+    agents TEXT NOT NULL,
+    PRIMARY KEY (symbol, mode)
 );
 
 CREATE TABLE IF NOT EXISTS closed_trades (
@@ -190,6 +191,29 @@ class Storage:
     def _init(self) -> None:
         with self._lock, self._conn() as c:
             c.executescript(_SCHEMA)
+            # Historical schema keyed positions by symbol only, which let paper
+            # and live rows collide and made live sell eligibility depend on
+            # whichever mode wrote last. Migrate in place to mode-scoped rows.
+            cols = c.execute("PRAGMA table_info(positions)").fetchall()
+            pk_cols = [r["name"] for r in cols if int(r["pk"] or 0) > 0]
+            if pk_cols == ["symbol"]:
+                c.execute("ALTER TABLE positions RENAME TO positions_old")
+                c.execute(
+                    "CREATE TABLE positions ("
+                    "symbol TEXT NOT NULL,"
+                    "mode TEXT NOT NULL,"
+                    "qty REAL NOT NULL,"
+                    "entry_price REAL NOT NULL,"
+                    "entry_ts TEXT NOT NULL,"
+                    "agents TEXT NOT NULL,"
+                    "PRIMARY KEY (symbol, mode)"
+                    ")"
+                )
+                c.execute(
+                    "INSERT INTO positions(symbol, mode, qty, entry_price, entry_ts, agents) "
+                    "SELECT symbol, mode, qty, entry_price, entry_ts, agents FROM positions_old"
+                )
+                c.execute("DROP TABLE positions_old")
 
     # ── KV (used for autopilot state) ────────────────────────────────
     def kv_set(self, key: str, value: Any) -> None:
@@ -310,7 +334,7 @@ class Storage:
             c.execute(
                 "INSERT INTO positions(symbol,mode,qty,entry_price,entry_ts,agents) "
                 "VALUES(?,?,?,?,?,?) "
-                "ON CONFLICT(symbol) DO UPDATE SET qty=qty+excluded.qty, "
+                "ON CONFLICT(symbol,mode) DO UPDATE SET qty=qty+excluded.qty, "
                 "entry_price=((qty*entry_price + excluded.qty*excluded.entry_price)/"
                 "(qty+excluded.qty)) ",
                 (symbol, mode, _f(qty), _f(entry_price), _now(), agents_json),
@@ -318,7 +342,10 @@ class Storage:
 
     def get_position(self, symbol: str) -> Optional[dict]:
         with self._lock, self._conn() as c:
-            row = c.execute("SELECT * FROM positions WHERE symbol=?", (symbol,)).fetchone()
+            row = c.execute(
+                "SELECT * FROM positions WHERE symbol=? ORDER BY CASE mode WHEN 'live' THEN 0 ELSE 1 END LIMIT 1",
+                (symbol,),
+            ).fetchone()
         return dict(row) if row else None
 
     def all_positions(self) -> list[dict]:
@@ -330,11 +357,22 @@ class Storage:
         self,
         *,
         symbol: str,
+        mode: Optional[str] = None,
         exit_price: Decimal | float,
     ) -> Optional[dict]:
         """Close a position fully. Records to closed_trades and updates agent stats."""
         with self._lock, self._conn() as c:
-            row = c.execute("SELECT * FROM positions WHERE symbol=?", (symbol,)).fetchone()
+            if mode is None:
+                row = c.execute(
+                    "SELECT * FROM positions WHERE symbol=? "
+                    "ORDER BY CASE mode WHEN 'live' THEN 0 ELSE 1 END LIMIT 1",
+                    (symbol,),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT * FROM positions WHERE symbol=? AND mode=?",
+                    (symbol, mode),
+                ).fetchone()
             if not row:
                 return None
             qty = float(row["qty"])
@@ -354,7 +392,7 @@ class Storage:
             entry_ts = row["entry_ts"]
             mode = row["mode"]
             now = _now()
-            c.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
+            c.execute("DELETE FROM positions WHERE symbol=? AND mode=?", (symbol, mode or row["mode"]))
             c.execute(
                 "INSERT INTO closed_trades(mode,symbol,qty,entry_price,exit_price,pnl,"
                 "pnl_pct,entry_ts,exit_ts,agents) VALUES(?,?,?,?,?,?,?,?,?,?)",
