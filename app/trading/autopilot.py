@@ -726,6 +726,17 @@ class Autopilot:
             if sig.action == SignalAction.HOLD:
                 _bump("action_hold", symbol, f"conf={sig.confidence:.2f}")
                 continue
+            # A SELL of a coin we actually hold is an EXIT, not an entry. Exits
+            # must never be blocked by the entry-oriented gates below: the
+            # dynamic confidence bar is leaned UP in risk-off (which would make
+            # it harder to sell exactly when we most want out), and the ML
+            # quality gate is calibrated on entry win-rates. If the ensemble
+            # says SELL and we hold the asset, let the sale through — worst case
+            # we sit in cash, the safe/reversible direction on spot.
+            is_exit = (
+                sig.action == SignalAction.SELL
+                and balances.get(symbol.removesuffix("USDT"), Decimal("0")) > 0
+            )
             if sig.action == SignalAction.BUY:
                 _set_filter(
                     symbol,
@@ -734,7 +745,7 @@ class Autopilot:
                     f"conf={sig.confidence:.3f} threshold={min_conf:.3f}",
                     sig,
                 )
-            if sig.confidence < min_conf:
+            if sig.confidence < min_conf and not is_exit:
                 if sig.action == SignalAction.BUY:
                     _finish(
                         symbol,
@@ -759,7 +770,7 @@ class Autopilot:
             # loop fed with counterfactual outcomes so the gate can self-correct.
             if sig.action in (SignalAction.BUY, SignalAction.SELL):
                 await self._record_signal_event(symbol, sig)
-            if ml_model is not None and sig.action in (SignalAction.BUY, SignalAction.SELL):
+            if ml_model is not None and not is_exit and sig.action in (SignalAction.BUY, SignalAction.SELL):
                 proba = await self._ml_win_proba(ml_model, symbol, sig)
                 if proba is not None:
                     gate_evaluated += 1
