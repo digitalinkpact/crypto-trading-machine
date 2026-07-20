@@ -101,9 +101,9 @@ def evaluate_exits(
             out.append(ExitDecision(symbol, qty, "take_profit"))
             continue
 
-        # 3. Trailing stop (only after position has gained at least half the take-profit)
-        half_tp = Decimal(str(s.take_profit_pct)) / Decimal("2")
-        if hwm > entry * (Decimal("1") + half_tp):
+        # 3. Trailing stop (arm only after position gains the configured threshold)
+        trail_activation = Decimal(str(getattr(s, "trailing_activation_pct", s.take_profit_pct / 2)))
+        if hwm > entry * (Decimal("1") + trail_activation):
             trail_floor = hwm * (Decimal("1") - Decimal(str(s.trailing_stop_pct)))
             if price <= trail_floor:
                 out.append(ExitDecision(symbol, qty, "trailing_stop"))

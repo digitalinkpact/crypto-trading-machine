@@ -37,6 +37,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
             out["ema_20"] = pta.ema(close, length=20)
             out["ema_50"] = pta.ema(close, length=50)
             out["ema_200"] = pta.ema(close, length=200)
+            out["ema_9"] = pta.ema(close, length=9)
+            out["ema_21"] = pta.ema(close, length=21)
             out["rsi_14"] = pta.rsi(close, length=14)
             macd = pta.macd(close)
             if macd is not None:
@@ -49,6 +51,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
                 out["bb_mid"] = bb.iloc[:, 1]
                 out["bb_upper"] = bb.iloc[:, 2]
             out["atr_14"] = pta.atr(high, low, close, length=14)
+            out["vol_sma_20"] = out["volume"].rolling(20).mean()
             return out
         except (ValueError, TypeError, KeyError) as e:  # fall through to `ta`
             log.warning("pandas_ta indicator pipeline failed, using ta fallback: %s", e)
@@ -56,6 +59,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["ema_20"] = EMAIndicator(close=close, window=20).ema_indicator()
     out["ema_50"] = EMAIndicator(close=close, window=50).ema_indicator()
     out["ema_200"] = EMAIndicator(close=close, window=200).ema_indicator()
+    out["ema_9"] = EMAIndicator(close=close, window=9).ema_indicator()
+    out["ema_21"] = EMAIndicator(close=close, window=21).ema_indicator()
     out["rsi_14"] = RSIIndicator(close=close, window=14).rsi()
     macd = MACD(close=close)
     out["macd"] = macd.macd()
@@ -66,4 +71,5 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["bb_mid"] = bb.bollinger_mavg()
     out["bb_upper"] = bb.bollinger_hband()
     out["atr_14"] = AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
+    out["vol_sma_20"] = out["volume"].rolling(20).mean()
     return out

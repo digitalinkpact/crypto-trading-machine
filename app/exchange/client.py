@@ -84,12 +84,13 @@ class BinanceUSClient:
     async def klines(
         self,
         symbol: str,
-        timeframe: Timeframe,
+        timeframe: Timeframe | str,
         limit: int = 500,
     ) -> pd.DataFrame:
         """Fetch OHLCV candles. Returns a DataFrame indexed by close_time (UTC)."""
+        interval = timeframe.value if hasattr(timeframe, "value") else str(timeframe)
         raw = await asyncio.to_thread(
-            self._spot.klines, symbol, timeframe.value, limit=limit
+            self._spot.klines, symbol, interval, limit=limit
         )
         cols = [
             "open_time", "open", "high", "low", "close", "volume",

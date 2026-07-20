@@ -205,19 +205,34 @@ class Settings(BaseSettings):
     max_position_pct: float = Field(0.05, ge=0.005, le=1.0)      # per-position sizing cap
     max_portfolio_risk_pct: float = Field(0.25, ge=0.0, le=1.0)
     kelly_fraction_cap: float = Field(0.25, ge=0.005, le=1.0)
-    max_open_positions: int = Field(25, ge=1, le=25)             # cap concurrent positions
+    max_open_positions: int = Field(3, ge=1, le=25)              # cap concurrent positions
     max_long_exposure_pct: float = Field(0.60, ge=0.0, le=1.0)   # ≤ 60% of equity in non-USDT
 
     # Exit gates (hard rules, evaluated every risk-tick)
-    stop_loss_pct: float = Field(0.04, ge=0.005, le=0.20)        # 4% hard stop (2% sat inside crypto noise)
+    stop_loss_pct: float = Field(0.015, ge=0.005, le=0.20)       # 1.5% hard stop
     take_profit_pct: float = Field(0.05, ge=0.005, le=0.50)      # 5% take-profit
-    trailing_stop_pct: float = Field(0.025, ge=0.005, le=0.20)   # 2.5% trail from HWM
+    trailing_stop_pct: float = Field(0.01, ge=0.005, le=0.20)    # 1.0% trail from HWM
+    trailing_activation_pct: float = Field(0.02, ge=0.005, le=0.50)  # arm trailing after +2%
     max_hold_hours: int = Field(96, ge=1, le=10000)              # force-exit after 4 days
     drawdown_circuit_breaker_pct: float = Field(0.10, ge=0.01, le=0.50)  # halt new BUYs after -10%
 
     # Entry gates
-    min_signal_confidence: float = Field(0.55, ge=0.0, le=1.0)   # lowered to 0.55: more aggressive entries for live trading
-    buy_cooldown_minutes: int = Field(30, ge=0, le=1440)         # was 60
+    min_signal_confidence: float = Field(0.65, ge=0.0, le=1.0)
+    buy_cooldown_minutes: int = Field(20, ge=0, le=1440)
+
+    # ProfitStream strategy controls.
+    profitstream_enabled: bool = True
+    profitstream_use_legacy_agents: bool = False
+    profitstream_score_threshold: int = Field(80, ge=0, le=100)
+    profitstream_rsi_min: int = Field(40, ge=1, le=99)
+    profitstream_rsi_max: int = Field(65, ge=1, le=99)
+    profitstream_volume_spike_multiple: float = Field(1.5, ge=1.0, le=10.0)
+    profitstream_btc_volatility_threshold: float = Field(0.03, ge=0.001, le=0.20)
+    profitstream_low_volume_quote_min: float = Field(50.0, ge=0.0, le=1_000_000.0)
+    # Optional comma-separated UTC timestamps (ISO-8601) for major news events.
+    # Example: "2026-07-20T12:30:00+00:00,2026-08-01T14:00:00+00:00"
+    profitstream_news_events_utc: str = ""
+    profitstream_news_buffer_minutes: int = Field(30, ge=0, le=240)
     # Long-term trend filter — only open longs when the latest daily close is
     # above its 200-EMA. Spot is long-only, so buying assets in a downtrend just
     # feeds the stop-loss gate. Backtest-validated: cuts losses ~3x and max
@@ -300,7 +315,7 @@ class Settings(BaseSettings):
     # Reject entry if (ask-bid)/mid exceeds this (0.005 = 0.50%). Aligned with
     # the universe `max_spread_percent` (0.50%) — Binance.US is thin, so the old
     # 0.15% was effectively un-satisfiable and starved the bot of entries.
-    max_spread_pct: float = Field(0.005, ge=0.0, le=0.05)
+    max_spread_pct: float = Field(0.0025, ge=0.0, le=0.05)
     # Require resting depth near mid >= this multiple of the trade notional.
     min_depth_trade_multiple: float = Field(2.0, ge=0.0, le=100.0)
     # "Near mid" band used for the depth check (0.001 = 0.1%).
@@ -335,6 +350,11 @@ class Settings(BaseSettings):
     onchain_cache_ttl_seconds: int = Field(1800, ge=60, le=86_400)
     # Block new longs when 24h exchange inflow exceeds this z-score vs trailing mean.
     onchain_inflow_spike_z: float = Field(2.0, ge=0.5, le=10.0)
+
+    # Risk manager controls.
+    risk_per_trade_pct: float = Field(0.01, ge=0.001, le=0.10)
+    loss_streak_pause_count: int = Field(3, ge=1, le=20)
+    loss_streak_pause_minutes: int = Field(60, ge=1, le=1440)
 
     # Storage
     data_cache_dir: Path = Path("./data/cache")

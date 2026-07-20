@@ -9,7 +9,9 @@ from app.exchange.symbol_source import get_symbols
 from app.logging_setup import get_logger
 from app.regime import RegimeClassifier
 from app.signals import Signal, SignalAggregator
+from app.storage import storage
 from app.ta import add_indicators
+from app.trading.strategy import ProfitStreamStrategy
 
 from .base import AgentContext
 from .breakout import BreakoutAgent
@@ -60,13 +62,14 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
     raw_signals: list[Signal] = []
     llm_tasks: list[asyncio.Task[Signal | None]] = []
     llm_sem = asyncio.Semaphore(_LLM_CONCURRENCY)
+    settings = get_settings()
+    mode = "paper" if settings.paper_trading else "live"
 
 
     # --- ML model gating for LLM signals ---
-    from app.storage import storage
     import numpy as np
     ML_MODEL_NAME = "signal_quality_v1"
-    ml_confidence_threshold = get_settings().ml_gate_threshold
+    ml_confidence_threshold = settings.ml_gate_threshold
     ml_model_artifact = storage.load_model_artifact(ML_MODEL_NAME)
     ml_model = ml_model_artifact["model"] if ml_model_artifact else None
 
@@ -118,6 +121,44 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
                 return None
 
     symbols = await get_symbols()
+
+    if settings.profitstream_enabled:
+        strategy = ProfitStreamStrategy()
+        score_threshold = settings.profitstream_score_threshold
+        for symbol in symbols:
+            decision = await strategy.analyze_symbol(symbol, mode=mode)
+            executed = (
+                decision.action.value in ("BUY", "SELL")
+                and decision.score >= score_threshold
+            )
+            reason = "; ".join(decision.reasons) if decision.reasons else "score_pass"
+            storage.record_tick_audit(
+                mode=mode,
+                symbol=symbol,
+                timeframe="1m/5m/15m/1h",
+                action=decision.action.value,
+                score=decision.score,
+                executed=executed,
+                reason=reason,
+                indicators=decision.indicators,
+                filters={"score_threshold": score_threshold},
+            )
+            if executed:
+                raw_signals.append(
+                    Signal(
+                        agent="profitstream_strategy",
+                        symbol=symbol,
+                        timeframe=Timeframe.H1,
+                        action=decision.action,
+                        confidence=max(0.0, min(1.0, decision.score / 100.0)),
+                        rationale=reason,
+                        contributing_agents=("profitstream_strategy",),
+                    )
+                )
+
+        if not settings.profitstream_use_legacy_agents:
+            return SignalAggregator().aggregate(raw_signals)
+
     for symbol in symbols:
         for tf in TIMEFRAMES:
             try:

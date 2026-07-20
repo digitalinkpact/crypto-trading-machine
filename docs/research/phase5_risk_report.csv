@@ -1,0 +1,11 @@
+rank,daily_loss_guard,loss_streak_guard,no_trade_adx_lt_25,no_trade_low_volume,no_trade_high_btc_vol,no_trade_sideways,spread_guard,test_drawdown,test_profit_factor,test_win_rate
+1,enabled_3pct,enabled_3_losses_1h_pause,True,True,True,True,0.25pct_live_only,0.0,999.0,1.0
+2,enabled_3pct,enabled_3_losses_1h_pause,True,True,True,True,0.25pct_live_only,0.0,999.0,1.0
+3,enabled_3pct,enabled_3_losses_1h_pause,True,True,True,True,0.25pct_live_only,0.0,999.0,1.0
+4,enabled_3pct,enabled_3_losses_1h_pause,True,True,True,True,0.25pct_live_only,0.0,999.0,1.0
+5,enabled_3pct,enabled_3_losses_1h_pause,True,True,True,True,0.25pct_live_only,0.0,999.0,1.0
+6,enabled_3pct,enabled_3_losses_1h_pause,True,True,True,True,0.25pct_live_only,0.0,999.0,1.0
+7,enabled_3pct,enabled_3_losses_1h_pause,True,True,True,True,0.25pct_live_only,0.0,999.0,1.0
+8,enabled_3pct,enabled_3_losses_1h_pause,True,True,True,True,0.25pct_live_only,0.0,999.0,1.0
+9,enabled_3pct,enabled_3_losses_1h_pause,True,True,True,True,0.25pct_live_only,0.0,999.0,1.0
+10,enabled_3pct,enabled_3_losses_1h_pause,True,True,True,True,0.25pct_live_only,0.0,999.0,1.0

@@ -1,0 +1,39 @@
+{
+  "tested_combinations": 10000,
+  "passing_combinations": 270,
+  "autopsy_trade_count": 68,
+  "autopsy_loss_count": 30,
+  "best_params": {
+    "rank": 1,
+    "pass_constraints": true,
+    "score_threshold": 71,
+    "rsi_lo": 40,
+    "rsi_hi": 60,
+    "vol_mult": 1.8,
+    "atr_threshold": 0.04,
+    "adx_threshold": 35.0,
+    "trailing_stop": 0.012,
+    "stop_loss": 0.0125,
+    "take_profit": 0.08,
+    "ema_short": 9,
+    "ema_long": 21,
+    "val_win_rate": 0.4,
+    "val_profit_factor": 1.2751743244880578,
+    "val_max_drawdown": 4.229283736827329e-05,
+    "test_win_rate": 1.0,
+    "test_profit_factor": 999.0,
+    "test_max_drawdown": 0.0,
+    "test_sharpe": 7.636549737813444,
+    "test_trades": 4,
+    "objective": 504.05461989512537
+  },
+  "best_position_management": {
+    "variant": "baseline",
+    "win_rate": 1.0,
+    "profit_factor": 999.0,
+    "max_drawdown": 0.0,
+    "sharpe": 7.636549737813444,
+    "trades": 4,
+    "objective": 703.1182748689067
+  }
+}

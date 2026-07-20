@@ -179,6 +179,22 @@ CREATE TABLE IF NOT EXISTS trade_audit (
 );
 CREATE INDEX IF NOT EXISTS ix_trade_audit_ts ON trade_audit(ts);
 CREATE INDEX IF NOT EXISTS ix_trade_audit_symbol_ts ON trade_audit(symbol, ts);
+
+CREATE TABLE IF NOT EXISTS tick_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    action TEXT NOT NULL,
+    score INTEGER NOT NULL,
+    executed INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL,
+    indicators TEXT NOT NULL,
+    filters TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_tick_audit_ts ON tick_audit(ts);
+CREATE INDEX IF NOT EXISTS ix_tick_audit_symbol_ts ON tick_audit(symbol, ts);
 """
 
 
@@ -592,6 +608,47 @@ class Storage:
         with self._lock, self._conn() as c:
             rows = c.execute(
                 "SELECT * FROM trade_audit ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_tick_audit(
+        self,
+        *,
+        mode: str,
+        symbol: str,
+        timeframe: str,
+        action: str,
+        score: int,
+        executed: bool,
+        reason: str,
+        indicators: Optional[dict[str, Any]] = None,
+        filters: Optional[dict[str, Any]] = None,
+    ) -> int:
+        with self._lock, self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO tick_audit("
+                "ts,mode,symbol,timeframe,action,score,executed,reason,indicators,filters"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    _now(),
+                    mode,
+                    symbol,
+                    timeframe,
+                    action,
+                    int(score),
+                    1 if executed else 0,
+                    reason,
+                    json.dumps(indicators or {}, default=str),
+                    json.dumps(filters or {}, default=str),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def recent_tick_audit(self, limit: int = 100) -> list[dict]:
+        with self._lock, self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM tick_audit ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]

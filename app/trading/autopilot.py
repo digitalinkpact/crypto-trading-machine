@@ -38,6 +38,7 @@ from app.trading.audit import trade_audit_logger
 from app.trading import risk
 from app.trading.paper import paper_exchange
 from app.trading.portfolio import portfolio_snapshot
+from app.trading.risk_manager import RiskManager
 
 log = get_logger(__name__)
 
@@ -336,10 +337,42 @@ class Autopilot:
                             log.warning("stale close failed for %s: %s", ex.symbol, exc)
                     else:
                         log.info("risk-exit %s skipped: filters reject qty=%s", ex.symbol, qty)
+                    storage.record_tick_audit(
+                        mode=self.state.mode,
+                        symbol=ex.symbol,
+                        timeframe="risk",
+                        action="SELL",
+                        score=100,
+                        executed=False,
+                        reason=f"risk_exit_skip:{ex.reason}",
+                        indicators={
+                            "entry_qty": str(ex.qty),
+                            "free_qty": str(avail) if avail is not None else None,
+                            "rounded_qty": str(qty),
+                            "price": str(price),
+                        },
+                        filters={"meets_min": False},
+                    )
                     continue
                 log.warning("RISK EXIT %s reason=%s qty=%s price=%s (book=%s free=%s)",
                             ex.symbol, ex.reason, qty, price, ex.qty, avail)
                 order = await self._submit(ex.symbol, OrderSide.SELL, qty, [f"risk:{ex.reason}"])
+                storage.record_tick_audit(
+                    mode=self.state.mode,
+                    symbol=ex.symbol,
+                    timeframe="risk",
+                    action="SELL",
+                    score=100,
+                    executed=self._order_filled(order),
+                    reason=f"risk_exit:{ex.reason}",
+                    indicators={
+                        "entry_qty": str(ex.qty),
+                        "free_qty": str(avail) if avail is not None else None,
+                        "rounded_qty": str(qty),
+                        "price": str(price),
+                    },
+                    filters={"meets_min": True},
+                )
                 if self._order_filled(order):
                     risk.clear_hwm(ex.symbol)
                 else:
@@ -594,7 +627,10 @@ class Autopilot:
             min_notional_passed = min_notional_info.get("ok") if min_notional_info else None
             signal_val = entry.get("action") or (getattr(sig.action, "value", "HOLD") if sig is not None else "HOLD")
             confidence = entry.get("confidence")
-            balances = snap["all_balances"] if isinstance(snap, dict) else {}
+            balances = (
+                snap.get("free_balances") or snap.get("all_balances")
+                if isinstance(snap, dict) else {}
+            )
             avail = Decimal(str(snap.get("usdt_cash", "0"))) if isinstance(snap, dict) else Decimal("0")
             if signal_val == SignalAction.SELL.value:
                 base = sym.removesuffix("USDT")
@@ -660,6 +696,7 @@ class Autopilot:
         )
         now = datetime.now(timezone.utc)
         cooldown = timedelta(minutes=s.buy_cooldown_minutes)
+        risk_manager = RiskManager()
 
         # ML quality gate — load the learned model once per tick. Trades whose
         # predicted win-probability is below the threshold are skipped. Loaded
@@ -838,21 +875,23 @@ class Autopilot:
                         _finish(symbol, "cooldown", f"cooldown={cooldown}", submitted=False, sig=sig)
                         continue
                     _set_filter(symbol, "cooldown", True, f"cooldown window clear ({cooldown})", sig)
-                    ok, why = risk.can_open_new_position(
+                    entry_price = await self._price(symbol)
+                    entry_risk = risk_manager.evaluate_entry(
+                        mode=self.state.mode,
+                        total_equity_usdt=total_eq,
                         open_positions=open_count,
                         long_exposure_pct=long_exposure_pct,
+                        entry_price=entry_price,
                     )
-                    _set_filter(symbol, "risk_cap", ok, why, sig)
-                    if not ok:
-                        _finish(symbol, "risk_cap", why, submitted=False, sig=sig)
-                        log.info("skip %s BUY: %s", symbol, why)
+                    _set_filter(symbol, "risk_manager", entry_risk.allow, entry_risk.reason, sig)
+                    if not entry_risk.allow:
+                        _finish(symbol, "risk_manager", entry_risk.reason, submitted=False, sig=sig)
+                        log.info("skip %s BUY: %s", symbol, entry_risk.reason)
                         continue
 
                     atr_pct = await self._atr_pct(symbol)
-                    eff_pct = risk.volatility_scaled_pct(s.max_position_pct, atr_pct)
-                    per_trade_usdt = usdt_free * Decimal(str(eff_pct))
-                    if per_trade_usdt < 10 and usdt_free >= 10:
-                        per_trade_usdt = Decimal("10")
+                    per_trade_usdt = entry_risk.notional_usdt
+                    eff_pct = float(per_trade_usdt / total_eq) if total_eq > 0 else 0.0
                     buy_plan = await self._buy_order_plan(symbol, per_trade_usdt)
                     buy_plan["atr_pct"] = atr_pct
                     buy_plan["effective_position_pct"] = eff_pct
