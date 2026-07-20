@@ -289,8 +289,9 @@ class Autopilot:
         balances_known = False
         try:
             snap = await portfolio_snapshot(mode=self.state.mode)
+            balance_source = snap.get("free_balances") or snap.get("all_balances") or {}
             free_balances = {
-                a: Decimal(str(q)) for a, q in snap["all_balances"].items()
+                a: Decimal(str(q)) for a, q in balance_source.items()
             }
             balances_known = True
         except Exception as exc:  # noqa: BLE001
@@ -372,8 +373,9 @@ class Autopilot:
         """Execute one aggregated signal through Validate -> Risk -> Execute -> Log."""
         s = get_settings()
         snap = await portfolio_snapshot(mode=self.state.mode)
+        balance_source = snap.get("free_balances") or snap.get("all_balances") or {}
         balances: dict[str, Decimal] = {
-            asset: Decimal(str(qty)) for asset, qty in snap["all_balances"].items()
+            asset: Decimal(str(qty)) for asset, qty in balance_source.items()
         }
         usdt_free = Decimal(str(snap["usdt_cash"]))
         total_eq = Decimal(str(snap["total_usdt"]))
@@ -645,8 +647,9 @@ class Autopilot:
         long_exposure_pct = float(
             (total_eq - usdt_free) / total_eq if total_eq > 0 else Decimal("0")
         )
+        balance_source = snap.get("free_balances") or snap.get("all_balances") or {}
         balances: dict[str, Decimal] = {
-            asset: Decimal(str(qty)) for asset, qty in snap["all_balances"].items()
+            asset: Decimal(str(qty)) for asset, qty in balance_source.items()
         }
         open_positions = [
             p for p in storage.all_positions() if p["mode"] == self.state.mode

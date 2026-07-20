@@ -33,19 +33,27 @@ async def portfolio_snapshot(
     can_trade = bool(account.get("canTrade", True))
     account_type = account.get("accountType", "SPOT")
     raw_balances = [
-        (b["asset"], Decimal(b["free"]) + Decimal(b.get("locked", "0")))
+        (
+            b["asset"],
+            Decimal(str(b.get("free", "0"))),
+            Decimal(str(b.get("locked", "0"))),
+        )
         for b in account.get("balances", [])
     ]
 
     usdt_cash = Decimal("0")
     holdings: list[dict] = []
     all_balances: dict[str, Decimal] = {}
-    for asset, qty in raw_balances:
+    free_balances: dict[str, Decimal] = {}
+    for asset, free_qty, locked_qty in raw_balances:
+        qty = free_qty + locked_qty
         if qty <= 0:
             continue
         all_balances[asset] = qty
+        if free_qty > 0:
+            free_balances[asset] = free_qty
         if asset == "USDT":
-            usdt_cash = qty
+            usdt_cash = free_qty
             continue
         symbol = f"{asset}USDT"
         try:
@@ -65,6 +73,7 @@ async def portfolio_snapshot(
         "usdt_cash": usdt_cash,
         "holdings": holdings,
         "all_balances": all_balances,
+        "free_balances": free_balances,
         "can_trade": can_trade,
         "account_type": account_type,
     }

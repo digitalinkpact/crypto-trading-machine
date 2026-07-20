@@ -312,6 +312,57 @@ async def test_execute_sell_uses_live_balance_without_local_position(monkeypatch
     assert placed == [("BTCUSDT", Decimal("0.25"))]
 
 
+async def test_execute_sell_prefers_free_balance_over_total_balance(monkeypatch):
+    """SELL sizing must use free balance, not free+locked total balance."""
+    ap = Autopilot()
+    ap.state.mode = "live"
+
+    class _Settings:
+        min_signal_confidence = 0.55
+        dynamic_threshold_enabled = False
+        ml_gate_enabled = False
+        buy_cooldown_minutes = 30
+
+    async def _fake_snapshot(*, mode):
+        assert mode == "live"
+        return {
+            "usdt_cash": Decimal("100"),
+            "total_usdt": Decimal("150"),
+            "all_balances": {"BTC": Decimal("0.25"), "USDT": Decimal("100")},
+            "free_balances": {"BTC": Decimal("0.20"), "USDT": Decimal("100")},
+        }
+
+    placed: list[tuple[str, Decimal]] = []
+
+    async def _fake_place_sell(_self, symbol: str, _sig, free: Decimal) -> bool:
+        placed.append((symbol, free))
+        return True
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _Settings())
+    monkeypatch.setattr(autopilot_module, "portfolio_snapshot", _fake_snapshot)
+    monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [])
+    monkeypatch.setattr(
+        Autopilot,
+        "_count_non_dust_positions",
+        lambda *_a, **_k: __import__("asyncio").sleep(0, result=(0, set())),
+        raising=True,
+    )
+    monkeypatch.setattr(Autopilot, "_place_sell", _fake_place_sell, raising=True)
+    monkeypatch.setattr(autopilot_module.filters, "is_listed", lambda _s: True, raising=True)
+    monkeypatch.setattr(Autopilot, "_record_signal_event", lambda *_a, **_k: __import__("asyncio").sleep(0), raising=True)
+    monkeypatch.setattr(Autopilot, "_persist_skip_stats", lambda *_a, **_k: None, raising=True)
+
+    class _SellSig:
+        action = autopilot_module.SignalAction.SELL
+        confidence = 0.9
+        contributing_agents = ["test"]
+        timeframe = autopilot_module.Timeframe.D1
+
+    await ap._execute({"BTCUSDT": _SellSig()}, allow_buys=True)
+
+    assert placed == [("BTCUSDT", Decimal("0.20"))]
+
+
 async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
     ap = Autopilot()
     ap.state.mode = "live"
