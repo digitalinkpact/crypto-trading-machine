@@ -203,6 +203,83 @@ def test_order_filled_false_for_none():
     assert Autopilot._order_filled(None) is False
 
 
+def test_dynamic_ml_gate_thresholds_follow_confidence_bands(monkeypatch):
+    ap = Autopilot()
+
+    class _S:
+        ml_gate_threshold = 0.50
+        ml_gate_threshold_conf_70 = 0.45
+        ml_gate_threshold_conf_80 = 0.40
+        ml_gate_threshold_conf_90 = 0.35
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+
+    assert ap._ml_gate_threshold_for_confidence(0.95, True) == 0.35
+    assert ap._ml_gate_threshold_for_confidence(0.85, True) == 0.40
+    assert ap._ml_gate_threshold_for_confidence(0.75, True) == 0.45
+    assert ap._ml_gate_threshold_for_confidence(0.65, True) == 0.50
+    assert ap._ml_gate_threshold_for_confidence(0.95, False) == 0.50
+
+
+def test_trend_gate_bypass_requires_both_confidence_and_ml(monkeypatch):
+    ap = Autopilot()
+
+    class _S:
+        trend_gate_bypass_confidence = 0.85
+        trend_gate_bypass_ml_proba = 0.55
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+
+    assert ap._trend_gate_bypass_allowed(0.90, 0.60, True) is True
+    assert ap._trend_gate_bypass_allowed(0.84, 0.60, True) is False
+    assert ap._trend_gate_bypass_allowed(0.90, 0.54, True) is False
+    assert ap._trend_gate_bypass_allowed(0.90, None, True) is False
+
+
+def test_aggressive_mode_rolls_back_below_min_win_rate(monkeypatch):
+    ap = Autopilot()
+    ap.state.mode = "live"
+
+    class _S:
+        aggressive_mode_enabled = True
+        aggressive_rollback_min_trades = 30
+        aggressive_rollback_min_win_rate = 0.50
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    monkeypatch.setattr(
+        autopilot_module.storage,
+        "closed_trades",
+        lambda limit=30: [{"mode": "live", "pnl": 1}] * 14 + [{"mode": "live", "pnl": -1}] * 16,
+        raising=True,
+    )
+
+    active, reason = ap._aggressive_mode_active()
+    assert active is False
+    assert "rollback" in reason
+
+
+def test_aggressive_mode_stays_active_during_warmup(monkeypatch):
+    ap = Autopilot()
+    ap.state.mode = "live"
+
+    class _S:
+        aggressive_mode_enabled = True
+        aggressive_rollback_min_trades = 30
+        aggressive_rollback_min_win_rate = 0.50
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    monkeypatch.setattr(
+        autopilot_module.storage,
+        "closed_trades",
+        lambda limit=30: [{"mode": "live", "pnl": 1}] * 10,
+        raising=True,
+    )
+
+    active, reason = ap._aggressive_mode_active()
+    assert active is True
+    assert reason.startswith("warmup:")
+
+
 class _Sig:
     contributing_agents = ["test"]
 
@@ -444,7 +521,7 @@ async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
     assert info["action"] == "BUY"
     assert info["filters"]["market_regime"]["ok"] is False
     assert info["filters"]["min_notional"]["ok"] is True
-    assert info["sizing"]["rounded_qty"] == "0.2000"
-    assert info["sizing"]["notional"] == "10.0000"
+    assert info["sizing"]["rounded_qty"] == "0.1200"
+    assert info["sizing"]["notional"] == "6.0000"
     assert info["final_reason"] == "market_gate"
     assert info["submitted"] is False

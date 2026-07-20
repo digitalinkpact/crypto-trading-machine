@@ -144,6 +144,7 @@ class Autopilot:
         # The regime is portfolio-wide, so it is computed once and reused for
         # every symbol within a tick instead of refetching BTC per candidate.
         self._market_regime_cache: Optional[tuple[bool, str, float]] = None
+        self._orderbook_retry_tasks: dict[tuple[str, str], asyncio.Task] = {}
 
     # ── persistence ────────────────────────────────────────────────────
     def _save(self) -> None:
@@ -753,6 +754,14 @@ class Autopilot:
         gate_accepted = 0
         gate_gated = 0
         gate_proba_sum = 0.0
+        aggressive_mode, aggressive_reason = self._aggressive_mode_active()
+        spread_cap = Decimal(
+            str(
+                getattr(s, "aggressive_max_spread_pct", 0.0025)
+                if aggressive_mode else getattr(s, "rollback_max_spread_pct", getattr(s, "max_spread_pct", 0.0015))
+            )
+        )
+        log.info("[AGGRESSIVE] %s spread_cap=%.4f%%", aggressive_reason, float(spread_cap) * 100)
 
         # Rank candidates by confidence (desc) so scarce cash and the
         # long-exposure cap are spent on the strongest signals first. Without
@@ -763,6 +772,7 @@ class Autopilot:
             signals.items(), key=lambda kv: kv[1].confidence, reverse=True
         )
         for symbol, sig in ranked_signals:
+            ml_proba: Optional[float] = None
             if sig.action == SignalAction.HOLD:
                 _bump("action_hold", symbol, f"conf={sig.confidence:.2f}")
                 continue
@@ -811,42 +821,43 @@ class Autopilot:
             if sig.action in (SignalAction.BUY, SignalAction.SELL):
                 await self._record_signal_event(symbol, sig)
             if ml_model is not None and not is_exit and sig.action in (SignalAction.BUY, SignalAction.SELL):
-                proba = await self._ml_win_proba(ml_model, symbol, sig)
-                if proba is not None:
+                ml_proba = await self._ml_win_proba(ml_model, symbol, sig)
+                if ml_proba is not None:
+                    gate_threshold = self._ml_gate_threshold_for_confidence(sig.confidence, aggressive_mode)
                     gate_evaluated += 1
-                    gate_proba_sum += proba
-                    if proba < s.ml_gate_threshold:
+                    gate_proba_sum += ml_proba
+                    if ml_proba < gate_threshold:
                         gate_gated += 1
                         log.info("[ML_GATE] SKIP %s %s proba=%.3f < %.2f",
-                                 symbol, sig.action.value, proba, s.ml_gate_threshold)
+                                 symbol, sig.action.value, ml_proba, gate_threshold)
                         if sig.action == SignalAction.BUY:
                             _set_filter(
                                 symbol,
                                 "ml_gate",
                                 False,
-                                f"proba={proba:.3f} threshold={s.ml_gate_threshold:.3f}",
+                                f"proba={ml_proba:.3f} threshold={gate_threshold:.3f}",
                                 sig,
                             )
                             _finish(
                                 symbol,
                                 "ml_gate",
-                                f"{sig.action.value} proba={proba:.2f} < {s.ml_gate_threshold}",
+                                f"{sig.action.value} proba={ml_proba:.2f} < {gate_threshold}",
                                 submitted=False,
                                 sig=sig,
                             )
                         else:
                             _bump("ml_gate", symbol,
-                                  f"{sig.action.value} proba={proba:.2f} < {s.ml_gate_threshold}")
+                                  f"{sig.action.value} proba={ml_proba:.2f} < {gate_threshold}")
                         continue
                     gate_accepted += 1
                     log.info("[ML_GATE] PASS %s %s proba=%.3f >= %.2f",
-                             symbol, sig.action.value, proba, s.ml_gate_threshold)
+                             symbol, sig.action.value, ml_proba, gate_threshold)
                     if sig.action == SignalAction.BUY:
                         _set_filter(
                             symbol,
                             "ml_gate",
                             True,
-                            f"proba={proba:.3f} threshold={s.ml_gate_threshold:.3f}",
+                            f"proba={ml_proba:.3f} threshold={gate_threshold:.3f}",
                             sig,
                         )
             if not filters.is_listed(symbol):
@@ -860,28 +871,61 @@ class Autopilot:
                 _set_filter(symbol, "listed", True, "symbol trading on Binance.US", sig)
             try:
                 if sig.action == SignalAction.BUY:
+                    open_pos = next(
+                        (p for p in open_positions if p["symbol"] == symbol and p["mode"] == self.state.mode),
+                        None,
+                    )
+                    is_pyramid = bool(
+                        open_pos
+                        and aggressive_mode
+                        and sig.confidence > float(getattr(s, "pyramid_confidence_threshold", 0.85))
+                    )
                     if not allow_buys:
                         _set_filter(symbol, "drawdown_breaker", False, "new BUYs halted by circuit breaker", sig)
                         _finish(symbol, "breaker_tripped", "new BUYs halted by circuit breaker", submitted=False, sig=sig)
                         continue
                     _set_filter(symbol, "drawdown_breaker", True, "circuit breaker allows BUY", sig)
-                    if symbol in held_symbols:
+                    if symbol in held_symbols and not is_pyramid:
                         _set_filter(symbol, "already_held", False, "existing position already held", sig)
                         _finish(symbol, "already_held", "existing position already held", submitted=False, sig=sig)
                         continue  # don't pyramid into existing position
-                    _set_filter(symbol, "already_held", True, "position not currently held", sig)
-                    if self._on_cooldown(symbol, now, cooldown):
+                    if is_pyramid:
+                        _set_filter(
+                            symbol,
+                            "already_held",
+                            True,
+                            (
+                                f"pyramiding allowed conf={sig.confidence:.3f} > "
+                                f"{float(getattr(s, 'pyramid_confidence_threshold', 0.85)):.3f}"
+                            ),
+                            sig,
+                        )
+                    else:
+                        _set_filter(symbol, "already_held", True, "position not currently held", sig)
+                    if self._on_cooldown(symbol, now, cooldown) and not is_pyramid:
                         _set_filter(symbol, "cooldown", False, f"cooldown={cooldown}", sig)
                         _finish(symbol, "cooldown", f"cooldown={cooldown}", submitted=False, sig=sig)
                         continue
-                    _set_filter(symbol, "cooldown", True, f"cooldown window clear ({cooldown})", sig)
+                    _set_filter(
+                        symbol,
+                        "cooldown",
+                        True,
+                        ("cooldown bypassed for pyramid add" if is_pyramid else f"cooldown window clear ({cooldown})"),
+                        sig,
+                    )
                     entry_price = await self._price(symbol)
+                    current_position_notional = None
+                    if open_pos is not None:
+                        current_position_notional = Decimal(str(open_pos.get("qty") or "0")) * entry_price
                     entry_risk = risk_manager.evaluate_entry(
                         mode=self.state.mode,
                         total_equity_usdt=total_eq,
                         open_positions=open_count,
                         long_exposure_pct=long_exposure_pct,
                         entry_price=entry_price,
+                        aggressive_mode=aggressive_mode,
+                        is_pyramid=is_pyramid,
+                        current_position_notional=current_position_notional,
                     )
                     _set_filter(symbol, "risk_manager", entry_risk.allow, entry_risk.reason, sig)
                     if not entry_risk.allow:
@@ -923,6 +967,9 @@ class Autopilot:
                     # 200-EMA. Spot is long-only, so a downtrend long just feeds
                     # the stop-loss gate. Backtest-validated structural guard.
                     trend_ok, trend_why = await self._trend_gate(symbol)
+                    if not trend_ok and self._trend_gate_bypass_allowed(sig.confidence, ml_proba, aggressive_mode):
+                        trend_ok = True
+                        trend_why = f"bypassed conf={sig.confidence:.3f} ml_proba={ml_proba:.3f}"
                     _set_filter(symbol, "trend_gate", trend_ok, trend_why, sig)
                     if not trend_ok:
                         _finish(symbol, "trend_gate", trend_why, submitted=False, sig=sig)
@@ -968,11 +1015,27 @@ class Autopilot:
 
                     # Order-book liquidity gate (reject thin/wide books).
                     ob_ok, ob_why = await liquidity_gate(
-                        symbol, SignalAction.BUY, per_trade_usdt
+                        symbol, SignalAction.BUY, per_trade_usdt, max_spread_pct=spread_cap
                     )
                     _set_filter(symbol, "orderbook_gate", ob_ok, ob_why, sig)
                     if not ob_ok:
-                        _finish(symbol, "orderbook_gate", ob_why, submitted=False, sig=sig)
+                        retry_scheduled = False
+                        if aggressive_mode and getattr(s, "orderbook_retry_enabled", True):
+                            task_key = (symbol, sig.action.value)
+                            if task_key not in self._orderbook_retry_tasks:
+                                self._orderbook_retry_tasks[task_key] = asyncio.create_task(
+                                    self._retry_orderbook_recheck(
+                                        symbol=symbol,
+                                        sig=sig,
+                                        per_trade_usdt=per_trade_usdt,
+                                        attempt=1,
+                                        aggressive_mode=aggressive_mode,
+                                        spread_cap=spread_cap,
+                                    )
+                                )
+                                retry_scheduled = True
+                        detail = ob_why if not retry_scheduled else f"{ob_why}; retry_scheduled=60s x{int(getattr(s, 'orderbook_retry_attempts', 3))}"
+                        _finish(symbol, "orderbook_gate", detail, submitted=False, sig=sig)
                         log.info("skip %s BUY: order book %s", symbol, ob_why)
                         continue
 
@@ -981,12 +1044,13 @@ class Autopilot:
                         _finish(symbol, "filter_reject_buy", "exchange filters rejected computed qty", submitted=False, sig=sig)
                         continue
                     self.state.cooldowns[symbol] = now.isoformat()
-                    open_count += 1
-                    held_symbols.add(symbol)
+                    if not is_pyramid:
+                        open_count += 1
+                        held_symbols.add(symbol)
                     skip_counter["executed_buy"] += 1
                     _finish(
                         symbol,
-                        "executed_buy",
+                        ("executed_pyramid_buy" if is_pyramid else "executed_buy"),
                         (
                             f"submitted qty={buy_plan['rounded_qty']} notional={buy_plan['notional']} "
                             f"price={buy_plan['price']}"
@@ -1127,6 +1191,140 @@ class Autopilot:
         if not last:
             return False
         return (now - last) < cooldown
+
+    def _aggressive_mode_active(self) -> tuple[bool, str]:
+        s = get_settings()
+        if not getattr(s, "aggressive_mode_enabled", True):
+            return False, "disabled"
+        min_trades = int(getattr(s, "aggressive_rollback_min_trades", 30))
+        min_win_rate = float(getattr(s, "aggressive_rollback_min_win_rate", 0.50))
+        trades = [
+            t for t in storage.closed_trades(limit=min_trades)
+            if t.get("mode") == self.state.mode
+        ]
+        if len(trades) < min_trades:
+            return True, f"warmup:{len(trades)}/{min_trades}"
+        wins = sum(1 for t in trades if Decimal(str(t.get("pnl", 0))) > 0)
+        win_rate = wins / len(trades) if trades else 0.0
+        if win_rate < min_win_rate:
+            return False, f"rollback:win_rate={win_rate:.2f}<{min_win_rate:.2f}"
+        return True, f"active:win_rate={win_rate:.2f}"
+
+    def _ml_gate_threshold_for_confidence(self, confidence: float, aggressive_mode: bool) -> float:
+        s = get_settings()
+        base = float(getattr(s, "ml_gate_threshold", 0.50))
+        if not aggressive_mode:
+            return base
+        if confidence >= 0.90:
+            return float(getattr(s, "ml_gate_threshold_conf_90", 0.35))
+        if confidence >= 0.80:
+            return float(getattr(s, "ml_gate_threshold_conf_80", 0.40))
+        if confidence >= 0.70:
+            return float(getattr(s, "ml_gate_threshold_conf_70", 0.45))
+        return base
+
+    def _trend_gate_bypass_allowed(
+        self,
+        confidence: float,
+        ml_proba: Optional[float],
+        aggressive_mode: bool,
+    ) -> bool:
+        s = get_settings()
+        if not aggressive_mode or ml_proba is None:
+            return False
+        return (
+            confidence > float(getattr(s, "trend_gate_bypass_confidence", 0.85))
+            and ml_proba > float(getattr(s, "trend_gate_bypass_ml_proba", 0.55))
+        )
+
+    async def _retry_orderbook_recheck(
+        self,
+        *,
+        symbol: str,
+        sig,
+        per_trade_usdt: Decimal,
+        attempt: int,
+        aggressive_mode: bool,
+        spread_cap: Decimal,
+    ) -> None:
+        s = get_settings()
+        task_key = (symbol, sig.action.value)
+        try:
+            await asyncio.sleep(int(getattr(s, "orderbook_retry_delay_seconds", 60)))
+            if not self.state.running or sig.action != SignalAction.BUY:
+                return
+
+            snap = await portfolio_snapshot(mode=self.state.mode)
+            balance_source = snap.get("free_balances") or snap.get("all_balances") or {}
+            balances: dict[str, Decimal] = {
+                asset: Decimal(str(qty)) for asset, qty in balance_source.items()
+            }
+            open_positions = [
+                p for p in storage.all_positions() if p["mode"] == self.state.mode
+            ]
+            open_count, held_symbols = await self._count_non_dust_positions(
+                open_positions=open_positions,
+                balances=balances,
+            )
+            if symbol in held_symbols:
+                return
+
+            usdt_free = Decimal(str(snap["usdt_cash"]))
+            total_eq = Decimal(str(snap["total_usdt"]))
+            long_exposure_pct = float(
+                (total_eq - usdt_free) / total_eq if total_eq > 0 else Decimal("0")
+            )
+            entry_price = await self._price(symbol)
+            entry_risk = RiskManager().evaluate_entry(
+                mode=self.state.mode,
+                total_equity_usdt=total_eq,
+                open_positions=open_count,
+                long_exposure_pct=long_exposure_pct,
+                entry_price=entry_price,
+                aggressive_mode=aggressive_mode,
+            )
+            if not entry_risk.allow:
+                log.info("[OB_RETRY] %s attempt=%d skipped: %s", symbol, attempt, entry_risk.reason)
+                return
+
+            retry_notional = min(per_trade_usdt, usdt_free, entry_risk.notional_usdt)
+            if retry_notional <= 0:
+                return
+            ob_ok, ob_why = await liquidity_gate(
+                symbol,
+                SignalAction.BUY,
+                retry_notional,
+                max_spread_pct=spread_cap,
+            )
+            if not ob_ok:
+                log.info("[OB_RETRY] %s attempt=%d blocked: %s", symbol, attempt, ob_why)
+                if getattr(s, "orderbook_retry_enabled", True) and attempt < int(getattr(s, "orderbook_retry_attempts", 3)):
+                    next_task = asyncio.create_task(
+                        self._retry_orderbook_recheck(
+                            symbol=symbol,
+                            sig=sig,
+                            per_trade_usdt=retry_notional,
+                            attempt=attempt + 1,
+                            aggressive_mode=aggressive_mode,
+                            spread_cap=spread_cap,
+                        )
+                    )
+                    self._orderbook_retry_tasks[task_key] = next_task
+                return
+
+            placed = await self._place_buy(symbol, sig, retry_notional)
+            if placed:
+                self.state.cooldowns[symbol] = datetime.now(timezone.utc).isoformat()
+                self._save()
+                log.info("[OB_RETRY] %s attempt=%d executed after recheck", symbol, attempt)
+            else:
+                log.info("[OB_RETRY] %s attempt=%d failed at submit stage", symbol, attempt)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[OB_RETRY] %s attempt=%d failed: %s", symbol, attempt, exc)
+        finally:
+            task = self._orderbook_retry_tasks.get(task_key)
+            if task is asyncio.current_task():
+                self._orderbook_retry_tasks.pop(task_key, None)
 
     async def _count_non_dust_positions(
         self,

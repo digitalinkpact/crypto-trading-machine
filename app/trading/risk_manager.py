@@ -31,11 +31,23 @@ class RiskManager:
         open_positions: int,
         long_exposure_pct: float,
         entry_price: Decimal,
+        aggressive_mode: bool,
+        is_pyramid: bool = False,
+        current_position_notional: Decimal | None = None,
     ) -> EntryRiskDecision:
         s = get_settings()
 
-        if open_positions >= s.max_open_positions:
-            return EntryRiskDecision(False, f"max_open_positions={s.max_open_positions}", Decimal("0"))
+        max_open_positions = (
+            getattr(s, "aggressive_max_open_positions", 10)
+            if aggressive_mode else getattr(s, "rollback_max_open_positions", getattr(s, "max_open_positions", 3))
+        )
+        position_pct = (
+            getattr(s, "aggressive_position_pct", 0.06)
+            if aggressive_mode else getattr(s, "rollback_position_pct", getattr(s, "max_position_pct", 0.10))
+        )
+
+        if (not is_pyramid) and open_positions >= max_open_positions:
+            return EntryRiskDecision(False, f"max_open_positions={max_open_positions}", Decimal("0"))
 
         if long_exposure_pct >= s.max_long_exposure_pct:
             return EntryRiskDecision(False, f"max_long_exposure_pct={s.max_long_exposure_pct}", Decimal("0"))
@@ -54,9 +66,13 @@ class RiskManager:
 
         # Kelly-aware cap + per-position cap to avoid oversized entries.
         kelly_cap_notional = total_equity_usdt * Decimal(str(s.kelly_fraction_cap))
-        position_cap_notional = total_equity_usdt * Decimal(str(s.max_position_pct))
+        position_cap_notional = total_equity_usdt * Decimal(str(position_pct))
 
-        notional = min(risk_based_notional, kelly_cap_notional, position_cap_notional)
+        if is_pyramid:
+            pyramid_notional = (current_position_notional or Decimal("0")) * Decimal(str(getattr(s, "pyramid_add_fraction", 0.50)))
+            notional = min(pyramid_notional, kelly_cap_notional, position_cap_notional)
+        else:
+            notional = min(risk_based_notional, kelly_cap_notional, position_cap_notional)
         if notional <= 0:
             return EntryRiskDecision(False, "non_positive_notional", Decimal("0"))
 

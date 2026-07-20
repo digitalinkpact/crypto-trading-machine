@@ -137,6 +137,7 @@ async def liquidity_gate(
     trade_quote: Decimal,
     *,
     client: Optional[BinanceUSClient] = None,
+    max_spread_pct: Decimal | float | None = None,
 ) -> tuple[bool, str]:
     """Decide whether `symbol` has a tight enough book for a `trade_quote` entry.
 
@@ -173,9 +174,10 @@ async def liquidity_gate(
         float(required_depth), slip_str,
     )
 
-    if metrics.spread_pct > s.max_spread_pct:
+    spread_cap = Decimal(str(s.max_spread_pct if max_spread_pct is None else max_spread_pct))
+    if metrics.spread_pct > spread_cap:
         return False, (
-            f"spread {metrics.spread_pct:.4%} > {s.max_spread_pct:.4%}"
+            f"spread {metrics.spread_pct:.4%} > {spread_cap:.4%}"
         )
     if s.min_depth_trade_multiple > 0 and depth < required_depth:
         return False, (

@@ -207,6 +207,22 @@ class Settings(BaseSettings):
     kelly_fraction_cap: float = Field(0.25, ge=0.005, le=1.0)
     max_open_positions: int = Field(3, ge=1, le=25)              # cap concurrent positions
     max_long_exposure_pct: float = Field(0.60, ge=0.0, le=1.0)   # ≤ 60% of equity in non-USDT
+    aggressive_mode_enabled: bool = True
+    aggressive_rollback_min_trades: int = Field(30, ge=1, le=10_000)
+    aggressive_rollback_min_win_rate: float = Field(0.50, ge=0.0, le=1.0)
+    aggressive_max_spread_pct: float = Field(0.0025, ge=0.0, le=0.05)
+    rollback_max_spread_pct: float = Field(0.0015, ge=0.0, le=0.05)
+    aggressive_position_pct: float = Field(0.06, ge=0.005, le=1.0)
+    rollback_position_pct: float = Field(0.10, ge=0.005, le=1.0)
+    aggressive_max_open_positions: int = Field(10, ge=1, le=25)
+    rollback_max_open_positions: int = Field(3, ge=1, le=25)
+    trend_gate_bypass_confidence: float = Field(0.85, ge=0.0, le=1.0)
+    trend_gate_bypass_ml_proba: float = Field(0.55, ge=0.0, le=1.0)
+    pyramid_confidence_threshold: float = Field(0.85, ge=0.0, le=1.0)
+    pyramid_add_fraction: float = Field(0.50, ge=0.0, le=2.0)
+    orderbook_retry_enabled: bool = True
+    orderbook_retry_delay_seconds: int = Field(60, ge=1, le=3600)
+    orderbook_retry_attempts: int = Field(3, ge=1, le=10)
 
     # Exit gates (hard rules, evaluated every risk-tick)
     stop_loss_pct: float = Field(0.015, ge=0.005, le=0.20)       # 1.5% hard stop
@@ -292,6 +308,9 @@ class Settings(BaseSettings):
     # below). Risk exits bypass this gate.
     ml_gate_enabled: bool = True
     ml_gate_threshold: float = Field(0.50, ge=0.0, le=1.0)
+    ml_gate_threshold_conf_70: float = Field(0.45, ge=0.0, le=1.0)
+    ml_gate_threshold_conf_80: float = Field(0.40, ge=0.0, le=1.0)
+    ml_gate_threshold_conf_90: float = Field(0.35, ge=0.0, le=1.0)
     # Safety valve: an auxiliary quality model trained on a past market regime
     # must not veto trades forever. If the loaded model is older than this many
     # hours, the gate goes advisory (fail-open) so a stale, single-regime model
