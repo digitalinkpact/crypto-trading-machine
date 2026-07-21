@@ -96,6 +96,9 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
         ]
         return np.asarray(features, dtype=float).reshape(1, -1)
 
+    def _llm_gate_threshold_for_action(action: str) -> float:
+        return 0.40 if action == "BUY" else 0.50
+
     async def _llm_call(c: AgentContext) -> Signal | None:
         async with llm_sem:
             try:
@@ -105,7 +108,8 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
                 # Only allow if ML model predicts high win probability
                 features = _llm_features_from_signal(sig, c)
                 proba = ml_model.predict_proba(features)[0, 1]
-                if proba >= ml_confidence_threshold:
+                gate_threshold = _llm_gate_threshold_for_action(sig.action)
+                if proba >= gate_threshold:
                     return sig
                 else:
                     log.info(
@@ -113,7 +117,7 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
                         c.symbol,
                         c.timeframe.value,
                         proba,
-                        ml_confidence_threshold,
+                        gate_threshold,
                     )
                     return None
             except Exception as exc:  # noqa: BLE001
@@ -124,7 +128,7 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
 
     if settings.profitstream_enabled:
         strategy = ProfitStreamStrategy()
-        score_threshold = settings.profitstream_score_threshold
+        score_threshold = getattr(settings, "profitstream_score_threshold", 80)
         for symbol in symbols:
             decision = await strategy.analyze_symbol(symbol, mode=mode)
             executed = (
@@ -156,8 +160,13 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
                     )
                 )
 
-        if not settings.profitstream_use_legacy_agents:
+        if raw_signals and not settings.profitstream_use_legacy_agents:
             return SignalAggregator().aggregate(raw_signals)
+
+        if not raw_signals:
+            log.warning(
+                "ProfitStream produced no BUY/SELL signals; falling back to legacy agents"
+            )
 
     for symbol in symbols:
         for tf in TIMEFRAMES:

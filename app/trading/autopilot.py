@@ -773,6 +773,10 @@ class Autopilot:
         )
         for symbol, sig in ranked_signals:
             ml_proba: Optional[float] = None
+            open_pos = next(
+                (p for p in open_positions if p["symbol"] == symbol and p["mode"] == self.state.mode),
+                None,
+            )
             if sig.action == SignalAction.HOLD:
                 _bump("action_hold", symbol, f"conf={sig.confidence:.2f}")
                 continue
@@ -787,30 +791,54 @@ class Autopilot:
                 sig.action == SignalAction.SELL
                 and balances.get(symbol.removesuffix("USDT"), Decimal("0")) > 0
             )
+            signal_min_conf = self._signal_min_confidence(sig.action)
             if sig.action == SignalAction.BUY:
                 _set_filter(
                     symbol,
                     "signal_confidence",
-                    sig.confidence >= min_conf,
-                    f"conf={sig.confidence:.3f} threshold={min_conf:.3f}",
+                    sig.confidence >= signal_min_conf,
+                    f"conf={sig.confidence:.3f} threshold={signal_min_conf:.3f}",
                     sig,
                 )
-            if sig.confidence < min_conf and not is_exit:
+            if sig.confidence < signal_min_conf and not is_exit:
                 if sig.action == SignalAction.BUY:
                     _finish(
                         symbol,
                         "low_confidence",
-                        f"{sig.action.value} conf={sig.confidence:.2f} < {min_conf:.2f}",
+                        f"{sig.action.value} conf={sig.confidence:.2f} < {signal_min_conf:.2f}",
                         submitted=False,
                         sig=sig,
                     )
                 else:
                     _bump("low_confidence", symbol,
-                          f"{sig.action.value} conf={sig.confidence:.2f} < {min_conf:.2f}")
+                          f"{sig.action.value} conf={sig.confidence:.2f} < {signal_min_conf:.2f}")
                 log.info("[SIGNAL] SKIP %s %s conf=%.3f < %.2f (agents: %s)",
-                         symbol, sig.action.value, sig.confidence, min_conf,
+                         symbol, sig.action.value, sig.confidence, signal_min_conf,
                          ", ".join(sig.contributing_agents) or "none")
                 continue
+            current_price: Optional[Decimal] = None
+            aggressive_exit_reason: Optional[str] = None
+            if open_pos is not None:
+                current_price = await self._price(symbol)
+                entry_price = Decimal(str(open_pos.get("entry_price") or "0"))
+                if entry_price > 0:
+                    position_return_pct = (current_price - entry_price) / entry_price
+                    aggressive_exit_reason = self._aggressive_exit_reason(sig, position_return_pct)
+                    if aggressive_exit_reason is not None:
+                        _set_filter(symbol, "aggressive_sell", True, aggressive_exit_reason, sig)
+                        free = balances.get(symbol.removesuffix("USDT"), Decimal("0"))
+                        if free > 0:
+                            placed = await self._place_sell(symbol, sig, free)
+                            if placed:
+                                skip_counter["executed_sell"] += 1
+                                risk.clear_hwm(symbol)
+                                self._clear_pyramid_adds_count(symbol)
+                                _finish(symbol, "executed_sell", aggressive_exit_reason, submitted=True, sig=sig)
+                            else:
+                                _bump("filter_reject_sell", symbol)
+                        else:
+                            _bump("sell_no_balance", symbol)
+                        continue
             # Record the candidate signal for ML training BEFORE the quality gate.
             # The gate filters EXECUTION, but must never censor LEARNING: if we
             # only recorded gate-approved signals, a model biased against one
@@ -823,7 +851,11 @@ class Autopilot:
             if ml_model is not None and not is_exit and sig.action in (SignalAction.BUY, SignalAction.SELL):
                 ml_proba = await self._ml_win_proba(ml_model, symbol, sig)
                 if ml_proba is not None:
-                    gate_threshold = self._ml_gate_threshold_for_confidence(sig.confidence, aggressive_mode)
+                    gate_threshold = self._ml_gate_threshold_for_confidence(
+                        sig.confidence,
+                        aggressive_mode,
+                        sig.action,
+                    )
                     gate_evaluated += 1
                     gate_proba_sum += ml_proba
                     if ml_proba < gate_threshold:
@@ -871,14 +903,14 @@ class Autopilot:
                 _set_filter(symbol, "listed", True, "symbol trading on Binance.US", sig)
             try:
                 if sig.action == SignalAction.BUY:
-                    open_pos = next(
-                        (p for p in open_positions if p["symbol"] == symbol and p["mode"] == self.state.mode),
-                        None,
-                    )
+                    pyramid_adds = self._pyramid_adds_count(symbol)
+                    pyramid_threshold = 0.75
+                    max_pyramid_adds = 2
                     is_pyramid = bool(
                         open_pos
                         and aggressive_mode
-                        and sig.confidence > float(getattr(s, "pyramid_confidence_threshold", 0.85))
+                        and sig.confidence >= pyramid_threshold
+                        and pyramid_adds < max_pyramid_adds
                     )
                     if not allow_buys:
                         _set_filter(symbol, "drawdown_breaker", False, "new BUYs halted by circuit breaker", sig)
@@ -886,8 +918,11 @@ class Autopilot:
                         continue
                     _set_filter(symbol, "drawdown_breaker", True, "circuit breaker allows BUY", sig)
                     if symbol in held_symbols and not is_pyramid:
-                        _set_filter(symbol, "already_held", False, "existing position already held", sig)
-                        _finish(symbol, "already_held", "existing position already held", submitted=False, sig=sig)
+                        reason = "existing position already held"
+                        if open_pos and aggressive_mode and sig.confidence >= pyramid_threshold and pyramid_adds >= max_pyramid_adds:
+                            reason = f"pyramid limit reached ({pyramid_adds}/{max_pyramid_adds})"
+                        _set_filter(symbol, "already_held", False, reason, sig)
+                        _finish(symbol, "already_held", reason, submitted=False, sig=sig)
                         continue  # don't pyramid into existing position
                     if is_pyramid:
                         _set_filter(
@@ -895,8 +930,8 @@ class Autopilot:
                             "already_held",
                             True,
                             (
-                                f"pyramiding allowed conf={sig.confidence:.3f} > "
-                                f"{float(getattr(s, 'pyramid_confidence_threshold', 0.85)):.3f}"
+                                f"pyramiding allowed conf={sig.confidence:.3f} >= {pyramid_threshold:.3f} "
+                                f"add={pyramid_adds + 1}/{max_pyramid_adds}"
                             ),
                             sig,
                         )
@@ -913,7 +948,7 @@ class Autopilot:
                         ("cooldown bypassed for pyramid add" if is_pyramid else f"cooldown window clear ({cooldown})"),
                         sig,
                     )
-                    entry_price = await self._price(symbol)
+                    entry_price = current_price if current_price is not None else await self._price(symbol)
                     current_position_notional = None
                     if open_pos is not None:
                         current_position_notional = Decimal(str(open_pos.get("qty") or "0")) * entry_price
@@ -1047,6 +1082,9 @@ class Autopilot:
                     if not is_pyramid:
                         open_count += 1
                         held_symbols.add(symbol)
+                        self._clear_pyramid_adds_count(symbol)
+                    else:
+                        self._set_pyramid_adds_count(symbol, pyramid_adds + 1)
                     skip_counter["executed_buy"] += 1
                     _finish(
                         symbol,
@@ -1067,14 +1105,12 @@ class Autopilot:
                     base = symbol.removesuffix("USDT")
                     free = balances.get(base, Decimal("0"))
                     # SAFETY: Check if an open position actually exists
-                    open_pos = next((p for p in storage.all_positions()
-                                    if p["symbol"] == symbol and p["mode"] == self.state.mode),
-                                   None)
                     if free > 0:
                         placed = await self._place_sell(symbol, sig, free)
                         if placed:
                             skip_counter["executed_sell"] += 1
                             risk.clear_hwm(symbol)
+                            self._clear_pyramid_adds_count(symbol)
                         else:
                             _bump("filter_reject_sell", symbol)
                     else:
@@ -1192,6 +1228,18 @@ class Autopilot:
             return False
         return (now - last) < cooldown
 
+    def _pyramid_adds_key(self, symbol: str) -> str:
+        return f"pyramid_adds:{self.state.mode}:{symbol}"
+
+    def _pyramid_adds_count(self, symbol: str) -> int:
+        return int(storage.kv_get(self._pyramid_adds_key(symbol), 0) or 0)
+
+    def _set_pyramid_adds_count(self, symbol: str, count: int) -> None:
+        storage.kv_set(self._pyramid_adds_key(symbol), max(0, int(count)))
+
+    def _clear_pyramid_adds_count(self, symbol: str) -> None:
+        self._set_pyramid_adds_count(symbol, 0)
+
     def _aggressive_mode_active(self) -> tuple[bool, str]:
         s = get_settings()
         if not getattr(s, "aggressive_mode_enabled", True):
@@ -1210,18 +1258,40 @@ class Autopilot:
             return False, f"rollback:win_rate={win_rate:.2f}<{min_win_rate:.2f}"
         return True, f"active:win_rate={win_rate:.2f}"
 
-    def _ml_gate_threshold_for_confidence(self, confidence: float, aggressive_mode: bool) -> float:
-        s = get_settings()
-        base = float(getattr(s, "ml_gate_threshold", 0.50))
-        if not aggressive_mode:
-            return base
-        if confidence >= 0.90:
-            return float(getattr(s, "ml_gate_threshold_conf_90", 0.35))
-        if confidence >= 0.80:
-            return float(getattr(s, "ml_gate_threshold_conf_80", 0.40))
-        if confidence >= 0.70:
-            return float(getattr(s, "ml_gate_threshold_conf_70", 0.45))
-        return base
+    def _ml_gate_threshold_for_confidence(
+        self,
+        confidence: float,
+        aggressive_mode: bool,
+        action: SignalAction | str | None = None,
+    ) -> float:
+        del confidence, aggressive_mode
+        action_value = getattr(action, "value", action)
+        if action_value == SignalAction.BUY.value:
+            return 0.40
+        if action_value == SignalAction.SELL.value:
+            return 0.50
+        return 0.50
+
+    def _signal_min_confidence(self, action: SignalAction | str) -> float:
+        action_value = getattr(action, "value", action)
+        if action_value == SignalAction.BUY.value:
+            return 0.40
+        if action_value == SignalAction.SELL.value:
+            return 0.497
+        return 0.497
+
+    def _aggressive_exit_reason(
+        self,
+        sig,
+        position_return_pct: Decimal,
+    ) -> Optional[str]:
+        if sig.action == SignalAction.SELL and sig.confidence >= 0.70:
+            return f"sell confidence={sig.confidence:.2f} >= 0.70"
+        if position_return_pct >= Decimal("0.03"):
+            return f"profit={float(position_return_pct) * 100:.2f}% >= 3.00%"
+        if position_return_pct <= Decimal("-0.05"):
+            return f"loss={float(position_return_pct) * 100:.2f}% <= -5.00%"
+        return None
 
     def _trend_gate_bypass_allowed(
         self,
