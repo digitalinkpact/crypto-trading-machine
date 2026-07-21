@@ -777,8 +777,19 @@ class Autopilot:
                 (p for p in open_positions if p["symbol"] == symbol and p["mode"] == self.state.mode),
                 None,
             )
+            base_asset = symbol.removesuffix("USDT")
+            free = balances.get(base_asset, Decimal("0"))
             if sig.action == SignalAction.HOLD:
                 _bump("action_hold", symbol, f"conf={sig.confidence:.2f}")
+                continue
+            # Short-circuit SELL intents for symbols we do not hold in the
+            # current mode. This keeps diagnostics focused on actionable exits.
+            if sig.action == SignalAction.SELL and open_pos is None:
+                _bump(
+                    "sell_no_position",
+                    symbol,
+                    f"no open position in {self.state.mode} mode",
+                )
                 continue
             # A SELL of a coin we actually hold is an EXIT, not an entry. Exits
             # must never be blocked by the entry-oriented gates below: the
@@ -789,7 +800,7 @@ class Autopilot:
             # we sit in cash, the safe/reversible direction on spot.
             is_exit = (
                 sig.action == SignalAction.SELL
-                and balances.get(symbol.removesuffix("USDT"), Decimal("0")) > 0
+                and free > 0
             )
             signal_min_conf = self._signal_min_confidence(sig.action)
             if sig.action == SignalAction.BUY:
@@ -823,10 +834,22 @@ class Autopilot:
                 entry_price = Decimal(str(open_pos.get("entry_price") or "0"))
                 if entry_price > 0:
                     position_return_pct = (current_price - entry_price) / entry_price
-                    aggressive_exit_reason = self._aggressive_exit_reason(sig, position_return_pct)
+                    hold_days: Optional[float]
+                    hold_days = None
+                    try:
+                        entry_ts = datetime.fromisoformat(str(open_pos.get("entry_ts") or ""))
+                        if entry_ts.tzinfo is None:
+                            entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+                        hold_days = max(0.0, (now - entry_ts).total_seconds() / 86_400.0)
+                    except Exception:  # noqa: BLE001
+                        hold_days = None
+                    aggressive_exit_reason = self._aggressive_exit_reason(
+                        sig,
+                        position_return_pct,
+                        hold_days,
+                    )
                     if aggressive_exit_reason is not None:
                         _set_filter(symbol, "aggressive_sell", True, aggressive_exit_reason, sig)
-                        free = balances.get(symbol.removesuffix("USDT"), Decimal("0"))
                         if free > 0:
                             placed = await self._place_sell(symbol, sig, free)
                             if placed:
@@ -1102,8 +1125,6 @@ class Autopilot:
                         long_exposure_pct + float(per_trade_usdt / total_eq) if total_eq > 0 else 0,
                     )
                 elif sig.action == SignalAction.SELL:
-                    base = symbol.removesuffix("USDT")
-                    free = balances.get(base, Decimal("0"))
                     # SAFETY: Check if an open position actually exists
                     if free > 0:
                         placed = await self._place_sell(symbol, sig, free)
@@ -1123,6 +1144,10 @@ class Autopilot:
                 self.state.last_error = f"{symbol}: {exc}"
                 log.warning("execute failed %s: %s", symbol, exc)
                 _bump("exception", symbol, str(exc))
+
+        if self.state.mode == "live":
+            await self._log_live_held_positions(now)
+
         self._persist_skip_stats(skip_counter, tick_debug, total=len(signals))
         if s.ml_gate_enabled:
             self._persist_gate_stats(
@@ -1219,6 +1244,47 @@ class Autopilot:
         except Exception as exc:  # noqa: BLE001
             log.debug("gate-stats persist failed: %s", exc)
 
+    async def _log_live_held_positions(self, now: datetime) -> None:
+        """Emit per-position exit readiness diagnostics for live mode."""
+        live_positions = [
+            p for p in storage.all_positions() if p.get("mode") == "live"
+        ]
+        for pos in live_positions:
+            symbol = str(pos.get("symbol") or "")
+            entry_raw = pos.get("entry_price")
+            if not symbol or entry_raw is None:
+                continue
+            try:
+                entry_price = Decimal(str(entry_raw))
+                if entry_price <= 0:
+                    continue
+                current_price = await self._price(symbol)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("[HELD] %s price/entry unavailable: %s", symbol, exc)
+                continue
+
+            try:
+                entry_ts = datetime.fromisoformat(str(pos.get("entry_ts") or ""))
+                if entry_ts.tzinfo is None:
+                    entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+                hold_days = max(0.0, (now - entry_ts).total_seconds() / 86_400.0)
+            except Exception:  # noqa: BLE001
+                hold_days = 0.0
+
+            pnl_pct = ((current_price - entry_price) / entry_price) * Decimal("100")
+            exit_ready = (
+                pnl_pct >= Decimal("2.0")
+                or pnl_pct <= Decimal("-5.0")
+                or hold_days >= 7.0
+            )
+            log.info(
+                "[HELD] %s PnL=%.2f%% days=%.2f exit_ready=%s",
+                symbol,
+                float(pnl_pct),
+                hold_days,
+                exit_ready,
+            )
+
     def _on_cooldown(self, symbol: str, now: datetime, cooldown: timedelta) -> bool:
         ts = self.state.cooldowns.get(symbol)
         if not ts:
@@ -1284,13 +1350,16 @@ class Autopilot:
         self,
         sig,
         position_return_pct: Decimal,
+        hold_days: Optional[float],
     ) -> Optional[str]:
-        if sig.action == SignalAction.SELL and sig.confidence >= 0.70:
-            return f"sell confidence={sig.confidence:.2f} >= 0.70"
-        if position_return_pct >= Decimal("0.03"):
-            return f"profit={float(position_return_pct) * 100:.2f}% >= 3.00%"
+        if sig.action == SignalAction.SELL and sig.confidence > 0.60:
+            return f"sell confidence={sig.confidence:.2f} > 0.60"
+        if position_return_pct >= Decimal("0.02"):
+            return f"profit={float(position_return_pct) * 100:.2f}% >= 2.00%"
         if position_return_pct <= Decimal("-0.05"):
             return f"loss={float(position_return_pct) * 100:.2f}% <= -5.00%"
+        if hold_days is not None and hold_days > 7.0:
+            return f"hold_days={hold_days:.2f} > 7.00"
         return None
 
     def _trend_gate_bypass_allowed(
@@ -1694,8 +1763,52 @@ class Autopilot:
     async def _place_sell(self, symbol: str, sig, free: Decimal) -> bool:
         price = await self._price(symbol)
         qty = filters.round_qty(symbol, free)
-        if qty <= 0 or not filters.meets_min(symbol, qty, price):
-            log.info("skip %s SELL: filters reject qty=%s", symbol, qty)
+        diag = filters.diagnostics(symbol, qty, price)
+        min_qty = diag.get("min_qty")
+        min_notional = diag.get("min_notional")
+
+        # Dust/dilution handling: try a minimum-qty sell when the position
+        # value is large enough, otherwise reject with explicit diagnostics.
+        qty_floor_reject = qty <= 0 or (min_qty is not None and qty < min_qty)
+        if qty_floor_reject:
+            position_value = free * price
+            if (
+                min_qty is not None
+                and min_notional is not None
+                and position_value >= min_notional
+                and free >= min_qty
+            ):
+                qty = filters.round_qty(symbol, min_qty)
+                diag = filters.diagnostics(symbol, qty, price)
+                log.info(
+                    "sell %s dust adjust: free=%s rounded=%s -> min_qty=%s notional=%s",
+                    symbol,
+                    free,
+                    filters.round_qty(symbol, free),
+                    qty,
+                    qty * price,
+                )
+            else:
+                log.info(
+                    "skip %s SELL: filter_reject_sell: dust balance %s < min_qty %s "
+                    "(value=%s min_notional=%s)",
+                    symbol,
+                    qty,
+                    min_qty,
+                    position_value,
+                    min_notional,
+                )
+                return False
+
+        if not bool(diag.get("meets_min")):
+            log.info(
+                "skip %s SELL: filters reject qty=%s min_qty=%s min_notional=%s notional=%s",
+                symbol,
+                qty,
+                min_qty,
+                min_notional,
+                qty * price,
+            )
             return False
         agents = list(getattr(sig, "contributing_agents", []) or [])
         order = await self._submit(symbol, OrderSide.SELL, qty, agents)
