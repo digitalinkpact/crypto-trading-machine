@@ -216,8 +216,8 @@ class Settings(BaseSettings):
     rollback_position_pct: float = Field(0.10, ge=0.005, le=1.0)
     aggressive_max_open_positions: int = Field(10, ge=10, le=25)
     rollback_max_open_positions: int = Field(10, ge=10, le=25)
-    trend_gate_bypass_confidence: float = Field(0.85, ge=0.0, le=1.0)
-    trend_gate_bypass_ml_proba: float = Field(0.55, ge=0.0, le=1.0)
+    trend_gate_bypass_confidence: float = Field(0.50, ge=0.0, le=1.0)
+    trend_gate_bypass_ml_proba: float = Field(0.44, ge=0.0, le=1.0)
     pyramid_confidence_threshold: float = Field(0.85, ge=0.0, le=1.0)
     pyramid_add_fraction: float = Field(0.50, ge=0.0, le=2.0)
     orderbook_retry_enabled: bool = True

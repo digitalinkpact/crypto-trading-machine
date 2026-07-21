@@ -6,6 +6,7 @@ file lives under `data/trading.db` next to the OHLCV cache.
 from __future__ import annotations
 
 import json
+import os
 import pickle
 import sqlite3
 import threading
@@ -293,7 +294,10 @@ class Storage:
                 if row:
                     try:
                         data = json.loads(row["value"])
-                        if float(data.get("expires", 0)) > now and data.get("owner") != owner:
+                        prev_owner = str(data.get("owner") or "")
+                        prev_expires = float(data.get("expires", 0))
+                        owner_alive = self._lock_owner_is_alive(prev_owner)
+                        if prev_expires > now and prev_owner != owner and owner_alive:
                             c.execute("COMMIT")
                             return False
                     except (json.JSONDecodeError, ValueError, TypeError):
@@ -311,6 +315,28 @@ class Storage:
                 logger.exception(f"Trade execution failure: {e}")
                 c.execute("ROLLBACK")
                 raise
+
+    @staticmethod
+    def _lock_owner_is_alive(owner: str) -> bool:
+        """Best-effort liveness check for lock owners in form '<pid>-<suffix>'."""
+        if not owner:
+            return False
+        pid_str = owner.split("-", 1)[0]
+        try:
+            pid = int(pid_str)
+        except (TypeError, ValueError):
+            # Unknown owner format: keep conservative behavior and treat as alive.
+            return True
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # Process exists but we can't signal it.
+            return True
 
     def release_lock(self, name: str, owner: str) -> None:
         """Release a lock previously acquired by ``owner`` (no-op otherwise)."""

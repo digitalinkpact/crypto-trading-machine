@@ -779,12 +779,9 @@ class Autopilot:
             )
             base_asset = symbol.removesuffix("USDT")
             free = balances.get(base_asset, Decimal("0"))
-            if sig.action == SignalAction.HOLD:
-                _bump("action_hold", symbol, f"conf={sig.confidence:.2f}")
-                continue
-            # Short-circuit SELL intents for symbols we do not hold in the
-            # current mode. This keeps diagnostics focused on actionable exits.
-            if sig.action == SignalAction.SELL and open_pos is None:
+            # Short-circuit SELL intents only when we have neither a local
+            # position row nor a real free balance on the exchange.
+            if sig.action == SignalAction.SELL and open_pos is None and free <= 0:
                 _bump(
                     "sell_no_position",
                     symbol,
@@ -862,6 +859,9 @@ class Autopilot:
                         else:
                             _bump("sell_no_balance", symbol)
                         continue
+            if sig.action == SignalAction.HOLD:
+                _bump("action_hold", symbol, f"conf={sig.confidence:.2f}")
+                continue
             # Record the candidate signal for ML training BEFORE the quality gate.
             # The gate filters EXECUTION, but must never censor LEARNING: if we
             # only recorded gate-approved signals, a model biased against one
@@ -1330,13 +1330,20 @@ class Autopilot:
         aggressive_mode: bool,
         action: SignalAction | str | None = None,
     ) -> float:
-        del confidence, aggressive_mode
+        del aggressive_mode
+        s = get_settings()
         action_value = getattr(action, "value", action)
         if action_value == SignalAction.BUY.value:
-            return 0.40
+            if confidence >= 0.90:
+                return float(getattr(s, "ml_gate_threshold_conf_90", 0.35))
+            if confidence >= 0.80:
+                return float(getattr(s, "ml_gate_threshold_conf_80", 0.40))
+            if confidence >= 0.70:
+                return float(getattr(s, "ml_gate_threshold_conf_70", 0.45))
+            return float(getattr(s, "ml_gate_threshold", 0.50))
         if action_value == SignalAction.SELL.value:
-            return 0.50
-        return 0.50
+            return float(getattr(s, "ml_gate_threshold", 0.50))
+        return float(getattr(s, "ml_gate_threshold", 0.50))
 
     def _signal_min_confidence(self, action: SignalAction | str) -> float:
         action_value = getattr(action, "value", action)

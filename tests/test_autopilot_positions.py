@@ -209,12 +209,16 @@ def test_dynamic_ml_gate_thresholds_follow_action(monkeypatch):
 
     class _S:
         ml_gate_threshold = 0.50
+        ml_gate_threshold_conf_70 = 0.45
+        ml_gate_threshold_conf_80 = 0.40
+        ml_gate_threshold_conf_90 = 0.35
 
     monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
 
-    assert ap._ml_gate_threshold_for_confidence(0.95, True, autopilot_module.SignalAction.BUY) == 0.40
+    assert ap._ml_gate_threshold_for_confidence(0.95, True, autopilot_module.SignalAction.BUY) == 0.35
     assert ap._ml_gate_threshold_for_confidence(0.85, True, autopilot_module.SignalAction.SELL) == 0.50
-    assert ap._ml_gate_threshold_for_confidence(0.75, False, autopilot_module.SignalAction.BUY) == 0.40
+    assert ap._ml_gate_threshold_for_confidence(0.75, False, autopilot_module.SignalAction.BUY) == 0.45
+    assert ap._ml_gate_threshold_for_confidence(0.82, False, autopilot_module.SignalAction.BUY) == 0.40
     assert ap._ml_gate_threshold_for_confidence(0.65, False, autopilot_module.SignalAction.SELL) == 0.50
 
 
