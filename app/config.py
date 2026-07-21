@@ -205,7 +205,7 @@ class Settings(BaseSettings):
     max_position_pct: float = Field(0.05, ge=0.005, le=1.0)      # per-position sizing cap
     max_portfolio_risk_pct: float = Field(0.25, ge=0.0, le=1.0)
     kelly_fraction_cap: float = Field(0.25, ge=0.005, le=1.0)
-    max_open_positions: int = Field(3, ge=1, le=25)              # cap concurrent positions
+    max_open_positions: int = Field(10, ge=10, le=25)            # cap concurrent positions
     max_long_exposure_pct: float = Field(0.60, ge=0.0, le=1.0)   # ≤ 60% of equity in non-USDT
     aggressive_mode_enabled: bool = True
     aggressive_rollback_min_trades: int = Field(30, ge=1, le=10_000)
@@ -214,8 +214,8 @@ class Settings(BaseSettings):
     rollback_max_spread_pct: float = Field(0.0015, ge=0.0, le=0.05)
     aggressive_position_pct: float = Field(0.06, ge=0.005, le=1.0)
     rollback_position_pct: float = Field(0.10, ge=0.005, le=1.0)
-    aggressive_max_open_positions: int = Field(10, ge=1, le=25)
-    rollback_max_open_positions: int = Field(3, ge=1, le=25)
+    aggressive_max_open_positions: int = Field(10, ge=10, le=25)
+    rollback_max_open_positions: int = Field(10, ge=10, le=25)
     trend_gate_bypass_confidence: float = Field(0.85, ge=0.0, le=1.0)
     trend_gate_bypass_ml_proba: float = Field(0.55, ge=0.0, le=1.0)
     pyramid_confidence_threshold: float = Field(0.85, ge=0.0, le=1.0)
