@@ -205,7 +205,8 @@ class Settings(BaseSettings):
     max_position_pct: float = Field(0.05, ge=0.005, le=1.0)      # per-position sizing cap
     max_portfolio_risk_pct: float = Field(0.25, ge=0.0, le=1.0)
     kelly_fraction_cap: float = Field(0.25, ge=0.005, le=1.0)
-    max_open_positions: int = Field(10, ge=10, le=25)            # cap concurrent positions
+    min_open_positions: int = Field(10, ge=1, le=25)             # always hold at least 10
+    max_open_positions: int = Field(10, ge=10, le=25)            # cap concurrent positions (target=10)
     max_long_exposure_pct: float = Field(0.60, ge=0.0, le=1.0)   # ≤ 60% of equity in non-USDT
     aggressive_mode_enabled: bool = True
     aggressive_rollback_min_trades: int = Field(30, ge=1, le=10_000)
