@@ -382,6 +382,34 @@ class Settings(BaseSettings):
     loss_streak_pause_count: int = Field(3, ge=1, le=20)
     loss_streak_pause_minutes: int = Field(60, ge=1, le=1440)
 
+    # ── Health monitoring / auto-recovery escalation ──────────────────
+    # The background health loop (app/trading/health.py) checks scheduler,
+    # websocket, exchange, database, and trade-loop liveness every 60s and
+    # attempts inline recovery (restart websocket/scheduler). If a check
+    # stays unhealthy for this many CONSECUTIVE loop iterations despite
+    # recovery attempts, the bot halts new BUY entries (same mechanism as
+    # the drawdown circuit breaker) WITHOUT stopping the process or touching
+    # existing positions — exits/risk gates keep running normally. This is
+    # the practical equivalent of "switch to paper mode": no new real-money
+    # exposure is created, but real holdings are never abandoned/orphaned
+    # by flipping the whole app's mode while live positions are open.
+    emergency_halt_max_failures: int = Field(3, ge=1, le=20)
+    # Consecutive HEALTHY iterations required before the halt auto-clears.
+    emergency_halt_auto_clear_cycles: int = Field(3, ge=1, le=20)
+    # Exchange-level order failures (submitted but rejected/not filled) within
+    # this trailing window count toward the failure escalation above.
+    health_order_failure_lookback_minutes: int = Field(15, ge=1, le=1440)
+    health_order_failure_max: int = Field(3, ge=1, le=50)
+    # Two orders for the same symbol/side/mode within this many seconds is
+    # treated as a possible duplicate-order bug (the cross-process tick lock
+    # should make this impossible — this is a regression canary).
+    health_duplicate_order_window_seconds: float = Field(10.0, ge=1.0, le=300.0)
+    # Soft, log-only thresholds — NEVER used to kill the process (the app must
+    # never terminate itself; an external watchdog/cron restarts on a crash).
+    health_memory_rss_warn_mb: float = Field(1024.0, ge=64.0, le=32768.0)
+    health_cpu_warn_pct: float = Field(90.0, ge=10.0, le=100.0)
+    health_latency_warn_seconds: float = Field(5.0, ge=0.5, le=60.0)
+
     # Storage
     data_cache_dir: Path = Path("./data/cache")
 

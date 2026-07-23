@@ -259,6 +259,17 @@ class Autopilot:
                     log.warning("circuit breaker check failed: %s", exc)
                     breaker_tripped = False
 
+                # 2b. Health-monitor emergency halt (app/trading/health.py) —
+                # engaged automatically when a critical system check (exchange,
+                # scheduler, database, duplicate/failed orders...) stays
+                # unhealthy despite recovery attempts. Blocks new entries only;
+                # existing positions keep being protected by risk gates above.
+                try:
+                    emergency_halted = bool((storage.kv_get("emergency_halt") or {}).get("active"))
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("emergency halt flag check failed: %s", exc)
+                    emergency_halted = False
+
                 # 3. Agent signals → execute (skip BUYs if breaker tripped).
                 try:
                     signals = await run_all_agents(use_llm=get_settings().llm_in_trading_loop)
@@ -268,7 +279,7 @@ class Autopilot:
                     self._save()
                     return
                 try:
-                    await self._execute(signals, allow_buys=not breaker_tripped)
+                    await self._execute(signals, allow_buys=not breaker_tripped and not emergency_halted)
                 finally:
                     self._save()
             finally:
