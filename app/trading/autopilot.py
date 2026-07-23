@@ -1155,6 +1155,31 @@ class Autopilot:
                 self.state.last_error = f"{symbol}: {exc}"
                 log.warning("execute failed %s: %s", symbol, exc)
                 _bump("exception", symbol, str(exc))
+                # Record this to trade_audit too (not just the in-memory skip
+                # counter) — otherwise a real exchange/network exception during
+                # order placement (as opposed to a clean "Binance rejected the
+                # order" response) leaves no row for health.py's
+                # _check_failed_orders() to find, and a persistent outage could
+                # go undetected by the watchdog even though it's failing every
+                # tick. Never let a failure recording itself throw.
+                try:
+                    trade_audit_logger.log_event(
+                        mode=self.state.mode,
+                        symbol=symbol,
+                        signal=getattr(sig.action, "value", str(sig.action)),
+                        confidence=float(sig.confidence),
+                        position_exists=bool(symbol in held_symbols),
+                        execution_attempted=True,
+                        binance_response="EXCEPTION",
+                        exception=str(exc),
+                        final_outcome=f"rejected: exception: {exc}",
+                        detail={"detail": str(exc)},
+                    )
+                except Exception:  # noqa: BLE001
+                    log.debug(
+                        "trade_audit record-of-exception itself failed for %s",
+                        symbol, exc_info=True,
+                    )
 
         if self.state.mode == "live":
             await self._log_live_held_positions(now)
