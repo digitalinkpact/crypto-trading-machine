@@ -73,6 +73,13 @@ async def startup_report() -> dict:
 
 
 async def _health_loop() -> None:
+    """Watchdog loop. MUST NEVER DIE — every check below is best-effort and
+    failures are logged, not raised. A `raise` here would silently kill this
+    background task forever (no supervisor resurrects an asyncio.Task), which
+    is the exact "silent scheduler death" failure mode this loop exists to
+    catch. The outer try/except is defense-in-depth in case a future edit
+    reintroduces a bare raise inside one of the checks.
+    """
     while True:
         status = {
             "timestamp": _now_iso(),
@@ -84,55 +91,54 @@ async def _health_loop() -> None:
             "actions": [],
         }
         try:
-            storage.kv_set("health_last_ping", status["timestamp"])
-            _ = storage.kv_get("health_last_ping")
-            status["database_alive"] = True
-        except Exception as e:  # noqa: BLE001
-            logger = log
-            logger.exception(f"Trade execution failure: {e}")
-            raise
-
-        try:
-            _ = await BinanceUSClient().account()
-            status["binance_alive"] = True
-        except Exception as e:  # noqa: BLE001
-            logger = log
-            logger.exception(f"Trade execution failure: {e}")
-
-        if not live_prices.connected:
             try:
-                live_prices.start()
-                status["actions"].append("restarted_websocket")
+                storage.kv_set("health_last_ping", status["timestamp"])
+                _ = storage.kv_get("health_last_ping")
+                status["database_alive"] = True
             except Exception as e:  # noqa: BLE001
-                logger = log
-                logger.exception(f"Trade execution failure: {e}")
-                raise
+                log.exception("health check: database ping failed: %s", e)
 
-        if _SCHEDULER_REF is not None and not _SCHEDULER_REF.running:
             try:
-                _SCHEDULER_REF.start()
-                status["actions"].append("restarted_scheduler")
+                _ = await BinanceUSClient().account()
+                status["binance_alive"] = True
             except Exception as e:  # noqa: BLE001
-                logger = log
-                logger.exception(f"Trade execution failure: {e}")
-                raise
+                log.exception("health check: binance ping failed: %s", e)
 
-        last_tick = autopilot.state.last_tick_at
-        if autopilot.state.running and last_tick is not None:
-            age = (datetime.now(timezone.utc) - last_tick).total_seconds()
-            status["trade_loop_alive"] = age <= 1800
-            if age > 1800 and _SCHEDULER_REF is not None:
+            if not live_prices.connected:
                 try:
-                    _SCHEDULER_REF.wakeup()
-                    status["actions"].append("nudged_scheduler_wakeup")
+                    live_prices.start()
+                    status["actions"].append("restarted_websocket")
                 except Exception as e:  # noqa: BLE001
-                    logger = log
-                    logger.exception(f"Trade execution failure: {e}")
-                    raise
-        else:
-            status["trade_loop_alive"] = not autopilot.state.running
+                    log.exception("health check: websocket restart failed: %s", e)
 
-        storage.kv_set("health_status", status)
+            if _SCHEDULER_REF is not None and not _SCHEDULER_REF.running:
+                try:
+                    _SCHEDULER_REF.start()
+                    status["actions"].append("restarted_scheduler")
+                except Exception as e:  # noqa: BLE001
+                    log.exception("health check: scheduler restart failed: %s", e)
+
+            last_tick = autopilot.state.last_tick_at
+            if autopilot.state.running and last_tick is not None:
+                age = (datetime.now(timezone.utc) - last_tick).total_seconds()
+                status["trade_loop_alive"] = age <= 1800
+                if age > 1800 and _SCHEDULER_REF is not None:
+                    try:
+                        _SCHEDULER_REF.wakeup()
+                        status["actions"].append("nudged_scheduler_wakeup")
+                    except Exception as e:  # noqa: BLE001
+                        log.exception("health check: scheduler wakeup failed: %s", e)
+            else:
+                status["trade_loop_alive"] = not autopilot.state.running
+
+            try:
+                storage.kv_set("health_status", status)
+            except Exception as e:  # noqa: BLE001
+                log.exception("health check: failed to persist health_status: %s", e)
+        except Exception as e:  # noqa: BLE001
+            # Belt-and-suspenders: no single failed check may ever end this loop.
+            log.exception("health loop iteration failed unexpectedly: %s", e)
+
         await asyncio.sleep(60)
 
 

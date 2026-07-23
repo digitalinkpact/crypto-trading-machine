@@ -27,9 +27,10 @@ async def reconcile_positions(mode: str) -> dict[str, int]:
                 closed += 1
                 log.warning("reconcile closed stale position: %s mode=%s", symbol, mode)
             except Exception as e:  # noqa: BLE001
-                logger = log
-                logger.exception(f"Trade execution failure: {e}")
-                raise
+                # One bad position must not abort reconciliation of the rest —
+                # a raise here used to skip every remaining position in this
+                # pass. Log and move on; the next 5-minute cycle retries it.
+                log.exception("reconcile failed to close stale position %s mode=%s: %s", symbol, mode, e)
         else:
             kept += 1
 

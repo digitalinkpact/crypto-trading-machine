@@ -122,9 +122,11 @@ async def reconcile_portfolio() -> None:
         result = await reconcile_positions(mode=mode)
         log.info("portfolio reconcile mode=%s result=%s", mode, result)
     except Exception as e:  # noqa: BLE001
-        logger = log
-        logger.exception(f"Trade execution failure: {e}")
-        raise
+        # Log and return — this is a scheduled job that reruns every 5 minutes;
+        # re-raising just duplicates the traceback in apscheduler's executor
+        # log without adding any recovery, and one failed cycle shouldn't be
+        # treated as fatal for a self-healing background reconciliation job.
+        log.exception("portfolio reconcile failed mode=%s: %s", mode, e)
 
 
 def build_scheduler() -> AsyncIOScheduler:
