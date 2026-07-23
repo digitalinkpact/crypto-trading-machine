@@ -15,7 +15,8 @@ from app.logging_setup import configure_logging, get_logger
 from app.scheduler import build_scheduler
 from app.storage import storage
 from app.trading.paper import paper_exchange
-from app.trading.health import start_health_monitor, startup_report, stop_health_monitor
+from app.trading.health import startup_report
+from app.trading.watchdog import start_health_monitor, stop_health_monitor
 
 log = get_logger(__name__)
 

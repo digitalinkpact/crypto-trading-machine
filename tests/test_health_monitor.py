@@ -1,17 +1,12 @@
-"""Tests for the health-monitor auto-recovery escalation ladder in
-app/trading/health.py — duplicate/failed-order detection and the
-emergency-halt trigger/auto-clear flag consulted by Autopilot.tick().
+"""Tests for the individual health *checks* in app/trading/health.py —
+duplicate/failed-order/duplicate-position detection, plus the generic
+retry/recovery primitives. The watchdog loop and emergency-halt escalation
+ladder that consume these checks live in app/trading/watchdog.py and are
+tested separately in tests/test_watchdog.py.
 """
 from __future__ import annotations
 
 import app.trading.health as health
-
-
-def setup_function(_fn) -> None:
-    # Each check/escalation test starts from a clean streak/kv state so tests
-    # don't leak into each other via the module-level counters.
-    health._FAIL_STREAKS.clear()
-    health._HEALTHY_STREAK = 0
 
 
 def test_check_duplicate_orders_detects_same_symbol_side_within_window(monkeypatch):
@@ -68,37 +63,6 @@ def test_check_failed_orders_ignores_old_entries_outside_lookback(monkeypatch):
     failed, count = health._check_failed_orders()
     assert count == 0
     assert failed is False
-
-
-def test_emergency_halt_trigger_and_clear_roundtrip(monkeypatch):
-    kv_state: dict = {}
-    monkeypatch.setattr(health.storage, "kv_get", lambda key, default=None: kv_state.get(key, default))
-    monkeypatch.setattr(health.storage, "kv_set", lambda key, value: kv_state.__setitem__(key, value))
-
-    assert not kv_state.get("emergency_halt", {}).get("active")
-
-    health._trigger_emergency_halt("binance_alive unhealthy for 3 consecutive checks")
-    assert kv_state["emergency_halt"]["active"] is True
-    assert "binance_alive" in kv_state["emergency_halt"]["reason"]
-
-    # Triggering again while already active must not overwrite the reason/since.
-    first_since = kv_state["emergency_halt"]["since"]
-    health._trigger_emergency_halt("a different reason")
-    assert kv_state["emergency_halt"]["since"] == first_since
-
-    health._maybe_clear_emergency_halt()
-    assert kv_state["emergency_halt"]["active"] is False
-    assert "cleared_at" in kv_state["emergency_halt"]
-
-
-def test_maybe_clear_emergency_halt_noop_when_not_active(monkeypatch):
-    kv_state: dict = {"emergency_halt": {"active": False}}
-    monkeypatch.setattr(health.storage, "kv_get", lambda key, default=None: kv_state.get(key, default))
-    set_calls = []
-    monkeypatch.setattr(health.storage, "kv_set", lambda key, value: set_calls.append((key, value)))
-
-    health._maybe_clear_emergency_halt()
-    assert set_calls == []  # nothing to clear — must not write
 
 
 def test_check_stale_price_flags_connected_but_no_recent_messages(monkeypatch):
