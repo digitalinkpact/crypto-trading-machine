@@ -1,14 +1,28 @@
 """Runtime health monitoring for scheduler, websocket, exchange, storage, and trade loop.
 
-Also owns the auto-recovery escalation ladder: each check below is retried
-inline (restart websocket / restart scheduler) every loop iteration. If a
-critical check stays unhealthy for `emergency_halt_max_failures` consecutive
-iterations despite recovery attempts, `_trigger_emergency_halt` sets a
-persisted flag that `Autopilot.tick()` consults to stop opening NEW positions
-(same mechanism as the drawdown circuit breaker) while leaving risk-gate
-exits, monitoring, and the process itself completely untouched. The halt
-auto-clears once every check has been healthy for
-`emergency_halt_auto_clear_cycles` consecutive iterations.
+The ladder implemented here, every 60s, is:
+
+    detect failure -> attempt recovery -> verify recovery ->
+    if still failing -> escalate (emergency halt) -> keep retrying forever
+
+...and, separately, once things are healthy again:
+
+    N healthy cycles -> verify balances/positions/open-orders are readable
+    and consistent -> resume trading -> continue monitoring
+
+Every check and every recovery attempt is wrapped so NOTHING can raise out of
+this loop. There is no supervisor that resurrects a dead asyncio.Task, so a
+single uncaught exception here would silently and permanently kill the only
+thing watching the bot — this loop must be the last thing standing. "Running"
+is not the same as "running healthy": every iteration where any critical
+check is failing, that fact is logged loudly (WARNING/CRITICAL) so a stalled
+websocket/scheduler/exchange can never go unnoticed for hours just because
+the process itself is still alive.
+
+An external process-level watchdog also exists (scripts/watchdog.sh, cron
+every 5 min) that restarts the whole uvicorn process if /healthz stops
+responding or the last autopilot tick goes stale >20 min — this loop and that
+script are two independent layers of defense.
 """
 from __future__ import annotations
 
@@ -35,6 +49,7 @@ _SCHEDULER_REF = None
 _FAIL_STREAKS: dict[str, int] = {}
 _HEALTHY_STREAK = 0
 _CPU_LAST_TIMES: tuple[float, float] | None = None  # (cpu_seconds, wall_seconds)
+_LAST_HEALTHY_AT: str | None = None  # ISO timestamp of the last fully-healthy iteration
 
 
 def set_scheduler_ref(scheduler) -> None:
@@ -44,6 +59,56 @@ def set_scheduler_ref(scheduler) -> None:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+async def _retry_async(coro_fn, *, attempts: int = 3, base_delay: float = 1.0, label: str = ""):
+    """Best-effort retry with linear backoff for a flaky external call (the
+    "automatic API retries" requirement). NEVER raises — after the last
+    attempt fails it logs an error and returns (False, None) so the caller
+    can decide how to react (mark unhealthy, attempt a bigger recovery, etc).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            result = await coro_fn()
+            return True, result
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            log.warning("health check: %s attempt %d/%d failed: %s", label, attempt, attempts, e)
+            if attempt < attempts:
+                await asyncio.sleep(base_delay * attempt)
+    log.error("health check: %s failed after %d attempts: %s", label, attempts, last_exc)
+    return False, None
+
+
+async def _attempt_recovery(*, recover_fn, verify_fn, label: str, verify_delay: float = 2.0) -> bool:
+    """Run a recovery action, wait briefly, then re-check the thing it was
+    supposed to fix — the WATCHDOG's "verify recovery" step. Recovery must
+    never happen silently: the outcome (fixed or still broken) is always
+    logged loudly so a failed restart is never mistaken for a successful one.
+    Never raises.
+    """
+    try:
+        result = recover_fn()
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception as e:  # noqa: BLE001
+        log.error("health recovery: %s recovery attempt raised: %s", label, e)
+        return False
+    await asyncio.sleep(verify_delay)
+    try:
+        recovered = bool(verify_fn())
+    except Exception as e:  # noqa: BLE001
+        log.error("health recovery: %s post-recovery verification failed: %s", label, e)
+        return False
+    if recovered:
+        log.warning("health recovery: %s recovery VERIFIED successful", label)
+    else:
+        log.critical(
+            "health recovery: %s recovery attempt did NOT fix the problem — "
+            "will retry next cycle", label,
+        )
+    return recovered
 
 
 async def startup_report() -> dict:
@@ -163,13 +228,35 @@ def _check_failed_orders() -> tuple[bool, int]:
 async def _check_open_orders() -> tuple[bool, int]:
     """This strategy only places MARKET orders, so any resting open order is
     unexpected — could indicate a stuck/partially-processed order."""
-    try:
-        client = BinanceUSClient()
-        open_orders = await client.open_orders()
-        return len(open_orders) > 0, len(open_orders)
-    except Exception as e:  # noqa: BLE001
-        log.debug("health check: open_orders fetch failed (non-fatal): %s", e)
+    ok, open_orders = await _retry_async(
+        lambda: BinanceUSClient().open_orders(), attempts=2, base_delay=1.0, label="open_orders fetch",
+    )
+    if not ok:
         return False, 0
+    return len(open_orders) > 0, len(open_orders)
+
+
+def _check_duplicate_positions() -> tuple[bool, str]:
+    """Schema-bypass canary: the `positions` table PK is (symbol, mode), so
+    two open rows for the same symbol+mode should be structurally impossible
+    via the normal open_position()/upsert path. If it ever happens anyway
+    (manual DB edit, a future migration bug, a new code path that bypasses
+    the upsert), treat it as critical — this is exactly the duplicate-position
+    class of bug that has bitten this project before (see duplicate-order
+    fix, 2026-06-13)."""
+    try:
+        positions = storage.all_positions()
+    except Exception as e:  # noqa: BLE001
+        log.exception("health check: all_positions fetch failed: %s", e)
+        return False, ""
+    seen: dict[tuple[str, str], int] = {}
+    for p in positions:
+        key = (str(p.get("mode")), str(p.get("symbol")))
+        seen[key] = seen.get(key, 0) + 1
+    dupes = [k for k, c in seen.items() if c > 1]
+    if dupes:
+        return True, f"duplicate position rows detected: {dupes}"
+    return False, ""
 
 
 def _check_memory() -> float:
@@ -254,15 +341,47 @@ def _maybe_clear_emergency_halt() -> None:
     )
 
 
-async def _health_loop() -> None:
-    """Watchdog loop. MUST NEVER DIE — every check below is best-effort and
-    failures are logged, not raised. A `raise` here would silently kill this
-    background task forever (no supervisor resurrects an asyncio.Task), which
-    is the exact "silent scheduler death" failure mode this loop exists to
-    catch. The outer try/except is defense-in-depth in case a future edit
-    reintroduces a bare raise inside one of the checks.
+async def _verify_safe_to_resume(mode: str) -> tuple[bool, str]:
+    """Before actually resuming trading after an emergency halt, explicitly
+    re-verify balances, positions, and open orders are all readable and
+    consistent — "verify balances / verify positions / resume trading safely"
+    from the recovery ladder. A healthy-iteration COUNT alone is not proof
+    it's safe to resume; this does one more real check first.
     """
-    global _HEALTHY_STREAK
+    from app.trading.portfolio import portfolio_snapshot  # local import: avoid cycle
+
+    try:
+        snap = await portfolio_snapshot(mode=mode)
+        if not snap:
+            return False, "balance verification returned no data"
+    except Exception as e:  # noqa: BLE001
+        return False, f"balance verification failed: {e}"
+
+    try:
+        storage.all_positions()
+    except Exception as e:  # noqa: BLE001
+        return False, f"position verification failed: {e}"
+
+    try:
+        await BinanceUSClient().open_orders()
+    except Exception as e:  # noqa: BLE001
+        return False, f"open-order verification failed: {e}"
+
+    return True, "balances/positions/open-orders all verified readable"
+
+
+async def _health_loop() -> None:
+    """Watchdog loop. MUST NEVER DIE — every check and every recovery attempt
+    below is best-effort: failures are logged, NEVER raised. There is no
+    `except Exception: raise` anywhere in this module (verify with
+    `grep -n raise app/trading/health.py` — the only matches are this
+    comment and the docstring). A bare raise here would silently kill this
+    background task forever, since nothing resurrects a dead asyncio.Task —
+    that is the exact "silent scheduler death" failure mode this loop exists
+    to catch. The outer try/except is defense-in-depth in case a future edit
+    ever reintroduces one.
+    """
+    global _HEALTHY_STREAK, _LAST_HEALTHY_AT
     last_wall = time.monotonic()
     while True:
         s = get_settings()
@@ -283,41 +402,52 @@ async def _health_loop() -> None:
             except Exception as e:  # noqa: BLE001
                 log.exception("health check: database ping failed: %s", e)
 
+            # Automatic API retries: transient blips (a single dropped
+            # connection, a momentary 5xx) must not immediately count as a
+            # full exchange outage.
             api_start = time.monotonic()
-            try:
-                _ = await BinanceUSClient().account()
-                status["binance_alive"] = True
+            ok, _account = await _retry_async(
+                lambda: BinanceUSClient().account(), attempts=3, base_delay=1.0, label="binance account ping",
+            )
+            status["binance_alive"] = ok
+            if ok:
                 latency = time.monotonic() - api_start
                 status["binance_latency_s"] = round(latency, 3)
                 if latency > s.health_latency_warn_seconds:
                     log.warning("health check: abnormal binance API latency %.2fs", latency)
-            except Exception as e:  # noqa: BLE001
-                log.exception("health check: binance ping failed: %s", e)
 
+            # detect failure -> attempt recovery -> verify recovery.
             if not live_prices.connected:
-                try:
-                    live_prices.start()
-                    status["actions"].append("restarted_websocket")
-                except Exception as e:  # noqa: BLE001
-                    log.exception("health check: websocket restart failed: %s", e)
+                recovered = await _attempt_recovery(
+                    recover_fn=live_prices.start,
+                    verify_fn=lambda: live_prices.connected,
+                    label="websocket restart",
+                )
+                status["actions"].append("restarted_websocket" + ("_verified" if recovered else "_unverified"))
             else:
                 stale, detail = _check_stale_price()
                 status["stale_price"] = stale
                 if stale:
                     log.warning("health check: %s — restarting websocket", detail)
-                    try:
+
+                    async def _restart_ws():
                         await live_prices.stop()
                         live_prices.start()
-                        status["actions"].append("restarted_stale_websocket")
-                    except Exception as e:  # noqa: BLE001
-                        log.exception("health check: stale-websocket restart failed: %s", e)
+
+                    recovered = await _attempt_recovery(
+                        recover_fn=_restart_ws,
+                        verify_fn=lambda: live_prices.connected,
+                        label="stale-websocket restart",
+                    )
+                    status["actions"].append("restarted_stale_websocket" + ("_verified" if recovered else "_unverified"))
 
             if _SCHEDULER_REF is not None and not _SCHEDULER_REF.running:
-                try:
-                    _SCHEDULER_REF.start()
-                    status["actions"].append("restarted_scheduler")
-                except Exception as e:  # noqa: BLE001
-                    log.exception("health check: scheduler restart failed: %s", e)
+                recovered = await _attempt_recovery(
+                    recover_fn=_SCHEDULER_REF.start,
+                    verify_fn=lambda: bool(_SCHEDULER_REF.running),
+                    label="scheduler restart",
+                )
+                status["actions"].append("restarted_scheduler" + ("_verified" if recovered else "_unverified"))
 
             last_tick = autopilot.state.last_tick_at
             if autopilot.state.running and last_tick is not None:
@@ -342,6 +472,15 @@ async def _health_loop() -> None:
             except Exception as e:  # noqa: BLE001
                 log.exception("health check: duplicate-order check failed: %s", e)
                 dup = False
+
+            try:
+                dup_pos, dup_pos_detail = _check_duplicate_positions()
+                status["duplicate_positions"] = dup_pos
+                if dup_pos:
+                    log.critical("health check: %s", dup_pos_detail)
+            except Exception as e:  # noqa: BLE001
+                log.exception("health check: duplicate-position check failed: %s", e)
+                dup_pos = False
 
             try:
                 order_fail, order_fail_count = _check_failed_orders()
@@ -411,6 +550,7 @@ async def _health_loop() -> None:
                     "database_alive": not status["database_alive"],
                     "trade_loop_alive": not status["trade_loop_alive"],
                     "duplicate_orders": dup,
+                    "duplicate_positions": dup_pos,
                     "order_failures": order_fail,
                     "open_orders_unexpected": open_orders_bad,
                 }
@@ -431,10 +571,41 @@ async def _health_loop() -> None:
                 else:
                     _HEALTHY_STREAK += 1
                     if _HEALTHY_STREAK >= s.emergency_halt_auto_clear_cycles:
-                        _maybe_clear_emergency_halt()
+                        halt = storage.kv_get("emergency_halt") or {}
+                        if halt.get("active"):
+                            # "verify balances / verify positions / resume
+                            # trading safely" — one real check, not just a
+                            # streak counter, before actually resuming.
+                            safe, detail = await _verify_safe_to_resume(autopilot.state.mode)
+                            if safe:
+                                _maybe_clear_emergency_halt()
+                                log.warning("health recovery: RESUMING TRADING — %s", detail)
+                            else:
+                                log.critical(
+                                    "health recovery: healthy streak met but resume "
+                                    "verification FAILED (%s) — halt remains engaged", detail,
+                                )
+                                _HEALTHY_STREAK = 0
 
-                status["emergency_halt"] = bool((storage.kv_get("emergency_halt") or {}).get("active"))
+                halt_now = storage.kv_get("emergency_halt") or {}
+                status["emergency_halt"] = bool(halt_now.get("active"))
                 status["fail_streaks"] = dict(_FAIL_STREAKS)
+
+                # "RUNNING" != "RUNNING HEALTHY": while any critical check is
+                # down, say so loudly on every single iteration so an outage
+                # can never go unnoticed just because the process is alive.
+                overall_healthy = not any_failing and not status["emergency_halt"]
+                status["overall_healthy"] = overall_healthy
+                if overall_healthy:
+                    _LAST_HEALTHY_AT = status["timestamp"]
+                else:
+                    failing_names = [n for n, f in checks.items() if f]
+                    log.warning(
+                        "HEALTH STATUS: RUNNING BUT NOT HEALTHY — failing=%s "
+                        "fail_streaks=%s emergency_halt=%s last_healthy_at=%s",
+                        failing_names, _FAIL_STREAKS, status["emergency_halt"], _LAST_HEALTHY_AT,
+                    )
+                status["last_healthy_at"] = _LAST_HEALTHY_AT
             except Exception as e:  # noqa: BLE001
                 log.exception("health check: escalation ladder failed: %s", e)
 

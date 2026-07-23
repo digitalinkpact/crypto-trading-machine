@@ -118,3 +118,92 @@ def test_check_stale_price_ok_when_recent(monkeypatch):
     )
     stale, _detail = health._check_stale_price()
     assert stale is False
+
+
+def test_check_duplicate_positions_detects_same_symbol_mode(monkeypatch):
+    monkeypatch.setattr(
+        health.storage, "all_positions",
+        lambda: [
+            {"symbol": "BTCUSDT", "mode": "live"},
+            {"symbol": "BTCUSDT", "mode": "live"},
+        ],
+    )
+    dup, detail = health._check_duplicate_positions()
+    assert dup is True
+    assert "BTCUSDT" in detail
+
+
+def test_check_duplicate_positions_ok_across_modes(monkeypatch):
+    # Same symbol in live vs paper is fine — they're independent books.
+    monkeypatch.setattr(
+        health.storage, "all_positions",
+        lambda: [
+            {"symbol": "BTCUSDT", "mode": "live"},
+            {"symbol": "BTCUSDT", "mode": "paper"},
+        ],
+    )
+    dup, _detail = health._check_duplicate_positions()
+    assert dup is False
+
+
+async def test_retry_async_succeeds_after_transient_failures(monkeypatch):
+    monkeypatch.setattr(health.asyncio, "sleep", lambda *_a, **_k: _immediate())
+    calls = {"n": 0}
+
+    async def _flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise ConnectionError("boom")
+        return "ok"
+
+    ok, result = await health._retry_async(_flaky, attempts=3, base_delay=0.01, label="test")
+    assert ok is True
+    assert result == "ok"
+    assert calls["n"] == 3
+
+
+async def test_retry_async_gives_up_after_max_attempts(monkeypatch):
+    monkeypatch.setattr(health.asyncio, "sleep", lambda *_a, **_k: _immediate())
+
+    async def _always_fails():
+        raise ConnectionError("still down")
+
+    ok, result = await health._retry_async(_always_fails, attempts=2, base_delay=0.01, label="test")
+    assert ok is False
+    assert result is None
+
+
+async def test_attempt_recovery_verified_success(monkeypatch):
+    monkeypatch.setattr(health.asyncio, "sleep", lambda *_a, **_k: _immediate())
+    recovered_flag = {"ok": False}
+
+    def _recover():
+        recovered_flag["ok"] = True
+
+    ok = await health._attempt_recovery(
+        recover_fn=_recover, verify_fn=lambda: recovered_flag["ok"], label="test recovery",
+    )
+    assert ok is True
+
+
+async def test_attempt_recovery_still_broken_after_attempt(monkeypatch):
+    monkeypatch.setattr(health.asyncio, "sleep", lambda *_a, **_k: _immediate())
+
+    ok = await health._attempt_recovery(
+        recover_fn=lambda: None, verify_fn=lambda: False, label="test recovery",
+    )
+    assert ok is False
+
+
+async def test_attempt_recovery_never_raises_when_recover_fn_throws(monkeypatch):
+    monkeypatch.setattr(health.asyncio, "sleep", lambda *_a, **_k: _immediate())
+
+    def _boom():
+        raise RuntimeError("recover blew up")
+
+    ok = await health._attempt_recovery(recover_fn=_boom, verify_fn=lambda: True, label="test")
+    assert ok is False
+
+
+async def _immediate():
+    return None
