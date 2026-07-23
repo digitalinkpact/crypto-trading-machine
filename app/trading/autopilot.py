@@ -1889,9 +1889,25 @@ class Autopilot:
             )
         else:
             client = BinanceUSClient()
-            order = await client.place_order(
-                symbol=symbol, side=side, type=OrderType.MARKET, quantity=qty,
-            )
+            coid = client.generate_client_order_id()
+            try:
+                order = await client.place_order(
+                    symbol=symbol, side=side, type=OrderType.MARKET, quantity=qty,
+                    client_order_id=coid,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # ORDER FAILURE PROTOCOL: never assume an order failed just
+                # because the placement call raised. Network drops/timeouts
+                # can happen AFTER Binance already accepted the order — in
+                # that case a naive "treat exception as no-op" would silently
+                # lose a real position, and blindly retrying could double-fill.
+                # Ask Binance directly, using the client_order_id we minted
+                # up-front, before doing anything else.
+                order = await self._resolve_order_after_exception(
+                    symbol=symbol, side=side, qty=qty, coid=coid, exc=exc,
+                )
+                if order is None:
+                    return None
             # Only mirror a live order into our book if the exchange actually
             # filled it. Recording the *requested* qty on a partial fill (or a
             # config-drift DRY_RUN) would leave a phantom/oversized position the
@@ -1910,6 +1926,13 @@ class Autopilot:
                 self.state.last_error = (
                     f"{symbol} {side.value} not filled (status={order.status})"
                 )
+                try:
+                    trade_audit_logger.log_event(
+                        symbol=symbol, side=side.value,
+                        final_outcome=f"rejected: Binance not filled (status={order.status})",
+                    )
+                except Exception as audit_exc:  # noqa: BLE001
+                    log.warning("trade_audit log failed for unfilled order %s: %s", symbol, audit_exc)
                 return order
             if filled < qty:
                 log.warning(
@@ -1934,6 +1957,78 @@ class Autopilot:
                 log.warning("storage write failed for live order %s: %s", symbol, exc)
         self.state.trades_executed += 1
         return order
+
+    async def _resolve_order_after_exception(
+        self, *, symbol: str, side: OrderSide, qty: Decimal, coid: str, exc: Exception,
+    ) -> Optional[Order]:
+        """ORDER FAILURE PROTOCOL: `place_order` raised. Prove what actually
+        happened before doing anything else — never guess, never retry/resubmit.
+
+        Asks Binance directly for the order we tagged with `coid` and returns:
+          - a reconstructed `Order` if Binance confirms it exists (filled or
+            not — caller's normal fill-check handles either case; this NEVER
+            places a second order)
+          - `None` if Binance confirms the order never arrived (safe no-op)
+          - `None` (after triggering an emergency halt) if we genuinely cannot
+            determine the outcome — the only case where "no new order" is not
+            enough and trading must pause until a human verifies exchange
+            state directly.
+        """
+        log.error(
+            "place_order raised for %s %s qty=%s coid=%s: %s — verifying true "
+            "outcome via get_order_by_client_id before assuming anything",
+            symbol, side.value, qty, coid, exc,
+        )
+        client = BinanceUSClient()
+        outcome, raw = await client.get_order_by_client_id(symbol, coid)
+
+        if outcome == "confirmed_absent":
+            log.warning(
+                "confirmed via Binance: %s %s coid=%s never arrived — safe no-op",
+                symbol, side.value, coid,
+            )
+            self.state.last_error = f"{symbol} {side.value} order confirmed not placed: {exc}"
+            return None
+
+        if outcome == "found":
+            log.warning(
+                "recovered order %s %s coid=%s from Binance after placement "
+                "exception — reconstructing from exchange record, NOT resubmitting",
+                symbol, side.value, coid,
+            )
+            return client.order_from_raw(
+                symbol=symbol, side=side, type=OrderType.MARKET,
+                quantity=qty, client_order_id=coid, raw=raw or {},
+            )
+
+        # outcome == "inconclusive": we cannot prove the order was placed OR
+        # that it wasn't. Per the Order Failure Protocol, UNKNOWN must never
+        # be treated as "safe to continue" — halt new entries until a human
+        # (or a later, successful verification pass) confirms exchange state.
+        reason = (
+            f"order outcome UNKNOWN for {symbol} {side.value} qty={qty} coid={coid}: "
+            f"placement raised {exc!r} and follow-up verification could not reach Binance"
+        )
+        log.critical(reason)
+        try:
+            storage.kv_set(
+                "order_outcome_unknown",
+                {
+                    "symbol": symbol, "side": side.value, "qty": str(qty),
+                    "client_order_id": coid, "ts": datetime.now(timezone.utc).isoformat(),
+                    "placement_error": str(exc),
+                },
+            )
+        except Exception as kv_exc:  # noqa: BLE001
+            log.warning("failed to persist order_outcome_unknown record: %s", kv_exc)
+        try:
+            from app.trading import watchdog  # local import: avoid import cycle
+
+            watchdog.trigger_emergency_halt(reason, level="order_outcome_unknown")
+        except Exception as halt_exc:  # noqa: BLE001
+            log.warning("failed to trigger emergency halt for unknown order outcome: %s", halt_exc)
+        self.state.last_error = reason
+        return None
 
 
 autopilot = Autopilot()

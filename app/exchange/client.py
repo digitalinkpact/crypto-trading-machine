@@ -12,6 +12,7 @@ from decimal import Decimal
 from typing import Any, Optional
 
 import pandas as pd
+from binance.error import ClientError
 from binance.spot import Spot  # type: ignore[import-untyped]
 
 from app.config import Settings, Timeframe, get_settings
@@ -216,6 +217,88 @@ class BinanceUSClient:
     async def open_orders(self, symbol: Optional[str] = None) -> list[dict[str, Any]]:
         kwargs = {"symbol": symbol} if symbol else {}
         return await asyncio.to_thread(self._spot.get_open_orders, **kwargs)
+
+    @staticmethod
+    def generate_client_order_id(prefix: str = "ctm") -> str:
+        """Public accessor for the idempotency-key generator, so a caller can
+        mint a `client_order_id` *before* calling `place_order` — needed to
+        look the order back up if the placement call itself raises (network
+        drop, timeout) and the response was never received."""
+        return _new_client_order_id(prefix)
+
+    @staticmethod
+    def order_from_raw(
+        symbol: str,
+        side: OrderSide,
+        type: OrderType,
+        quantity: Decimal,
+        client_order_id: str,
+        raw: dict[str, Any],
+    ) -> Order:
+        """Reconstruct an `Order` from a raw Binance order payload — used when
+        recovering the true outcome of an order whose placement call raised
+        (so we never got `place_order`'s normal return value) via
+        `get_order_by_client_id`. Mirrors `place_order`'s own reconstruction
+        so downstream fill/recording logic behaves identically either way."""
+        order = Order(
+            symbol=symbol,
+            side=side,
+            type=type,
+            quantity=quantity,
+            client_order_id=client_order_id,
+            submitted_at=datetime.now(timezone.utc),
+        )
+        return order.model_copy(
+            update={
+                "status": OrderStatus(raw.get("status", "NEW")),
+                "exchange_order_id": str(raw.get("orderId")),
+                "filled_quantity": Decimal(str(raw.get("executedQty", "0"))),
+                "avg_fill_price": _extract_avg_fill_price(raw),
+                "raw": raw,
+            }
+        )
+
+    async def get_order_by_client_id(
+        self, symbol: str, client_order_id: str
+    ) -> tuple[str, Optional[dict[str, Any]]]:
+        """Query Binance for an order by its client_order_id — the
+        authoritative way to learn whether an order that raised during
+        placement (timeout, dropped connection) actually reached the
+        exchange, instead of guessing. Binance dedupes on this idempotency
+        key, so if the request DID land despite us losing the response, this
+        finds the real order.
+
+        Returns:
+          ("found", raw_order)       — Binance has a record; raw_order has
+                                        the real status/executedQty/etc.
+          ("confirmed_absent", None) — Binance explicitly says no such order
+                                        exists (error -2013) — it truly never
+                                        arrived; safe to treat as not placed.
+          ("inconclusive", None)     — the query itself failed (still can't
+                                        reach Binance, auth error, etc). This
+                                        proves NOTHING — callers must NOT
+                                        treat this as either success or
+                                        failure.
+        """
+        try:
+            raw = await asyncio.to_thread(
+                self._spot.get_order, symbol=symbol, origClientOrderId=client_order_id
+            )
+            return "found", raw
+        except ClientError as e:
+            if e.error_code == -2013:
+                return "confirmed_absent", None
+            log.warning(
+                "get_order_by_client_id inconclusive for symbol=%s coid=%s: %s",
+                symbol, client_order_id, e,
+            )
+            return "inconclusive", None
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "get_order_by_client_id inconclusive for symbol=%s coid=%s: %s",
+                symbol, client_order_id, e,
+            )
+            return "inconclusive", None
 
     # ── Liquidation ──────────────────────────────────────────────────────
     async def liquidate_all(self, quote: str = "USDT") -> list[Order]:
