@@ -1754,17 +1754,25 @@ class Autopilot:
         raw_qty = (per_trade_usdt / price) if price > 0 else Decimal("0")
         rounded_qty = filters.round_qty(symbol, raw_qty)
         min_check = filters.diagnostics(symbol, rounded_qty, price)
+        notional = rounded_qty * price
+        # Hard $10 entry floor (config.min_trade_usdt), on top of whatever the
+        # exchange's own MIN_NOTIONAL filter allows. Entries only — sells are
+        # never gated by this so risk exits can always fully liquidate.
+        min_trade_floor = Decimal(str(get_settings().min_trade_usdt))
+        exchange_min_notional = min_check.get("min_notional")
+        effective_min_notional = max(min_trade_floor, exchange_min_notional or Decimal("0"))
+        notional_ok = bool(min_check.get("notional_ok")) and notional >= min_trade_floor
         return {
             "price": price,
             "per_trade_usdt": per_trade_usdt,
             "raw_qty": raw_qty,
             "rounded_qty": rounded_qty,
-            "notional": rounded_qty * price,
+            "notional": notional,
             "min_qty": min_check.get("min_qty"),
-            "min_notional": min_check.get("min_notional"),
-            "meets_min": bool(min_check.get("meets_min")),
+            "min_notional": effective_min_notional,
+            "meets_min": bool(min_check.get("qty_ok")) and notional_ok,
             "qty_ok": bool(min_check.get("qty_ok")),
-            "notional_ok": bool(min_check.get("notional_ok")),
+            "notional_ok": notional_ok,
         }
 
     async def _place_sell(self, symbol: str, sig, free: Decimal) -> bool:

@@ -208,6 +208,12 @@ class Settings(BaseSettings):
     min_open_positions: int = Field(10, ge=1, le=25)             # always hold at least 10
     max_open_positions: int = Field(10, ge=10, le=25)            # cap concurrent positions (target=10)
     max_long_exposure_pct: float = Field(0.60, ge=0.0, le=1.0)   # ≤ 60% of equity in non-USDT
+    # Hard floor on new-entry notional, independent of (and usually stricter
+    # than) the exchange's own MIN_NOTIONAL filter, which on Binance.US is
+    # often as low as $1. Applies to BUY entries only — exits must always be
+    # able to fully liquidate a position regardless of size, so risk/exit
+    # sells are never blocked by this.
+    min_trade_usdt: float = Field(10.0, ge=1.0, le=1000.0)
     aggressive_mode_enabled: bool = True
     aggressive_rollback_min_trades: int = Field(30, ge=1, le=10_000)
     aggressive_rollback_min_win_rate: float = Field(0.50, ge=0.0, le=1.0)
