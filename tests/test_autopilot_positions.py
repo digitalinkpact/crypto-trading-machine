@@ -225,7 +225,7 @@ def test_dynamic_ml_gate_thresholds_follow_action(monkeypatch):
 def test_signal_min_confidence_follows_action(monkeypatch):
     ap = Autopilot()
 
-    assert ap._signal_min_confidence(autopilot_module.SignalAction.BUY) == 0.40
+    assert ap._signal_min_confidence(autopilot_module.SignalAction.BUY, buy_threshold=0.72) == 0.72
     assert ap._signal_min_confidence(autopilot_module.SignalAction.SELL) == 0.497
 
 
@@ -565,6 +565,8 @@ async def test_execute_buy_pyramids_when_position_exists_and_confidence_is_high(
         dynamic_threshold_enabled = False
         ml_gate_enabled = False
         buy_cooldown_minutes = 30
+        pyramid_confidence_threshold = 0.75
+        pyramid_max_adds = 2
         aggressive_mode_enabled = True
         aggressive_rollback_min_trades = 30
         aggressive_rollback_min_win_rate = 0.50
@@ -651,6 +653,8 @@ async def test_execute_buy_rejects_when_pyramid_limit_is_reached(monkeypatch):
         dynamic_threshold_enabled = False
         ml_gate_enabled = False
         buy_cooldown_minutes = 30
+        pyramid_confidence_threshold = 0.75
+        pyramid_max_adds = 2
         aggressive_mode_enabled = True
         aggressive_rollback_min_trades = 30
         aggressive_rollback_min_win_rate = 0.50
@@ -717,6 +721,7 @@ async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
         ml_gate_enabled = False
         buy_cooldown_minutes = 30
         max_position_pct = 0.05
+        min_trade_usdt = 1.0
 
     captured = {}
 

@@ -223,10 +223,11 @@ class Settings(BaseSettings):
     rollback_position_pct: float = Field(0.10, ge=0.005, le=1.0)
     aggressive_max_open_positions: int = Field(10, ge=10, le=25)
     rollback_max_open_positions: int = Field(10, ge=10, le=25)
-    trend_gate_bypass_confidence: float = Field(0.50, ge=0.0, le=1.0)
-    trend_gate_bypass_ml_proba: float = Field(0.44, ge=0.0, le=1.0)
+    trend_gate_bypass_confidence: float = Field(0.88, ge=0.0, le=1.0)
+    trend_gate_bypass_ml_proba: float = Field(0.60, ge=0.0, le=1.0)
     pyramid_confidence_threshold: float = Field(0.85, ge=0.0, le=1.0)
     pyramid_add_fraction: float = Field(0.50, ge=0.0, le=2.0)
+    pyramid_max_adds: int = Field(1, ge=0, le=5)
     orderbook_retry_enabled: bool = True
     orderbook_retry_delay_seconds: int = Field(60, ge=1, le=3600)
     orderbook_retry_attempts: int = Field(3, ge=1, le=10)
@@ -240,8 +241,8 @@ class Settings(BaseSettings):
     drawdown_circuit_breaker_pct: float = Field(0.10, ge=0.01, le=0.50)  # halt new BUYs after -10%
 
     # Entry gates
-    min_signal_confidence: float = Field(0.65, ge=0.0, le=1.0)
-    buy_cooldown_minutes: int = Field(20, ge=0, le=1440)
+    min_signal_confidence: float = Field(0.70, ge=0.0, le=1.0)
+    buy_cooldown_minutes: int = Field(45, ge=0, le=1440)
 
     # ProfitStream strategy controls.
     profitstream_enabled: bool = True

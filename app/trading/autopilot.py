@@ -810,7 +810,10 @@ class Autopilot:
                 sig.action == SignalAction.SELL
                 and free > 0
             )
-            signal_min_conf = self._signal_min_confidence(sig.action)
+            signal_min_conf = self._signal_min_confidence(
+                sig.action,
+                buy_threshold=min_conf,
+            )
             if sig.action == SignalAction.BUY:
                 _set_filter(
                     symbol,
@@ -938,8 +941,12 @@ class Autopilot:
             try:
                 if sig.action == SignalAction.BUY:
                     pyramid_adds = self._pyramid_adds_count(symbol)
-                    pyramid_threshold = 0.75
-                    max_pyramid_adds = 2
+                    pyramid_threshold = float(
+                        getattr(s, "pyramid_confidence_threshold", 0.85)
+                    )
+                    max_pyramid_adds = int(
+                        getattr(s, "pyramid_max_adds", 1)
+                    )
                     is_pyramid = bool(
                         open_pos
                         and aggressive_mode
@@ -1381,10 +1388,17 @@ class Autopilot:
             return float(getattr(s, "ml_gate_threshold", 0.50))
         return float(getattr(s, "ml_gate_threshold", 0.50))
 
-    def _signal_min_confidence(self, action: SignalAction | str) -> float:
+    def _signal_min_confidence(
+        self,
+        action: SignalAction | str,
+        *,
+        buy_threshold: Optional[float] = None,
+    ) -> float:
         action_value = getattr(action, "value", action)
         if action_value == SignalAction.BUY.value:
-            return 0.40
+            if buy_threshold is not None:
+                return max(0.0, min(1.0, float(buy_threshold)))
+            return float(getattr(get_settings(), "min_signal_confidence", 0.65))
         if action_value == SignalAction.SELL.value:
             return 0.497
         return 0.497
