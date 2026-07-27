@@ -16,6 +16,7 @@ from app.logging_setup import get_logger
 from app.regime import run_learning_cycle
 from app.storage import storage
 from app.trading.autopilot import autopilot
+from app.trading.performance_analytics import run_and_log_snapshot
 from app.trading.reconcile import reconcile_positions
 from app.trading.portfolio import portfolio_snapshot
 
@@ -129,6 +130,15 @@ async def reconcile_portfolio() -> None:
         log.exception("portfolio reconcile failed mode=%s: %s", mode, e)
 
 
+async def performance_analytics_pass() -> None:
+    """Refresh profitability analytics snapshots for dashboards and tuning."""
+    mode = autopilot.state.mode
+    try:
+        run_and_log_snapshot(mode=mode, lookback_days=180)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("performance analytics pass failed mode=%s: %s", mode, exc)
+
+
 def build_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(refresh_market_data, CronTrigger(minute="*/15"), id="market_data")
@@ -137,5 +147,6 @@ def build_scheduler() -> AsyncIOScheduler:
     scheduler.add_job(ml_learning_pass, CronTrigger(minute="12", hour="*/6"), id="ml_learning")
     scheduler.add_job(equity_snapshot, CronTrigger(minute="55"), id="equity_curve")
     scheduler.add_job(reconcile_portfolio, CronTrigger(minute="*/5"), id="portfolio_reconcile")
+    scheduler.add_job(performance_analytics_pass, CronTrigger(minute="20", hour="*/1"), id="performance_analytics")
     return scheduler
 

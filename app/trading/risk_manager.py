@@ -32,6 +32,7 @@ class RiskManager:
         long_exposure_pct: float,
         entry_price: Decimal,
         aggressive_mode: bool,
+        signal_score: int = 0,
         is_pyramid: bool = False,
         current_position_notional: Decimal | None = None,
     ) -> EntryRiskDecision:
@@ -68,15 +69,32 @@ class RiskManager:
         kelly_cap_notional = total_equity_usdt * Decimal(str(s.kelly_fraction_cap))
         position_cap_notional = total_equity_usdt * Decimal(str(position_pct))
 
+        conviction_notional = self._conviction_notional(signal_score)
+
         if is_pyramid:
             pyramid_notional = (current_position_notional or Decimal("0")) * Decimal(str(getattr(s, "pyramid_add_fraction", 0.50)))
             notional = min(pyramid_notional, kelly_cap_notional, position_cap_notional)
         else:
-            notional = min(risk_based_notional, kelly_cap_notional, position_cap_notional)
+            notional = min(conviction_notional, risk_based_notional, kelly_cap_notional, position_cap_notional)
         if notional <= 0:
             return EntryRiskDecision(False, "non_positive_notional", Decimal("0"))
 
         return EntryRiskDecision(True, "ok", notional)
+
+    def _conviction_notional(self, signal_score: int) -> Decimal:
+        s = get_settings()
+        score = max(0, min(100, int(signal_score)))
+        if score >= int(getattr(s, "conviction_high_score", 86)):
+            high = Decimal(str(getattr(s, "conviction_high_usdt", 30.0)))
+            cap = Decimal(str(getattr(s, "conviction_max_usdt", 35.0)))
+            if score >= 93:
+                return cap
+            return high
+        if score >= int(getattr(s, "conviction_mid_score", 76)):
+            return Decimal(str(getattr(s, "conviction_mid_usdt", 20.0)))
+        if score >= int(getattr(s, "conviction_min_score", 65)):
+            return Decimal(str(getattr(s, "conviction_base_usdt", 10.0)))
+        return Decimal(str(getattr(s, "conviction_base_usdt", 10.0)))
 
     def _loss_cooldown_active(self, mode: str) -> tuple[bool, str]:
         s = get_settings()

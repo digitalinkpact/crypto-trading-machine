@@ -33,6 +33,10 @@ def _hwm_key(symbol: str) -> str:
     return f"hwm:{symbol}"
 
 
+def _tp1_key(symbol: str) -> str:
+    return f"tp1:{symbol}"
+
+
 def update_hwm(symbol: str, price: Decimal) -> Decimal:
     """Track per-position high-water mark for trailing-stop."""
     cur = storage.kv_get(_hwm_key(symbol))
@@ -45,6 +49,18 @@ def update_hwm(symbol: str, price: Decimal) -> Decimal:
 
 def clear_hwm(symbol: str) -> None:
     storage.kv_set(_hwm_key(symbol), None)
+
+
+def mark_tp1_taken(symbol: str) -> None:
+    storage.kv_set(_tp1_key(symbol), True)
+
+
+def clear_tp1(symbol: str) -> None:
+    storage.kv_set(_tp1_key(symbol), None)
+
+
+def tp1_taken(symbol: str) -> bool:
+    return bool(storage.kv_get(_tp1_key(symbol)) or False)
 
 
 def get_hwm(symbol: str) -> Optional[Decimal]:
@@ -62,7 +78,7 @@ def get_hwm(symbol: str) -> Optional[Decimal]:
 class ExitDecision:
     symbol: str
     qty: Decimal
-    reason: str  # "stop_loss" | "take_profit" | "trailing_stop" | "max_hold"
+    reason: str  # "stop_loss" | "take_profit_1" | "take_profit_final" | "trailing_stop" | "max_hold"
 
 
 def evaluate_exits(
@@ -96,12 +112,23 @@ def evaluate_exits(
             out.append(ExitDecision(symbol, qty, "stop_loss"))
             continue
 
-        # 2. Take-profit
-        if change >= Decimal(str(s.take_profit_pct)):
-            out.append(ExitDecision(symbol, qty, "take_profit"))
+        # 2. Final take-profit target
+        final_tp = Decimal(str(getattr(s, "final_take_profit_pct", s.take_profit_pct)))
+        if change >= final_tp:
+            out.append(ExitDecision(symbol, qty, "take_profit_final"))
             continue
 
-        # 3. Trailing stop (arm only after position gains the configured threshold)
+        # 3. First take-profit scale-out (one-time partial sell)
+        tp1 = Decimal(str(getattr(s, "take_profit_1_pct", 0.08)))
+        tp1_fraction = Decimal(str(getattr(s, "take_profit_1_fraction", 0.50)))
+        if change >= tp1 and not tp1_taken(symbol):
+            part_qty = qty * tp1_fraction
+            if part_qty > 0:
+                out.append(ExitDecision(symbol, part_qty, "take_profit_1"))
+                mark_tp1_taken(symbol)
+                continue
+
+        # 4. Trailing stop (arm only after position gains the configured threshold)
         trail_activation = Decimal(str(getattr(s, "trailing_activation_pct", s.take_profit_pct / 2)))
         if hwm > entry * (Decimal("1") + trail_activation):
             trail_floor = hwm * (Decimal("1") - Decimal(str(s.trailing_stop_pct)))
@@ -109,7 +136,7 @@ def evaluate_exits(
                 out.append(ExitDecision(symbol, qty, "trailing_stop"))
                 continue
 
-        # 4. Max hold time
+        # 5. Max hold time
         try:
             entry_ts = datetime.fromisoformat(pos["entry_ts"])
             if entry_ts.tzinfo is None:

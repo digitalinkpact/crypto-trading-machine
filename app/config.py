@@ -31,11 +31,8 @@ class Timeframe(str, Enum):
 # ── Universe ─────────────────────────────────────────────────────────────
 # Static fallback list for USDT pairs (used if dynamic fetch fails)
 STATIC_SYMBOLS: tuple[str, ...] = (
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-    "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "DOTUSDT", "LINKUSDT",
-    "POLUSDT", "LTCUSDT", "BCHUSDT", "ATOMUSDT", "UNIUSDT",
-    "ETCUSDT", "FILUSDT", "NEARUSDT", "APTUSDT", "ARBUSDT",
-    "OPUSDT", "SHIBUSDT", "SUIUSDT", "FETUSDT", "AAVEUSDT",
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "LINKUSDT",
+    "AVAXUSDT", "DOGEUSDT", "ADAUSDT", "SUIUSDT",
 )
 
 # Back-compat alias — some modules import SYMBOLS directly.
@@ -53,7 +50,7 @@ TIMEFRAMES: tuple[Timeframe, ...] = (
 class Settings(BaseSettings):
     """Environment-driven settings. Loaded from .env via pydantic-settings."""
     # Dynamic symbol discovery
-    use_dynamic_symbols: bool = True
+    use_dynamic_symbols: bool = False
     symbols_cache_minutes: int = Field(60, ge=1, le=1440)
     static_symbols: tuple[str, ...] = STATIC_SYMBOLS
     # Universe filters (applied when use_dynamic_symbols=True). Trade every
@@ -68,8 +65,8 @@ class Settings(BaseSettings):
     #    min_quote_volume_usdt floor. The top-N are inherently liquid, so this
     #    doubles as a slippage guard while widening the tradeable universe.
     exclude_leveraged_tokens: bool = True
-    min_quote_volume_usdt: float = Field(0.0, ge=0.0)
-    max_symbols: int = Field(100, ge=0, le=1000)
+    min_quote_volume_usdt: float = Field(1_000_000.0, ge=0.0)
+    max_symbols: int = Field(9, ge=0, le=1000)
 
     # ── Liquidity-ranked pairlist (multi-stage universe filter) ──────────
     # When `liquidity_pairlist_enabled` is True, the tradable universe is built
@@ -92,12 +89,12 @@ class Settings(BaseSettings):
     # under $2k/24h. binance.com-scale floors (e.g. $5M) would zero the universe.
     # `min_24h_volume` is therefore intentionally low; the spread cap plus the
     # execution-time order-book gate do the real liquidity protection.
-    liquidity_pairlist_enabled: bool = True
-    universe_size: int = Field(75, ge=1, le=1000)
-    min_24h_volume: float = Field(1_000.0, ge=0.0)
+    liquidity_pairlist_enabled: bool = False
+    universe_size: int = Field(50, ge=1, le=1000)
+    min_24h_volume: float = Field(1_000_000.0, ge=0.0)
     max_spread_percent: float = Field(0.50, ge=0.0, le=100.0)
     min_days_listed: int = Field(15, ge=0, le=10_000)
-    final_pairlist_size: int = Field(50, ge=1, le=1000)
+    final_pairlist_size: int = Field(9, ge=1, le=1000)
     volume_sort_key: str = "quoteVolume"
     volume_refresh_seconds: int = Field(1800, ge=30, le=86_400)
     # Max concurrent per-symbol liquidity probes (depth + listing age).
@@ -205,8 +202,8 @@ class Settings(BaseSettings):
     max_position_pct: float = Field(0.05, ge=0.005, le=1.0)      # per-position sizing cap
     max_portfolio_risk_pct: float = Field(0.25, ge=0.0, le=1.0)
     kelly_fraction_cap: float = Field(0.25, ge=0.005, le=1.0)
-    min_open_positions: int = Field(10, ge=1, le=25)             # always hold at least 10
-    max_open_positions: int = Field(10, ge=10, le=25)            # cap concurrent positions (target=10)
+    min_open_positions: int = Field(1, ge=1, le=25)
+    max_open_positions: int = Field(5, ge=1, le=25)
     max_long_exposure_pct: float = Field(0.60, ge=0.0, le=1.0)   # ≤ 60% of equity in non-USDT
     # Hard floor on new-entry notional, independent of (and usually stricter
     # than) the exchange's own MIN_NOTIONAL filter, which on Binance.US is
@@ -221,8 +218,8 @@ class Settings(BaseSettings):
     rollback_max_spread_pct: float = Field(0.0015, ge=0.0, le=0.05)
     aggressive_position_pct: float = Field(0.06, ge=0.005, le=1.0)
     rollback_position_pct: float = Field(0.10, ge=0.005, le=1.0)
-    aggressive_max_open_positions: int = Field(10, ge=10, le=25)
-    rollback_max_open_positions: int = Field(10, ge=10, le=25)
+    aggressive_max_open_positions: int = Field(5, ge=1, le=25)
+    rollback_max_open_positions: int = Field(5, ge=1, le=25)
     trend_gate_bypass_confidence: float = Field(0.88, ge=0.0, le=1.0)
     trend_gate_bypass_ml_proba: float = Field(0.60, ge=0.0, le=1.0)
     pyramid_confidence_threshold: float = Field(0.85, ge=0.0, le=1.0)
@@ -233,24 +230,27 @@ class Settings(BaseSettings):
     orderbook_retry_attempts: int = Field(3, ge=1, le=10)
 
     # Exit gates (hard rules, evaluated every risk-tick)
-    stop_loss_pct: float = Field(0.015, ge=0.005, le=0.20)       # 1.5% hard stop
-    take_profit_pct: float = Field(0.05, ge=0.005, le=0.50)      # 5% take-profit
-    trailing_stop_pct: float = Field(0.01, ge=0.005, le=0.20)    # 1.0% trail from HWM
-    trailing_activation_pct: float = Field(0.02, ge=0.005, le=0.50)  # arm trailing after +2%
+    stop_loss_pct: float = Field(0.02, ge=0.005, le=0.20)        # 2.0% hard stop
+    take_profit_pct: float = Field(0.15, ge=0.005, le=0.50)      # final 15% target
+    trailing_stop_pct: float = Field(0.025, ge=0.005, le=0.20)   # dynamic trail from HWM
+    trailing_activation_pct: float = Field(0.04, ge=0.005, le=0.50)  # arm trailing after +4%
+    take_profit_1_pct: float = Field(0.08, ge=0.005, le=0.50)    # scale out 50% at +8%
+    take_profit_1_fraction: float = Field(0.50, ge=0.05, le=0.95)
+    final_take_profit_pct: float = Field(0.15, ge=0.01, le=1.0)
     max_hold_hours: int = Field(96, ge=1, le=10000)              # force-exit after 4 days
     drawdown_circuit_breaker_pct: float = Field(0.10, ge=0.01, le=0.50)  # halt new BUYs after -10%
 
     # Entry gates
-    min_signal_confidence: float = Field(0.70, ge=0.0, le=1.0)
+    min_signal_confidence: float = Field(0.65, ge=0.0, le=1.0)
     buy_cooldown_minutes: int = Field(45, ge=0, le=1440)
 
     # ProfitStream strategy controls.
     profitstream_enabled: bool = True
     profitstream_use_legacy_agents: bool = False
-    profitstream_score_threshold: int = Field(80, ge=0, le=100)
-    profitstream_rsi_min: int = Field(40, ge=1, le=99)
-    profitstream_rsi_max: int = Field(65, ge=1, le=99)
-    profitstream_volume_spike_multiple: float = Field(1.5, ge=1.0, le=10.0)
+    profitstream_score_threshold: int = Field(65, ge=0, le=100)
+    profitstream_rsi_min: int = Field(35, ge=1, le=99)
+    profitstream_rsi_max: int = Field(70, ge=1, le=99)
+    profitstream_volume_spike_multiple: float = Field(1.2, ge=1.0, le=10.0)
     profitstream_btc_volatility_threshold: float = Field(0.03, ge=0.001, le=0.20)
     profitstream_low_volume_quote_min: float = Field(50.0, ge=0.0, le=1_000_000.0)
     # Optional comma-separated UTC timestamps (ISO-8601) for major news events.
@@ -380,6 +380,14 @@ class Settings(BaseSettings):
 
     # Risk manager controls.
     risk_per_trade_pct: float = Field(0.01, ge=0.001, le=0.10)
+    # High-conviction dynamic notional sizing in USDT.
+    conviction_min_score: int = Field(65, ge=0, le=100)
+    conviction_mid_score: int = Field(76, ge=0, le=100)
+    conviction_high_score: int = Field(86, ge=0, le=100)
+    conviction_base_usdt: float = Field(10.0, ge=1.0, le=10_000.0)
+    conviction_mid_usdt: float = Field(20.0, ge=1.0, le=10_000.0)
+    conviction_high_usdt: float = Field(30.0, ge=1.0, le=10_000.0)
+    conviction_max_usdt: float = Field(35.0, ge=1.0, le=10_000.0)
     loss_streak_pause_count: int = Field(3, ge=1, le=20)
     loss_streak_pause_minutes: int = Field(60, ge=1, le=1440)
 

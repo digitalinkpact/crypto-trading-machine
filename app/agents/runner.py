@@ -128,7 +128,7 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
 
     if settings.profitstream_enabled:
         strategy = ProfitStreamStrategy()
-        score_threshold = getattr(settings, "profitstream_score_threshold", 80)
+        score_threshold = getattr(settings, "profitstream_score_threshold", 65)
         for symbol in symbols:
             decision = await strategy.analyze_symbol(symbol, mode=mode)
             executed = (

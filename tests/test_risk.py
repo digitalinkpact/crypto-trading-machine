@@ -30,13 +30,25 @@ def test_stop_loss_triggers():
 
 
 def test_take_profit_triggers():
-    """Position up >5% should hit take_profit exit."""
+    """Position up past the TP1 scale-out band should hit take_profit_1 exit."""
     positions = [_pos("BTCUSDT", 1.0, 100.0)]
-    prices = {"BTCUSDT": Decimal("106")}  # +6%
+    prices = {"BTCUSDT": Decimal("109")}  # +9% (past the 8% TP1 trigger)
     risk.clear_hwm("BTCUSDT")
+    risk.clear_tp1("BTCUSDT")
     exits = risk.evaluate_exits(positions=positions, prices=prices)
     assert len(exits) == 1
-    assert exits[0].reason == "take_profit"
+    assert exits[0].reason == "take_profit_1"
+
+
+def test_final_take_profit_triggers():
+    """Position up past the final take-profit target should fully exit."""
+    positions = [_pos("BTCUSDT", 1.0, 100.0)]
+    prices = {"BTCUSDT": Decimal("116")}  # +16% (past the 15% final target)
+    risk.clear_hwm("BTCUSDT")
+    risk.clear_tp1("BTCUSDT")
+    exits = risk.evaluate_exits(positions=positions, prices=prices)
+    assert len(exits) == 1
+    assert exits[0].reason == "take_profit_final"
 
 
 def test_no_exit_when_within_band():

@@ -448,7 +448,7 @@ async def test_execute_sell_prefers_free_balance_over_total_balance(monkeypatch)
     assert placed == [("BTCUSDT", Decimal("0.20"))]
 
 
-async def test_execute_forces_take_profit_exit_before_buy_path(monkeypatch):
+async def test_execute_holds_small_gain_instead_of_forced_exit(monkeypatch):
     ap = Autopilot()
     ap.state.mode = "live"
 
@@ -500,7 +500,9 @@ async def test_execute_forces_take_profit_exit_before_buy_path(monkeypatch):
 
     await ap._execute({"BTCUSDT": _BuySig()}, allow_buys=True)
 
-    assert placed == [("BTCUSDT", Decimal("1"))]
+    # Small gains (e.g. +4%) must NOT trigger a forced discretionary exit —
+    # winners are allowed to run per the updated trailing-profit policy.
+    assert placed == []
     assert buys == []
 
 
@@ -793,7 +795,7 @@ async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
     assert info["action"] == "BUY"
     assert info["filters"]["market_regime"]["ok"] is False
     assert info["filters"]["min_notional"]["ok"] is True
-    assert info["sizing"]["rounded_qty"] == "0.1200"
-    assert info["sizing"]["notional"] == "6.0000"
+    assert info["sizing"]["rounded_qty"] == "0.2000"
+    assert info["sizing"]["notional"] == "10.0000"
     assert info["final_reason"] == "market_gate"
     assert info["submitted"] is False

@@ -417,14 +417,22 @@ class Storage:
             rows = c.execute("SELECT * FROM positions").fetchall()
         return [dict(r) for r in rows]
 
-    def close_position(
+    def reduce_position(
         self,
         *,
         symbol: str,
-        mode: Optional[str] = None,
+        qty: Decimal | float,
         exit_price: Decimal | float,
+        mode: Optional[str] = None,
     ) -> Optional[dict]:
-        """Close a position fully. Records to closed_trades and updates agent stats."""
+        """Partially or fully reduce a position and book realized PnL.
+
+        Used for scaled take-profit exits (e.g. selling a fraction at TP1
+        while the remainder keeps trailing) as well as full closes.
+        """
+        req_qty = _f(qty)
+        if req_qty <= 0:
+            return None
         with self._lock, self._conn() as c:
             if mode is None:
                 row = c.execute(
@@ -439,28 +447,44 @@ class Storage:
                 ).fetchone()
             if not row:
                 return None
-            qty = float(row["qty"])
+
+            cur_qty = float(row["qty"])
+            if cur_qty <= 0:
+                return None
+            sold_qty = min(cur_qty, req_qty)
+            remaining_qty = max(0.0, cur_qty - sold_qty)
+
             entry = float(row["entry_price"])
             exit_p = _f(exit_price)
-            # Closed-trade PnL should reflect execution costs so diagnostics,
-            # adaptive weights, and win/loss labels track real net edge.
             s = get_settings()
             taker_fee = float(s.binance_taker_fee)
-            gross_pnl = (exit_p - entry) * qty
-            est_fees = (entry * qty * taker_fee) + (exit_p * qty * taker_fee)
+            gross_pnl = (exit_p - entry) * sold_qty
+            est_fees = (entry * sold_qty * taker_fee) + (exit_p * sold_qty * taker_fee)
             pnl = gross_pnl - est_fees
-            entry_notional = entry * qty
+            entry_notional = entry * sold_qty
             pnl_pct = ((pnl / entry_notional) * 100) if entry_notional else 0.0
+
             agents_json = row["agents"]
             agents_list = json.loads(agents_json or "[]")
             entry_ts = row["entry_ts"]
-            mode = row["mode"]
+            mode_val = row["mode"]
             now = _now()
-            c.execute("DELETE FROM positions WHERE symbol=? AND mode=?", (symbol, mode or row["mode"]))
+
+            if remaining_qty <= 0:
+                c.execute(
+                    "DELETE FROM positions WHERE symbol=? AND mode=?",
+                    (symbol, mode_val),
+                )
+            else:
+                c.execute(
+                    "UPDATE positions SET qty=? WHERE symbol=? AND mode=?",
+                    (remaining_qty, symbol, mode_val),
+                )
+
             c.execute(
                 "INSERT INTO closed_trades(mode,symbol,qty,entry_price,exit_price,pnl,"
                 "pnl_pct,entry_ts,exit_ts,agents) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (mode, symbol, qty, entry, exit_p, pnl, pnl_pct,
+                (mode_val, symbol, sold_qty, entry, exit_p, pnl, pnl_pct,
                  entry_ts, now, agents_json),
             )
             won = pnl > 0
@@ -474,11 +498,40 @@ class Storage:
                     (agent, 1 if won else 0, 0 if won else 1, pnl, now),
                 )
         return {
-            "symbol": symbol, "qty": qty, "entry_price": entry,
-            "exit_price": exit_p, "pnl": pnl, "pnl_pct": pnl_pct,
+            "symbol": symbol, "mode": mode_val,
+            "sold_qty": sold_qty, "remaining_qty": remaining_qty,
+            "entry_price": entry, "exit_price": exit_p,
+            "pnl": pnl, "pnl_pct": pnl_pct,
             "agents": agents_list, "entry_ts": entry_ts, "exit_ts": now,
-            "mode": mode,
         }
+
+    def close_position(
+        self,
+        *,
+        symbol: str,
+        mode: Optional[str] = None,
+        exit_price: Decimal | float,
+    ) -> Optional[dict]:
+        """Close a position fully. Records to closed_trades and updates agent stats."""
+        if mode is None:
+            row = self.get_position(symbol)
+        else:
+            row = next(
+                (p for p in self.all_positions() if p.get("symbol") == symbol and p.get("mode") == mode),
+                None,
+            )
+        if row is None:
+            return None
+        result = self.reduce_position(
+            symbol=symbol,
+            qty=float(row.get("qty") or 0.0),
+            exit_price=exit_price,
+            mode=mode,
+        )
+        if result is not None:
+            result["qty"] = result.pop("sold_qty", None)
+            result.pop("remaining_qty", None)
+        return result
 
     # ── Agent stats ──────────────────────────────────────────────────
     def agent_stats(self) -> list[dict]:

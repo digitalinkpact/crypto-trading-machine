@@ -76,13 +76,17 @@ class ProfitStreamStrategy:
         indicators.update(
             {
                 "ema_cross_1m": ema_cross,
+                "ema_status": "bull_cross" if ema_cross else "no_bull_cross",
                 "rsi_5m": rsi_val,
                 "rsi_ok": rsi_ok,
                 "volume_spike_1m": vol_spike,
                 "volume_ratio_1m": vol_ratio,
+                "volume_score": round(min(vol_ratio / max(s.profitstream_volume_spike_multiple, 0.0001), 2.0), 4),
                 "quote_volume_1m": quote_1m,
                 "macd_bull_15m": macd_bull,
+                "macd_status": "bull" if macd_bull else "bear_or_flat",
                 "btc_aligned_1h": btc_aligned,
+                "btc_trend_alignment": "aligned" if btc_aligned else "not_aligned",
             }
         )
 
@@ -127,9 +131,9 @@ class ProfitStreamStrategy:
         if not ema_cross:
             reasons.append("ema9_not_crossing_ema21")
         if not rsi_ok:
-            reasons.append("rsi_outside_40_65")
+            reasons.append(f"rsi_outside_{s.profitstream_rsi_min}_{s.profitstream_rsi_max}")
         if not vol_spike:
-            reasons.append("volume_spike_missing")
+            reasons.append(f"volume_spike_below_{s.profitstream_volume_spike_multiple:.2f}x")
         if not macd_bull:
             reasons.append("macd_bull_confirmation_missing")
         if not btc_aligned:

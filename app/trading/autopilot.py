@@ -344,7 +344,7 @@ class Autopilot:
                         )
                         try:
                             storage.close_position(symbol=ex.symbol, exit_price=price)
-                            risk.clear_hwm(ex.symbol)
+                            self._clear_exit_state_if_flat(ex.symbol)
                         except Exception as exc:  # noqa: BLE001
                             log.warning("stale close failed for %s: %s", ex.symbol, exc)
                     else:
@@ -386,7 +386,7 @@ class Autopilot:
                     filters={"meets_min": True},
                 )
                 if self._order_filled(order):
-                    risk.clear_hwm(ex.symbol)
+                    self._clear_exit_state_if_flat(ex.symbol)
                 else:
                     log.error(
                         "RISK EXIT %s did NOT fill (status=%s) — position remains "
@@ -545,7 +545,8 @@ class Autopilot:
         atr_pct = await self._atr_pct(symbol)
         eff_pct = risk.volatility_scaled_pct(s.max_position_pct, atr_pct)
         per_trade_usdt = usdt_free * Decimal(str(eff_pct))
-        if per_trade_usdt < 10:
+        min_trade_usdt = Decimal(str(getattr(s, "min_trade_usdt", 10.0)))
+        if per_trade_usdt < min_trade_usdt:
             trade_audit_logger.log_event(
                 mode=self.state.mode,
                 symbol=symbol,
@@ -556,7 +557,7 @@ class Autopilot:
                 available_balance=usdt_free,
                 min_notional_passed=False,
                 final_outcome="rejected: No available funds",
-                detail={"required_min_usdt": 10, "computed_usdt": str(per_trade_usdt)},
+                detail={"required_min_usdt": str(min_trade_usdt), "computed_usdt": str(per_trade_usdt)},
             )
             return False, "No available funds"
 
@@ -634,6 +635,9 @@ class Autopilot:
             entry = _entry(sym, sig)
             entry["final_reason"] = reason
             entry["submitted"] = submitted
+            entry["buy_decision"] = reason if entry.get("action") == SignalAction.BUY.value else None
+            entry["sell_decision"] = reason if entry.get("action") == SignalAction.SELL.value else None
+            entry["rejection_reason"] = "" if submitted else reason
             _bump(reason, sym, detail)
             min_notional_info = (entry.get("filters") or {}).get("min_notional") or {}
             min_notional_passed = min_notional_info.get("ok") if min_notional_info else None
@@ -665,6 +669,28 @@ class Autopilot:
                     "trace": _jsonable(entry),
                 },
             )
+            try:
+                storage.record_tick_audit(
+                    mode=self.state.mode,
+                    symbol=sym,
+                    timeframe=getattr(getattr(sig, "timeframe", None), "value", Timeframe.D1.value),
+                    action=signal_val,
+                    score=int(round(float(confidence or 0.0) * 100)),
+                    executed=submitted,
+                    reason=reason,
+                    indicators={
+                        **(entry.get("diagnostics") or {}),
+                        "confidence": confidence,
+                        "strategy_score": int(round(float(confidence or 0.0) * 100)),
+                        "position_size_usdt": ((entry.get("sizing") or {}).get("per_trade_usdt")),
+                        "account_balance_usdt": str(avail),
+                        "profit_pct": (entry.get("diagnostics") or {}).get("profit_pct"),
+                        "binance_response": ("SUCCESS" if submitted else "REJECTED"),
+                    },
+                    filters=entry.get("filters") or {},
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("tick audit persist failed for %s: %s", sym, exc)
             if entry.get("action") == SignalAction.BUY.value:
                 log.info("[BUY_TRACE] %s %s", sym, json.dumps(_jsonable(entry), sort_keys=True))
 
@@ -813,6 +839,15 @@ class Autopilot:
                 sig.action == SignalAction.SELL
                 and free > 0
             )
+            entry = _entry(symbol, sig)
+            try:
+                entry["diagnostics"] = await self._symbol_tick_indicators(symbol)
+            except Exception as exc:  # noqa: BLE001
+                entry["diagnostics"] = {"diagnostic_error": str(exc)}
+            entry["diagnostics"]["strategy_score"] = int(round(float(sig.confidence) * 100))
+            entry["diagnostics"]["account_balance_usdt"] = float(usdt_free)
+            entry["diagnostics"]["total_equity_usdt"] = float(total_eq)
+            entry["diagnostics"]["signal"] = sig.action.value
             signal_min_conf = self._signal_min_confidence(
                 sig.action,
                 buy_threshold=min_conf,
@@ -848,6 +883,7 @@ class Autopilot:
                 entry_price = Decimal(str(open_pos.get("entry_price") or "0"))
                 if entry_price > 0:
                     position_return_pct = (current_price - entry_price) / entry_price
+                    entry["diagnostics"]["profit_pct"] = float(position_return_pct * Decimal("100"))
                     hold_days: Optional[float]
                     hold_days = None
                     try:
@@ -868,8 +904,7 @@ class Autopilot:
                             placed = await self._place_sell(symbol, sig, free)
                             if placed:
                                 skip_counter["executed_sell"] += 1
-                                risk.clear_hwm(symbol)
-                                self._clear_pyramid_adds_count(symbol)
+                                self._clear_exit_state_if_flat(symbol)
                                 _finish(symbol, "executed_sell", aggressive_exit_reason, submitted=True, sig=sig)
                             else:
                                 _bump("filter_reject_sell", symbol)
@@ -891,6 +926,7 @@ class Autopilot:
             if ml_model is not None and not is_exit and sig.action in (SignalAction.BUY, SignalAction.SELL):
                 ml_proba = await self._ml_win_proba(ml_model, symbol, sig)
                 if ml_proba is not None:
+                    entry["diagnostics"]["ml_score"] = round(float(ml_proba), 6)
                     gate_threshold = self._ml_gate_threshold_for_confidence(
                         sig.confidence,
                         aggressive_mode,
@@ -1003,6 +1039,7 @@ class Autopilot:
                         long_exposure_pct=long_exposure_pct,
                         entry_price=entry_price,
                         aggressive_mode=aggressive_mode,
+                        signal_score=int(round(float(sig.confidence) * 100)),
                         is_pyramid=is_pyramid,
                         current_position_notional=current_position_notional,
                     )
@@ -1020,6 +1057,7 @@ class Autopilot:
                     buy_plan["effective_position_pct"] = eff_pct
                     buy_plan["usdt_free"] = usdt_free
                     _set_sizing(symbol, buy_plan, sig)
+                    entry["diagnostics"]["position_size_usdt"] = float(per_trade_usdt)
                     _set_filter(
                         symbol,
                         "min_notional",
@@ -1054,10 +1092,11 @@ class Autopilot:
                         _finish(symbol, "trend_gate", trend_why, submitted=False, sig=sig)
                         log.info("skip %s BUY: %s", symbol, trend_why)
                         continue
-                    # Enforce $10 minimum per trade
-                    if per_trade_usdt < 10:
-                        if usdt_free >= 10:
-                            per_trade_usdt = Decimal("10")
+                    # Enforce configured minimum per trade
+                    min_trade_usdt = Decimal(str(getattr(s, "min_trade_usdt", 10.0)))
+                    if per_trade_usdt < min_trade_usdt:
+                        if usdt_free >= min_trade_usdt:
+                            per_trade_usdt = min_trade_usdt
                         else:
                             _set_filter(
                                 symbol,
@@ -1127,6 +1166,7 @@ class Autopilot:
                         open_count += 1
                         held_symbols.add(symbol)
                         self._clear_pyramid_adds_count(symbol)
+                        risk.clear_tp1(symbol)
                     else:
                         self._set_pyramid_adds_count(symbol, pyramid_adds + 1)
                     skip_counter["executed_buy"] += 1
@@ -1151,8 +1191,7 @@ class Autopilot:
                         placed = await self._place_sell(symbol, sig, free)
                         if placed:
                             skip_counter["executed_sell"] += 1
-                            risk.clear_hwm(symbol)
-                            self._clear_pyramid_adds_count(symbol)
+                            self._clear_exit_state_if_flat(symbol)
                         else:
                             _bump("filter_reject_sell", symbol)
                     else:
@@ -1318,17 +1357,23 @@ class Autopilot:
                 hold_days = 0.0
 
             pnl_pct = ((current_price - entry_price) / entry_price) * Decimal("100")
+            hwm = risk.get_hwm(symbol)
+            trailing_floor = None
+            if hwm is not None and hwm > 0:
+                trailing_floor = hwm * (Decimal("1") - Decimal(str(getattr(get_settings(), "trailing_stop_pct", 0.025))))
             exit_ready = (
-                pnl_pct >= Decimal("2.0")
-                or pnl_pct <= Decimal("-5.0")
-                or hold_days >= 7.0
+                pnl_pct >= Decimal("8.0")
+                or pnl_pct <= Decimal("-2.0")
+                or hold_days >= 21.0
             )
             log.info(
-                "[HELD] %s PnL=%.2f%% days=%.2f exit_ready=%s",
+                "[HELD] %s PnL=%.2f%% days=%.2f exit_ready=%s hwm=%s trailing_floor=%s",
                 symbol,
                 float(pnl_pct),
                 hold_days,
                 exit_ready,
+                hwm,
+                trailing_floor,
             )
 
     def _on_cooldown(self, symbol: str, now: datetime, cooldown: timedelta) -> bool:
@@ -1351,6 +1396,18 @@ class Autopilot:
 
     def _clear_pyramid_adds_count(self, symbol: str) -> None:
         self._set_pyramid_adds_count(symbol, 0)
+
+    def _clear_exit_state_if_flat(self, symbol: str) -> None:
+        """Clear trailing/scale-out state only when no position remains."""
+        still_open = any(
+            p.get("symbol") == symbol and p.get("mode") == self.state.mode
+            for p in storage.all_positions()
+        )
+        if still_open:
+            return
+        risk.clear_hwm(symbol)
+        risk.clear_tp1(symbol)
+        self._clear_pyramid_adds_count(symbol)
 
     def _aggressive_mode_active(self) -> tuple[bool, str]:
         s = get_settings()
@@ -1412,14 +1469,12 @@ class Autopilot:
         position_return_pct: Decimal,
         hold_days: Optional[float],
     ) -> Optional[str]:
-        if sig.action == SignalAction.SELL and sig.confidence > 0.60:
-            return f"sell confidence={sig.confidence:.2f} > 0.60"
-        if position_return_pct >= Decimal("0.02"):
-            return f"profit={float(position_return_pct) * 100:.2f}% >= 2.00%"
-        if position_return_pct <= Decimal("-0.05"):
-            return f"loss={float(position_return_pct) * 100:.2f}% <= -5.00%"
-        if hold_days is not None and hold_days > 7.0:
-            return f"hold_days={hold_days:.2f} > 7.00"
+        if sig.action == SignalAction.SELL and sig.confidence >= 0.65:
+            return f"sell confidence={sig.confidence:.2f} >= 0.65"
+        if position_return_pct <= Decimal("-0.02"):
+            return f"loss={float(position_return_pct) * 100:.2f}% <= -2.00%"
+        if hold_days is not None and hold_days > 21.0 and position_return_pct <= 0:
+            return f"hold_days={hold_days:.2f} > 21.00 with non-positive return"
         return None
 
     def _trend_gate_bypass_allowed(
@@ -1636,6 +1691,50 @@ class Autopilot:
         except Exception as exc:  # noqa: BLE001
             log.debug("feature snapshot failed for %s: %s", symbol, exc)
             return None, None, None
+
+    async def _symbol_tick_indicators(self, symbol: str) -> dict:
+        """Best-effort technical snapshot used by tick diagnostics."""
+        out = {
+            "rsi": None,
+            "macd_status": "unknown",
+            "ema_status": "unknown",
+            "btc_trend_alignment": "unknown",
+            "volume_score": None,
+            "ml_score": None,
+            "position_size_usdt": None,
+            "stop_loss_pct": float(getattr(get_settings(), "stop_loss_pct", 0.02)),
+            "trailing_activation_pct": float(getattr(get_settings(), "trailing_activation_pct", 0.04)),
+            "trailing_stop_pct": float(getattr(get_settings(), "trailing_stop_pct", 0.025)),
+            "take_profit_1_pct": float(getattr(get_settings(), "take_profit_1_pct", 0.08)),
+            "final_take_profit_pct": float(getattr(get_settings(), "final_take_profit_pct", 0.15)),
+        }
+        try:
+            from app.data import OHLCVRepository
+            from app.ta import add_indicators
+
+            df = await OHLCVRepository().get(symbol, Timeframe.D1, refresh=False)
+            df = add_indicators(df).dropna()
+            if df.empty:
+                return out
+            last = df.iloc[-1]
+            out["rsi"] = float(last.get("rsi_14", 0.0))
+            macd = float(last.get("macd", 0.0))
+            macd_sig = float(last.get("macd_signal", 0.0))
+            out["macd_status"] = "bull" if macd >= macd_sig else "bear"
+            ema20 = float(last.get("ema_20", 0.0))
+            ema50 = float(last.get("ema_50", 0.0))
+            out["ema_status"] = "bull" if ema20 >= ema50 else "bear"
+
+            vol = float(last.get("volume", 0.0))
+            vol_ma = float(df["volume"].rolling(20).mean().iloc[-1]) if len(df) >= 20 else 0.0
+            out["volume_score"] = (vol / vol_ma) if vol_ma > 0 else None
+
+            market_ok, market_why = await self._market_gate()
+            out["btc_trend_alignment"] = "aligned" if market_ok else f"blocked:{market_why}"
+            return out
+        except Exception as exc:  # noqa: BLE001
+            out["diagnostic_error"] = str(exc)
+            return out
 
     async def _price(self, symbol: str) -> Decimal:
         # Prefer the live websocket last-price when it's fresh; this avoids
@@ -1969,7 +2068,12 @@ class Autopilot:
                         entry_price=price, agents=agents,
                     )
                 else:
-                    storage.close_position(symbol=symbol, mode="live", exit_price=price)
+                    storage.reduce_position(
+                        symbol=symbol,
+                        mode="live",
+                        qty=filled,
+                        exit_price=price,
+                    )
             except Exception as exc:  # noqa: BLE001
                 log.warning("storage write failed for live order %s: %s", symbol, exc)
         self.state.trades_executed += 1

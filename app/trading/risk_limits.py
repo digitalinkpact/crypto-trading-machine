@@ -30,5 +30,5 @@ async def check_position_count(open_positions: int, pending_orders: int) -> bool
     Returns True if position count is within limit, False if blocked.
     """
     s = get_settings()
-    max_count = getattr(s, 'max_open_positions', 6)
+    max_count = getattr(s, 'max_open_positions', 5)
     return (open_positions + pending_orders) < max_count
