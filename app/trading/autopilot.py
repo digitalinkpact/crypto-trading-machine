@@ -660,7 +660,10 @@ class Autopilot:
                 binance_response=("SUCCESS" if submitted else "REJECTED"),
                 exception=None,
                 final_outcome=reason,
-                detail={"detail": detail},
+                detail={
+                    "detail": detail,
+                    "trace": _jsonable(entry),
+                },
             )
             if entry.get("action") == SignalAction.BUY.value:
                 log.info("[BUY_TRACE] %s %s", sym, json.dumps(_jsonable(entry), sort_keys=True))
