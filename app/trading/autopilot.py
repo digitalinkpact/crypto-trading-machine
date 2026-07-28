@@ -246,11 +246,23 @@ class Autopilot:
                     log.warning("filter load failed at tick start: %s", exc)
 
                 # 1. Risk gates — stop-loss / take-profit / trailing / max-hold.
-                #    Run BEFORE agents so we exit losers regardless of new signals.
-                try:
-                    await self._run_risk_gates()
-                except Exception as exc:  # noqa: BLE001
-                    log.exception("risk gate run failed: %s", exc)
+                #
+                # INTENTIONALLY NOT CALLED HERE ANYMORE. Risk-gate protection
+                # used to live entirely inside this once-a-minute tick, which
+                # meant a hung agent pipeline, a stalled APScheduler cron, or
+                # simply this process not running (the 2026-07-23→27 outage:
+                # the bot ran as a bare foreground process with no supervisor
+                # and had multi-day gaps with zero ticks) left every open
+                # position with NO stop-loss/take-profit/trailing coverage at
+                # all — the exact mechanism behind the PROMUSDT -40% loss.
+                #
+                # Stop-losses must never depend on the strategy tick. They now
+                # run on their own independent cadence in
+                # `app.trading.risk_loop` (default every 15s), which is
+                # started as its own asyncio task in app/main.py (and can
+                # additionally be deployed as its own OS process/systemd unit
+                # — see deploy/systemd/crypto-bot-risk.service). A BUY signal
+                # can safely wait a minute; a stop-loss cannot.
 
                 # 2. Drawdown circuit breaker.
                 try:
@@ -819,6 +831,13 @@ class Autopilot:
             )
             base_asset = symbol.removesuffix("USDT")
             free = balances.get(base_asset, Decimal("0"))
+            # Hard blocklist — never open a NEW position in these symbols,
+            # regardless of what the universe/signal pipeline produced. Exits
+            # (SELL) are never blocked here; a legacy/held position in a
+            # blocked symbol must still be sellable.
+            if sig.action == SignalAction.BUY and symbol in getattr(s, "blocked_symbols", ()):
+                _finish(symbol, "blocked_symbol", f"{symbol} is on the blocklist", submitted=False, sig=sig)
+                continue
             # Short-circuit SELL intents only when we have neither a local
             # position row nor a real free balance on the exchange.
             if sig.action == SignalAction.SELL and open_pos is None and free <= 0:
@@ -1039,7 +1058,10 @@ class Autopilot:
                         long_exposure_pct=long_exposure_pct,
                         entry_price=entry_price,
                         aggressive_mode=aggressive_mode,
-                        signal_score=int(round(float(sig.confidence) * 100)),
+                        signal_score=(
+                            int(sig.quality_score) if getattr(sig, "quality_score", 0)
+                            else int(round(float(sig.confidence) * 100))
+                        ),
                         is_pyramid=is_pyramid,
                         current_position_notional=current_position_notional,
                     )
@@ -1167,6 +1189,7 @@ class Autopilot:
                         held_symbols.add(symbol)
                         self._clear_pyramid_adds_count(symbol)
                         risk.clear_tp1(symbol)
+                        risk.clear_tp2(symbol)
                     else:
                         self._set_pyramid_adds_count(symbol, pyramid_adds + 1)
                     skip_counter["executed_buy"] += 1
@@ -1407,6 +1430,7 @@ class Autopilot:
             return
         risk.clear_hwm(symbol)
         risk.clear_tp1(symbol)
+        risk.clear_tp2(symbol)
         self._clear_pyramid_adds_count(symbol)
 
     def _aggressive_mode_active(self) -> tuple[bool, str]:

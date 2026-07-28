@@ -36,6 +36,12 @@ class Signal(BaseModel):
     rationale: str = ""
     contributing_agents: tuple[str, ...] = ()
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # Raw trade-quality score (0-110, see app/trading/strategy.py). Distinct
+    # from `confidence` (which is clamped to [0, 1] and, for a single-voter
+    # symbol, gets renormalized to 1.0 by the aggregator below) — this is the
+    # un-lossy value position sizing keys off. 0 when not produced by the
+    # quality-scoring strategy (e.g. legacy per-agent signals).
+    quality_score: int = 0
 
 
 # Higher timeframes carry more weight in cross-timeframe fusion.

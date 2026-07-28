@@ -1,11 +1,17 @@
 """Risk gates — evaluated on every tick BEFORE looking at agent signals.
 
-Five hard rules enforced here:
-  1. Hard stop-loss   (loss > stop_loss_pct          → force SELL)
-  2. Take-profit      (gain > take_profit_pct        → force SELL)
-  3. Trailing stop    (price drops trailing_stop_pct from HWM after take_profit/2 hit)
-  4. Max hold time    (entry_ts > max_hold_hours ago → force SELL)
-  5. Drawdown breaker (paper/live PnL < -drawdown_pct → halt new BUYs)
+Six hard rules enforced here:
+  1. Hard stop-loss     (loss > stop_loss_pct           → force SELL)
+  2. Take-profit 1      (gain > take_profit_1_pct       → sell 50% of stake)
+  3. Take-profit 2      (gain > take_profit_2_pct       → sell 25% of original stake)
+  4. Trailing stop      (price drops trailing_stop_pct from HWM after activation)
+  5. Max hold time      (entry_ts > max_hold_hours ago  → force SELL)
+  6. Drawdown breaker   (paper/live PnL < -drawdown_pct → halt new BUYs)
+
+The final ~25% of a winning position is deliberately never force-closed by a
+fixed profit target — once TP1+TP2 have scaled out 75% of the original stake,
+the remainder rides the trailing stop so a strong winner can keep running
+instead of being capped ("let winners run", not "more trades").
 
 Plus:
   - Volatility-scaled position sizing (size ∝ baseline / atr_pct, clamped)
@@ -14,6 +20,8 @@ Plus:
 
 Stored state:
   - kv:hwm:{symbol}  → high-water-mark price seen for the open position
+  - kv:tp1:{symbol}  → whether the +8%/50% scale-out has already fired
+  - kv:tp2:{symbol}  → whether the +15%/25% scale-out has already fired
 """
 from __future__ import annotations
 
@@ -35,6 +43,10 @@ def _hwm_key(symbol: str) -> str:
 
 def _tp1_key(symbol: str) -> str:
     return f"tp1:{symbol}"
+
+
+def _tp2_key(symbol: str) -> str:
+    return f"tp2:{symbol}"
 
 
 def update_hwm(symbol: str, price: Decimal) -> Decimal:
@@ -63,6 +75,18 @@ def tp1_taken(symbol: str) -> bool:
     return bool(storage.kv_get(_tp1_key(symbol)) or False)
 
 
+def mark_tp2_taken(symbol: str) -> None:
+    storage.kv_set(_tp2_key(symbol), True)
+
+
+def clear_tp2(symbol: str) -> None:
+    storage.kv_set(_tp2_key(symbol), None)
+
+
+def tp2_taken(symbol: str) -> bool:
+    return bool(storage.kv_get(_tp2_key(symbol)) or False)
+
+
 def get_hwm(symbol: str) -> Optional[Decimal]:
     cur = storage.kv_get(_hwm_key(symbol))
     if cur in (None, "None"):
@@ -78,7 +102,7 @@ def get_hwm(symbol: str) -> Optional[Decimal]:
 class ExitDecision:
     symbol: str
     qty: Decimal
-    reason: str  # "stop_loss" | "take_profit_1" | "take_profit_final" | "trailing_stop" | "max_hold"
+    reason: str  # "stop_loss" | "take_profit_1" | "take_profit_2" | "trailing_stop" | "max_hold"
 
 
 def evaluate_exits(
@@ -112,20 +136,35 @@ def evaluate_exits(
             out.append(ExitDecision(symbol, qty, "stop_loss"))
             continue
 
-        # 2. Final take-profit target
-        final_tp = Decimal(str(getattr(s, "final_take_profit_pct", s.take_profit_pct)))
-        if change >= final_tp:
-            out.append(ExitDecision(symbol, qty, "take_profit_final"))
-            continue
-
-        # 3. First take-profit scale-out (one-time partial sell)
-        tp1 = Decimal(str(getattr(s, "take_profit_1_pct", 0.08)))
         tp1_fraction = Decimal(str(getattr(s, "take_profit_1_fraction", 0.50)))
-        if change >= tp1 and not tp1_taken(symbol):
+        tp2_fraction = Decimal(str(getattr(s, "take_profit_2_fraction", 0.25)))
+        already_tp1 = tp1_taken(symbol)
+        # Reconstruct the ORIGINAL stake so TP2's fraction is "25% of what we
+        # first bought", not "25% of whatever happens to be left after TP1" —
+        # a fixed scale-out ladder (sell 50% @ +8%, sell 25% @ +15%, trail the
+        # final ~25%), not a shrinking-base percentage.
+        original_qty = (qty / (Decimal("1") - tp1_fraction)) if already_tp1 and tp1_fraction < 1 else qty
+
+        # 2. First take-profit scale-out (sell 50% of the stake at +8%)
+        tp1 = Decimal(str(getattr(s, "take_profit_1_pct", 0.08)))
+        if change >= tp1 and not already_tp1:
             part_qty = qty * tp1_fraction
             if part_qty > 0:
                 out.append(ExitDecision(symbol, part_qty, "take_profit_1"))
                 mark_tp1_taken(symbol)
+                continue
+
+        # 3. Second take-profit scale-out (sell another 25% of the ORIGINAL
+        #    stake at +15%). The final slice is deliberately never force-
+        #    closed by a fixed target — it rides the trailing stop below so a
+        #    strong winner can keep running instead of being capped
+        #    ("let winners run", not "more trades").
+        tp2 = Decimal(str(getattr(s, "take_profit_2_pct", 0.15)))
+        if change >= tp2 and not tp2_taken(symbol):
+            part_qty = min(qty, original_qty * tp2_fraction)
+            if part_qty > 0:
+                out.append(ExitDecision(symbol, part_qty, "take_profit_2"))
+                mark_tp2_taken(symbol)
                 continue
 
         # 4. Trailing stop (arm only after position gains the configured threshold)

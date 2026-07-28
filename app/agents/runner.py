@@ -155,18 +155,34 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
                         timeframe=Timeframe.H1,
                         action=decision.action,
                         confidence=max(0.0, min(1.0, decision.score / 100.0)),
+                        quality_score=decision.score,
                         rationale=reason,
                         contributing_agents=("profitstream_strategy",),
                     )
                 )
 
-        if raw_signals and not settings.profitstream_use_legacy_agents:
+        if not settings.profitstream_use_legacy_agents:
+            # ProfitStream is the SOLE strategy — do not fall back to the
+            # noisier legacy multi-agent ensemble just because this tick
+            # produced few or zero qualifying signals. An all-HOLD tick is the
+            # intended, healthy outcome of a stricter quality bar, not a
+            # trigger to reach for a worse strategy. (Live evidence: 2026-07-28
+            # audit found the legacy ensemble was silently producing most live
+            # trades — at a 14.6% win rate — precisely because this fallback
+            # fired on almost every tick where ProfitStream stayed quiet.)
+            # Bypass SignalAggregator here too: with at most one signal per
+            # symbol, its weighted-vote renormalization collapses confidence
+            # to 1.0 and would destroy the real 0-110 quality_score-derived
+            # confidence computed above.
+            return {sig.symbol: sig for sig in raw_signals}
+
+        if raw_signals:
             return SignalAggregator().aggregate(raw_signals)
 
-        if not raw_signals:
-            log.warning(
-                "ProfitStream produced no BUY/SELL signals; falling back to legacy agents"
-            )
+        log.warning(
+            "ProfitStream produced no BUY/SELL signals; falling back to legacy agents "
+            "(profitstream_use_legacy_agents=true)"
+        )
 
     for symbol in symbols:
         for tf in TIMEFRAMES:

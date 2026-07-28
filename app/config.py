@@ -38,6 +38,15 @@ STATIC_SYMBOLS: tuple[str, ...] = (
 # Back-compat alias — some modules import SYMBOLS directly.
 SYMBOLS = STATIC_SYMBOLS
 
+# Hard blocklist — never opened as a NEW entry regardless of how the universe
+# is sourced (static/dynamic/liquidity-ranked). Added 2026-07-28 after these
+# four accounted for the worst tail losses in the live trade history
+# (PROMUSDT -40%, HYPEUSDT -13.8%, ZECUSDT -9.3%, XLMUSDT -5.9%) — all low-
+# liquidity coins outside the approved 9-symbol universe that were only still
+# tradeable because of legacy positions predating this list. Existing risk
+# gates still close any position in these symbols; only NEW buys are blocked.
+BLOCKED_SYMBOLS: tuple[str, ...] = ("PROMUSDT", "HYPEUSDT", "ZECUSDT", "XLMUSDT")
+
 TIMEFRAMES: tuple[Timeframe, ...] = (
     Timeframe.H1,
     Timeframe.H4,
@@ -90,6 +99,7 @@ class Settings(BaseSettings):
     # `min_24h_volume` is therefore intentionally low; the spread cap plus the
     # execution-time order-book gate do the real liquidity protection.
     liquidity_pairlist_enabled: bool = False
+    blocked_symbols: tuple[str, ...] = BLOCKED_SYMBOLS
     universe_size: int = Field(50, ge=1, le=1000)
     min_24h_volume: float = Field(1_000_000.0, ge=0.0)
     max_spread_percent: float = Field(0.50, ge=0.0, le=100.0)
@@ -236,13 +246,35 @@ class Settings(BaseSettings):
     trailing_activation_pct: float = Field(0.04, ge=0.005, le=0.50)  # arm trailing after +4%
     take_profit_1_pct: float = Field(0.08, ge=0.005, le=0.50)    # scale out 50% at +8%
     take_profit_1_fraction: float = Field(0.50, ge=0.05, le=0.95)
-    final_take_profit_pct: float = Field(0.15, ge=0.01, le=1.0)
+    # Second scale-out: sell another 25% of the ORIGINAL stake at +15%. The
+    # final ~25% is deliberately never force-closed by a fixed target — it
+    # rides the trailing stop below so a strong winner can keep running
+    # instead of being capped at a fixed take-profit ("let winners run").
+    take_profit_2_pct: float = Field(0.15, ge=0.01, le=1.0)
+    take_profit_2_fraction: float = Field(0.25, ge=0.05, le=0.95)
+    final_take_profit_pct: float = Field(0.15, ge=0.01, le=1.0)  # back-compat alias, unused by the TP2 ladder
     max_hold_hours: int = Field(96, ge=1, le=10000)              # force-exit after 4 days
     drawdown_circuit_breaker_pct: float = Field(0.10, ge=0.01, le=0.50)  # halt new BUYs after -10%
 
     # Entry gates
     min_signal_confidence: float = Field(0.65, ge=0.0, le=1.0)
     buy_cooldown_minutes: int = Field(45, ge=0, le=1440)
+
+    # Multi-timeframe trend-agreement gate (app/trading/strategy.py). BUYs are
+    # hard-rejected — regardless of score — unless the symbol's own 15m, 1h,
+    # and 4h trend all agree with the trade direction. This is the single
+    # biggest lever for "fewer, better trades": most historical losses came
+    # from entries where higher timeframes disagreed with the entry signal.
+    mtf_confirmation_enabled: bool = True
+
+    # Independent risk-manager loop cadence (seconds). Stop-loss / trailing /
+    # take-profit checks run on THIS cadence, decoupled from the once-a-minute
+    # agent/strategy tick — see app/trading/risk_loop.py. A hung scheduler or a
+    # crashing agent must never stop stop-losses from firing.
+    risk_manager_loop_seconds: int = Field(15, ge=5, le=300)
+    # Set False when risk_loop.py is deployed as its OWN systemd-managed
+    # process (crypto-bot-risk.service) to avoid running the loop twice.
+    risk_loop_in_process_enabled: bool = True
 
     # ProfitStream strategy controls.
     profitstream_enabled: bool = True
@@ -380,16 +412,33 @@ class Settings(BaseSettings):
 
     # Risk manager controls.
     risk_per_trade_pct: float = Field(0.01, ge=0.001, le=0.10)
-    # High-conviction dynamic notional sizing in USDT.
-    conviction_min_score: int = Field(65, ge=0, le=100)
-    conviction_mid_score: int = Field(76, ge=0, le=100)
-    conviction_high_score: int = Field(86, ge=0, le=100)
+    # High-conviction dynamic notional sizing in USDT, keyed off the
+    # trade-quality score (0-110, see app/trading/strategy.py). Below
+    # `conviction_min_score` the trade is REJECTED outright (notional=0) —
+    # there is no minimum-size fallback anymore. Three tiers above that:
+    #   [min_score, mid_score)  -> conviction_base_usdt  ($10)
+    #   [mid_score, high_score) -> conviction_mid_usdt   ($20)
+    #   [high_score, ...)       -> conviction_max_usdt   ($35)
+    # The highest-quality setups get the most capital; weak setups get none.
+    conviction_min_score: int = Field(65, ge=0, le=110)
+    conviction_mid_score: int = Field(80, ge=0, le=110)
+    conviction_high_score: int = Field(90, ge=0, le=110)
     conviction_base_usdt: float = Field(10.0, ge=1.0, le=10_000.0)
     conviction_mid_usdt: float = Field(20.0, ge=1.0, le=10_000.0)
     conviction_high_usdt: float = Field(30.0, ge=1.0, le=10_000.0)
     conviction_max_usdt: float = Field(35.0, ge=1.0, le=10_000.0)
+    # Two-tier consecutive-loss circuit breaker (streak measured on CLOSED
+    # trades for this mode, most-recent-first, reset by any winning trade):
+    #   >= loss_streak_pause_count (3) consecutive losses -> block new BUYs
+    #      for loss_streak_pause_minutes (30) from the last loss.
+    #   >= loss_halt_count (5) consecutive losses -> block new BUYs for
+    #      loss_halt_minutes (60) from the last loss (a longer, harder pause).
+    # In both tiers, SELLS and risk-gate exits are never blocked — only new
+    # entries. See RiskManager._loss_cooldown_active.
     loss_streak_pause_count: int = Field(3, ge=1, le=20)
-    loss_streak_pause_minutes: int = Field(60, ge=1, le=1440)
+    loss_streak_pause_minutes: int = Field(30, ge=1, le=1440)
+    loss_halt_count: int = Field(5, ge=1, le=50)
+    loss_halt_minutes: int = Field(60, ge=1, le=1440)
 
     # ── Health monitoring / auto-recovery escalation ──────────────────
     # The background health loop (app/trading/health.py) checks scheduler,

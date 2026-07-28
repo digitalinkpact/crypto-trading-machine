@@ -16,6 +16,7 @@ from app.scheduler import build_scheduler
 from app.storage import storage
 from app.trading.paper import paper_exchange
 from app.trading.health import startup_report
+from app.trading import risk_loop
 from app.trading.watchdog import start_health_monitor, stop_health_monitor
 
 log = get_logger(__name__)
@@ -62,6 +63,15 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001
         log.warning("live price stream start failed: %s", exc)
 
+    # Independent risk-management loop (stop-loss/take-profit/trailing), fully
+    # decoupled from the scheduler/strategy tick — see app/trading/risk_loop.py
+    # for why. Must start before/independent of the scheduler so a stuck
+    # scheduler job can never block stop-losses from firing.
+    try:
+        risk_loop.start()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("independent risk loop start failed: %s", exc)
+
     scheduler = None
     try:
         scheduler = build_scheduler()
@@ -83,6 +93,10 @@ async def lifespan(app: FastAPI):
             await stop_health_monitor()
         except Exception as exc:  # noqa: BLE001
             log.warning("health monitor stop failed: %s", exc)
+        try:
+            await risk_loop.stop()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("independent risk loop stop failed: %s", exc)
         try:
             await live_prices.stop()
         except Exception as exc:  # noqa: BLE001

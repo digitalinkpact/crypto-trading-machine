@@ -267,6 +267,33 @@ async def _health_loop() -> None:
             else:
                 status["trade_loop_alive"] = not autopilot.state.running
 
+            # Independent risk-management loop (app/trading/risk_loop.py) —
+            # stop-loss/take-profit/trailing protection now runs completely
+            # decoupled from this process's scheduler/trade loop, so it needs
+            # its own liveness check here rather than piggy-backing on
+            # trade_loop_alive above. Heartbeat is a plain unix-epoch float
+            # written every successful iteration (default cadence 15s); allow
+            # a generous multiple before calling it stale to avoid false
+            # positives from a single slow tick.
+            try:
+                heartbeat = storage.kv_get("risk_loop_last_run")
+                risk_loop_max_age = max(60, int(s.risk_manager_loop_seconds) * 6)
+                if heartbeat is None:
+                    status["risk_loop_alive"] = False
+                else:
+                    age = time.time() - float(heartbeat)
+                    status["risk_loop_alive"] = age <= risk_loop_max_age
+                    status["risk_loop_age_s"] = round(age, 1)
+                if not status["risk_loop_alive"]:
+                    log.warning(
+                        "health check: independent risk loop heartbeat missing/stale "
+                        "(age=%ss, max=%ss) — stop-loss/take-profit protection may not "
+                        "be running", status.get("risk_loop_age_s"), risk_loop_max_age,
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.exception("health check: risk-loop heartbeat check failed: %s", e)
+                status["risk_loop_alive"] = False
+
             # ── extended detection: duplicates, failed orders, open orders,
             #    portfolio discrepancy, memory, cpu ────────────────────────
             try:
@@ -354,6 +381,7 @@ async def _health_loop() -> None:
                     "binance_alive": not status["binance_alive"],
                     "database_alive": not status["database_alive"],
                     "trade_loop_alive": not status["trade_loop_alive"],
+                    "risk_loop_alive": not status["risk_loop_alive"],
                     "duplicate_orders": dup,
                     "duplicate_positions": dup_pos,
                     "order_failures": order_fail,

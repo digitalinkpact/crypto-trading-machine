@@ -10,7 +10,12 @@ from app.signals import Signal, SignalAction
 
 
 @pytest.mark.asyncio
-async def test_run_all_agents_falls_back_when_profitstream_is_empty(monkeypatch):
+async def test_run_all_agents_does_not_fall_back_when_legacy_disabled(monkeypatch):
+    """When ProfitStream is the sole configured strategy
+    (profitstream_use_legacy_agents=False), an empty/all-HOLD ProfitStream
+    pass must NOT fall back to the legacy agent ensemble — that fallback bug
+    let the legacy (worse) agents dominate live trading despite being
+    explicitly disabled. An empty result is the correct, healthy outcome."""
     from app.agents import runner
 
     async def _symbols():
@@ -78,6 +83,87 @@ async def test_run_all_agents_falls_back_when_profitstream_is_empty(monkeypatch)
     class _Settings:
         profitstream_enabled = True
         profitstream_use_legacy_agents = False
+        ml_gate_threshold = 0.5
+        paper_trading = True
+
+    monkeypatch.setattr(runner, "get_settings", lambda: _Settings())
+
+    signals = await runner.run_all_agents(use_llm=False)
+
+    assert signals == {}
+
+
+@pytest.mark.asyncio
+async def test_run_all_agents_falls_back_when_legacy_explicitly_enabled(monkeypatch):
+    """The legacy ensemble is still reachable, but only as an explicit opt-in
+    (profitstream_use_legacy_agents=True) — never as an automatic fallback."""
+    from app.agents import runner
+
+    async def _symbols():
+        return ["BTCUSDT"]
+
+    class _EmptyProfitStream:
+        async def analyze_symbol(self, symbol: str, *, mode: str):
+            return SimpleNamespace(
+                action=SignalAction.HOLD,
+                score=0,
+                reasons=["insufficient_history"],
+                indicators={"symbol": symbol},
+            )
+
+    class _LegacySignalAgent:
+        name = "legacy_test_agent"
+
+        def analyze(self, ctx):
+            return Signal(
+                agent=self.name,
+                symbol=ctx.symbol,
+                timeframe=ctx.timeframe,
+                action=SignalAction.BUY,
+                confidence=0.9,
+                rationale="fallback path",
+                contributing_agents=(self.name,),
+            )
+
+    class _DummyRepo:
+        async def get(self, symbol, tf, refresh=False):
+            idx = pd.date_range("2026-07-20", periods=40, freq="min", tz="UTC")
+            return pd.DataFrame(
+                {
+                    "open": [100.0] * 40,
+                    "high": [101.0] * 40,
+                    "low": [99.0] * 40,
+                    "close": [100.5] * 40,
+                    "volume": [10_000.0] * 40,
+                },
+                index=idx,
+            )
+
+    class _DummyClassifier:
+        def classify(self, df):
+            return "trend"
+
+    class _DummyAggregator:
+        def aggregate(self, signals):
+            out = {}
+            for sig in signals:
+                out[sig.symbol] = sig
+            return out
+
+    monkeypatch.setattr(runner, "get_symbols", _symbols)
+    monkeypatch.setattr(runner, "ProfitStreamStrategy", _EmptyProfitStream)
+    monkeypatch.setattr(runner, "OHLCVRepository", _DummyRepo)
+    monkeypatch.setattr(runner, "RegimeClassifier", _DummyClassifier)
+    monkeypatch.setattr(runner, "SignalAggregator", _DummyAggregator)
+    monkeypatch.setattr(runner, "SYNC_AGENTS", [_LegacySignalAgent()])
+    monkeypatch.setattr(runner, "LLM_AGENT", _LegacySignalAgent())
+    monkeypatch.setattr(runner, "AGENTS", [_LegacySignalAgent()])
+    monkeypatch.setattr(runner, "TIMEFRAMES", [Timeframe.D1])
+    monkeypatch.setattr(runner, "add_indicators", lambda df: df)
+
+    class _Settings:
+        profitstream_enabled = True
+        profitstream_use_legacy_agents = True
         ml_gate_threshold = 0.5
         paper_trading = True
 

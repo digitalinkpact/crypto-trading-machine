@@ -49,12 +49,13 @@ class ProfitStreamStrategy:
             df_5m = await self._candles(symbol, "5m", 240)
             df_15m = await self._candles(symbol, "15m", 240)
             df_1h = await self._candles(symbol, "1h", 240)
+            df_4h = await self._candles(symbol, "4h", 240)
             btc_1h = await self._candles("BTCUSDT", "1h", 240)
         except Exception as exc:  # noqa: BLE001
             reasons.append(f"data_unavailable:{exc}")
             return StrategyDecision(symbol, SignalAction.HOLD, 0, reasons, indicators)
 
-        if min(len(df_1m), len(df_5m), len(df_15m), len(df_1h), len(btc_1h)) < 60:
+        if min(len(df_1m), len(df_5m), len(df_15m), len(df_1h), len(df_4h), len(btc_1h)) < 60:
             reasons.append("insufficient_history")
             return StrategyDecision(symbol, SignalAction.HOLD, 0, reasons, indicators)
 
@@ -73,6 +74,17 @@ class ProfitStreamStrategy:
         macd_bull = self._macd_bull(df_15m)
         btc_aligned = self._btc_trend_aligned(btc_1h)
 
+        # Multi-timeframe trend agreement on the SYMBOL ITSELF (not just BTC).
+        # 15m / 1h / 4h must all agree with the long direction for the entry
+        # to even be eligible — a hard gate, not just a scoring bonus. This is
+        # the main lever for "fewer, better trades": most historical losses
+        # came from entries where the higher timeframes disagreed with the
+        # trigger timeframe (buying a 1m bounce inside a 1h/4h downtrend).
+        trend_15m_up = self._trend_up(df_15m)
+        trend_1h_up = self._trend_up(df_1h)
+        trend_4h_up = self._trend_up(df_4h)
+        mtf_aligned = trend_15m_up and trend_1h_up and trend_4h_up
+
         indicators.update(
             {
                 "ema_cross_1m": ema_cross,
@@ -87,11 +99,23 @@ class ProfitStreamStrategy:
                 "macd_status": "bull" if macd_bull else "bear_or_flat",
                 "btc_aligned_1h": btc_aligned,
                 "btc_trend_alignment": "aligned" if btc_aligned else "not_aligned",
+                "trend_15m_up": trend_15m_up,
+                "trend_1h_up": trend_1h_up,
+                "trend_4h_up": trend_4h_up,
+                "mtf_aligned": mtf_aligned,
             }
         )
 
         # Market filters.
         filt_ok = True
+
+        if s.mtf_confirmation_enabled and not mtf_aligned:
+            filt_ok = False
+            reasons.append(
+                f"mtf_trend_conflict:15m={'up' if trend_15m_up else 'down'}"
+                f",1h={'up' if trend_1h_up else 'down'}"
+                f",4h={'up' if trend_4h_up else 'down'}"
+            )
 
         btc_vol = self._btc_volatility(btc_1h)
         indicators["btc_volatility_1h"] = btc_vol
@@ -119,14 +143,19 @@ class ProfitStreamStrategy:
             filt_ok = False
             reasons.append(f"spread_wide:{spread_pct:.4%}>0.2500%")
 
-        # Weighted score 0-100.
+        # Weighted trade-quality score, 0-110 points:
+        #   25 EMA cross + 20 MACD + 15 RSI + 15 BTC alignment
+        #   + 15 (1h trend) + 10 (4h trend) + 10 (volume) = 110 possible.
+        # Position sizing (RiskManager._conviction_notional) is tiered off
+        # this raw score: <65 no buy, 65-80 -> $10, 80-90 -> $20, 90+ -> $35.
         score = 0
         score += 25 if ema_cross else 0
-        score += 15 if rsi_ok else 0
-        score += 15 if vol_spike else 0
         score += 20 if macd_bull else 0
+        score += 15 if rsi_ok else 0
         score += 15 if btc_aligned else 0
-        score += 10 if filt_ok else 0
+        score += 15 if trend_1h_up else 0
+        score += 10 if trend_4h_up else 0
+        score += 10 if vol_spike else 0
 
         if not ema_cross:
             reasons.append("ema9_not_crossing_ema21")
@@ -214,6 +243,19 @@ class ProfitStreamStrategy:
 
     def _btc_trend_aligned(self, btc_1h: pd.DataFrame) -> bool:
         out = btc_1h.dropna()
+        if len(out) < 60:
+            return False
+        ema20 = float(out.iloc[-1]["ema_20"])
+        ema50 = float(out.iloc[-1]["ema_50"])
+        close = float(out.iloc[-1]["close"])
+        return close > ema50 and ema20 > ema50
+
+    def _trend_up(self, df: pd.DataFrame) -> bool:
+        """Generic up-trend check for any timeframe: close above the 50-EMA
+        and the 20-EMA above the 50-EMA (same rule as `_btc_trend_aligned`,
+        applied to the traded symbol itself on 15m/1h/4h for the
+        multi-timeframe agreement gate)."""
+        out = df.dropna()
         if len(out) < 60:
             return False
         ema20 = float(out.iloc[-1]["ema_20"])

@@ -40,15 +40,42 @@ def test_take_profit_triggers():
     assert exits[0].reason == "take_profit_1"
 
 
-def test_final_take_profit_triggers():
-    """Position up past the final take-profit target should fully exit."""
-    positions = [_pos("BTCUSDT", 1.0, 100.0)]
-    prices = {"BTCUSDT": Decimal("116")}  # +16% (past the 15% final target)
+def test_take_profit_2_triggers_after_tp1():
+    """After TP1 has scaled out 50%, a further move past the TP2 band (+15%)
+    should sell another 25% of the ORIGINAL stake, leaving the rest to the
+    trailing stop (no more fixed final-target full close)."""
+    # Simulate the post-TP1 state: 1.0 original qty -> 0.5 remaining.
+    positions = [_pos("BTCUSDT", 0.5, 100.0)]
+    prices = {"BTCUSDT": Decimal("116")}  # +16% (past the 15% TP2 trigger)
     risk.clear_hwm("BTCUSDT")
     risk.clear_tp1("BTCUSDT")
+    risk.clear_tp2("BTCUSDT")
+    risk.mark_tp1_taken("BTCUSDT")
     exits = risk.evaluate_exits(positions=positions, prices=prices)
     assert len(exits) == 1
-    assert exits[0].reason == "take_profit_final"
+    assert exits[0].reason == "take_profit_2"
+    # 25% of the original 1.0 stake, back-derived from the 0.5 remaining
+    # after a 50% TP1 scale-out.
+    assert exits[0].qty == Decimal("0.25")
+    risk.clear_tp1("BTCUSDT")
+    risk.clear_tp2("BTCUSDT")
+
+
+def test_remainder_after_tp1_and_tp2_rides_trailing_stop():
+    """Once both scale-outs have fired, the remaining ~25% should NOT be
+    force-closed by any fixed profit target — only stop-loss/trailing/max-hold
+    apply to it from here."""
+    positions = [_pos("BTCUSDT", 0.25, 100.0)]
+    prices = {"BTCUSDT": Decimal("130")}  # well past both TP1/TP2 bands
+    risk.clear_hwm("BTCUSDT")
+    risk.clear_tp1("BTCUSDT")
+    risk.clear_tp2("BTCUSDT")
+    risk.mark_tp1_taken("BTCUSDT")
+    risk.mark_tp2_taken("BTCUSDT")
+    exits = risk.evaluate_exits(positions=positions, prices=prices)
+    assert exits == []
+    risk.clear_tp1("BTCUSDT")
+    risk.clear_tp2("BTCUSDT")
 
 
 def test_no_exit_when_within_band():

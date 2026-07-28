@@ -1,0 +1,20 @@
+[Unit]
+Description=Crypto Trading Machine — Independent Risk Manager (stop-loss/take-profit/trailing)
+# Runs alongside (NOT instead of) crypto-bot.service. Only enable this unit
+# if app/config.py's risk_loop_in_process_enabled is set to False — otherwise
+# the main app process already runs the same loop in-process and you'd be
+# running it twice (harmless due to the kv-backed cross-process lock in
+# app/trading/risk_loop.py, but pointless).
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/crypto-trading-machine
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/crypto-trading-machine/.venv/bin/python -m app.trading.risk_loop
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
