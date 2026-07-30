@@ -32,7 +32,6 @@ class RiskManager:
         long_exposure_pct: float,
         entry_price: Decimal,
         aggressive_mode: bool,
-        signal_score: int = 0,
         is_pyramid: bool = False,
         current_position_notional: Decimal | None = None,
     ) -> EntryRiskDecision:
@@ -69,47 +68,17 @@ class RiskManager:
         kelly_cap_notional = total_equity_usdt * Decimal(str(s.kelly_fraction_cap))
         position_cap_notional = total_equity_usdt * Decimal(str(position_pct))
 
-        conviction_notional = self._conviction_notional(signal_score)
-
         if is_pyramid:
             pyramid_notional = (current_position_notional or Decimal("0")) * Decimal(str(getattr(s, "pyramid_add_fraction", 0.50)))
             notional = min(pyramid_notional, kelly_cap_notional, position_cap_notional)
         else:
-            notional = min(conviction_notional, risk_based_notional, kelly_cap_notional, position_cap_notional)
+            notional = min(risk_based_notional, kelly_cap_notional, position_cap_notional)
         if notional <= 0:
             return EntryRiskDecision(False, "non_positive_notional", Decimal("0"))
 
         return EntryRiskDecision(True, "ok", notional)
 
-    def _conviction_notional(self, signal_score: int) -> Decimal:
-        """Tiered position sizing off the raw 0-110 trade-quality score.
-
-        Below `conviction_min_score` the setup doesn't clear the quality bar
-        at all — this returns 0, which `evaluate_entry` treats as a hard
-        rejection (no minimum-size fallback). The highest-quality setups get
-        the most capital; everything else gets nothing.
-        """
-        s = get_settings()
-        score = max(0, int(signal_score))
-        if score < int(getattr(s, "conviction_min_score", 65)):
-            return Decimal("0")
-        if score >= int(getattr(s, "conviction_high_score", 90)):
-            return Decimal(str(getattr(s, "conviction_max_usdt", 35.0)))
-        if score >= int(getattr(s, "conviction_mid_score", 80)):
-            return Decimal(str(getattr(s, "conviction_mid_usdt", 20.0)))
-        return Decimal(str(getattr(s, "conviction_base_usdt", 10.0)))
-
     def _loss_cooldown_active(self, mode: str) -> tuple[bool, str]:
-        """Two-tier consecutive-loss circuit breaker.
-
-        Streak is counted backwards from the most recent CLOSED trade in this
-        mode and stops at the first winner. A deeper streak earns a longer,
-        harder pause:
-          >= loss_halt_count (5)         -> loss_halt_minutes (60)
-          >= loss_streak_pause_count (3) -> loss_streak_pause_minutes (30)
-        Only NEW entries are blocked here — SELLs and risk-gate exits are
-        evaluated on a completely separate path and are never affected.
-        """
         s = get_settings()
         trades = [t for t in storage.closed_trades(limit=100) if t.get("mode") == mode]
         if not trades:
@@ -131,20 +100,14 @@ class RiskManager:
                 continue
             break
 
-        if streak >= s.loss_halt_count:
-            pause_minutes = s.loss_halt_minutes
-            tier = "loss_halt"
-        elif streak >= s.loss_streak_pause_count:
-            pause_minutes = s.loss_streak_pause_minutes
-            tier = "loss_streak_pause"
-        else:
+        if streak < s.loss_streak_pause_count:
             return False, "ok"
 
         if latest_loss_ts is None:
-            return True, f"{tier}:streak={streak}"
+            return True, f"loss_streak_pause:streak={streak}"
 
-        resume_at = latest_loss_ts + timedelta(minutes=pause_minutes)
+        resume_at = latest_loss_ts + timedelta(minutes=s.loss_streak_pause_minutes)
         if datetime.now(timezone.utc) < resume_at:
-            return True, f"{tier}:streak={streak}:resume_at={resume_at.isoformat()}"
+            return True, f"loss_streak_pause:streak={streak}:resume_at={resume_at.isoformat()}"
 
         return False, "ok"

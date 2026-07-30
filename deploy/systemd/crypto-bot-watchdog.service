@@ -1,6 +1,7 @@
 [Unit]
 Description=Crypto Trading Machine watchdog (restarts crypto-bot if the autopilot scheduler stalls)
-After=network.target crypto-bot.service
+Wants=network-online.target
+After=network-online.target crypto-bot.service
 
 [Service]
 Type=oneshot

@@ -120,6 +120,35 @@ async def test_trade_fees_raises_when_missing(client):
         await client.trade_fees()
 
 
+def test_order_from_raw_reconstructs_filled_order():
+    raw = {
+        "status": "FILLED",
+        "orderId": 123,
+        "executedQty": "2",
+        "fills": [{"price": "100", "qty": "1"}, {"price": "102", "qty": "1"}],
+    }
+    order = BinanceUSClient.order_from_raw(
+        symbol="BTCUSDT",
+        side=OrderSide.BUY,
+        type=OrderType.MARKET,
+        quantity=Decimal("2"),
+        client_order_id="ctm-test-raw",
+        raw=raw,
+    )
+    assert order.status is OrderStatus.FILLED
+    assert order.exchange_order_id == "123"
+    assert order.filled_quantity == Decimal("2")
+    assert order.avg_fill_price == Decimal("101")
+
+
+@pytest.mark.asyncio
+async def test_get_order_by_client_id_maps_unknown_order_to_confirmed_absent(client):
+    client._spot.get_order.side_effect = RuntimeError("APIError(code=-2013): Order does not exist")
+    outcome, raw = await client.get_order_by_client_id("BTCUSDT", "ctm-missing")
+    assert outcome == "confirmed_absent"
+    assert raw is None
+
+
 def _filters_with(step: str, min_qty: str = "0"):
     from app.exchange.filters import SymbolFilters
 

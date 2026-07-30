@@ -5,16 +5,22 @@ Description=Crypto Trading Machine — Independent Risk Manager (stop-loss/take-
 # the main app process already runs the same loop in-process and you'd be
 # running it twice (harmless due to the kv-backed cross-process lock in
 # app/trading/risk_loop.py, but pointless).
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/opt/crypto-trading-machine
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/opt/crypto-trading-machine/.env
 ExecStart=/opt/crypto-trading-machine/.venv/bin/python -m app.trading.risk_loop
 Restart=always
-RestartSec=5
+RestartSec=3
+TimeoutStartSec=30
+TimeoutStopSec=30
+KillSignal=SIGINT
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target

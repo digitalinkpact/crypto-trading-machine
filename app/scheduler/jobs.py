@@ -1,6 +1,7 @@
 """Scheduler wiring. Single AsyncIOScheduler shared by the FastAPI app."""
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -39,7 +40,12 @@ async def refresh_market_data() -> None:
 
 async def autopilot_tick() -> None:
     """Run agents and execute signals only when the user has hit Start."""
-    await autopilot.tick()
+    timeout_s = max(5, int(get_settings().autopilot_tick_timeout_seconds))
+    try:
+        await asyncio.wait_for(autopilot.tick(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        autopilot.state.last_error = f"autopilot tick timed out after {timeout_s}s"
+        log.critical("autopilot tick timed out after %ss", timeout_s)
 
 
 async def equity_snapshot() -> None:

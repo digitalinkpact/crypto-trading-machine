@@ -146,6 +146,57 @@ def _maybe_clear_emergency_halt() -> None:
     )
 
 
+def engage_tick_protection(reason: str, *, detail: str = "") -> None:
+    """Persist tick-stall protection state so restarts keep BUYs blocked."""
+    existing = storage.kv_get("tick_protection") or {}
+    if isinstance(existing, dict) and existing.get("active"):
+        return
+    storage.kv_set(
+        "tick_protection",
+        {
+            "active": True,
+            "since": _now_iso(),
+            "reason": reason,
+            "detail": detail,
+            "auto": True,
+        },
+    )
+    log.critical("TICK PROTECTION ENGAGED — %s %s", reason, detail)
+
+
+def _maybe_clear_tick_protection() -> None:
+    existing = storage.kv_get("tick_protection") or {}
+    if not isinstance(existing, dict) or not existing.get("active"):
+        return
+    existing["active"] = False
+    existing["cleared_at"] = _now_iso()
+    storage.kv_set("tick_protection", existing)
+    log.warning("TICK PROTECTION CLEARED — healthy recovery verified")
+
+
+def _record_component_heartbeats(status: dict) -> None:
+    """Persist heartbeat status for critical runtime components."""
+    components = {
+        "scheduler": bool(status.get("scheduler_alive")),
+        "websocket": bool(status.get("websocket_alive")) and not bool(status.get("stale_price", False)),
+        "watchdog": True,
+        "risk_manager": bool(status.get("risk_loop_alive")),
+        "tick_execution": bool(status.get("trade_loop_alive")),
+        "api_connectivity": bool(status.get("binance_alive")),
+    }
+    for name, healthy in components.items():
+        storage.record_component_heartbeat(
+            component=name,
+            healthy=healthy,
+            detail={
+                "timestamp": status.get("timestamp"),
+                "actions": status.get("actions", []),
+                "emergency_halt": status.get("emergency_halt"),
+                "emergency_halt_level": status.get("emergency_halt_level"),
+            },
+        )
+
+
 async def _verify_safe_to_resume(mode: str) -> tuple[bool, str]:
     """Before actually resuming trading after an emergency halt, explicitly
     re-verify balances, positions, and open orders are all readable and
@@ -257,8 +308,30 @@ async def _health_loop() -> None:
             last_tick = autopilot.state.last_tick_at
             if autopilot.state.running and last_tick is not None:
                 age = (datetime.now(timezone.utc) - last_tick).total_seconds()
-                status["trade_loop_alive"] = age <= 1800
-                if age > 1800 and _SCHEDULER_REF is not None:
+                stale_after = int(s.health_tick_stale_seconds)
+                status["trade_loop_alive"] = age <= stale_after
+                status["trade_loop_age_s"] = round(age, 1)
+                if age > stale_after:
+                    detail = f"last_tick_age={age:.1f}s exceeds {stale_after}s"
+                    trigger_emergency_halt(
+                        f"trade loop stale: {detail}",
+                        level="new_entries_blocked",
+                    )
+                    engage_tick_protection("trade_loop_stale", detail=detail)
+                    status["actions"].append("tick_protection_engaged")
+                    try:
+                        await autopilot._run_risk_gates()
+                        status["actions"].append("ran_emergency_risk_gates")
+                    except Exception as e:  # noqa: BLE001
+                        log.exception("health check: emergency risk-gate run failed: %s", e)
+                    try:
+                        from app.trading.reconcile import reconcile_positions
+
+                        rec = await reconcile_positions(mode=autopilot.state.mode)
+                        status["actions"].append(f"reconciled_positions:{rec}")
+                    except Exception as e:  # noqa: BLE001
+                        log.exception("health check: emergency reconcile failed: %s", e)
+                if age > stale_after and _SCHEDULER_REF is not None:
                     try:
                         _SCHEDULER_REF.wakeup()
                         status["actions"].append("nudged_scheduler_wakeup")
@@ -406,13 +479,15 @@ async def _health_loop() -> None:
                     _HEALTHY_STREAK += 1
                     if _HEALTHY_STREAK >= s.emergency_halt_auto_clear_cycles:
                         halt = storage.kv_get("emergency_halt") or {}
-                        if halt.get("active"):
+                        tick_protection = storage.kv_get("tick_protection") or {}
+                        if halt.get("active") or tick_protection.get("active"):
                             # "verify balances / verify positions / resume
                             # trading safely" — one real check, not just a
                             # streak counter, before actually resuming.
                             safe, detail = await _verify_safe_to_resume(autopilot.state.mode)
                             if safe:
                                 _maybe_clear_emergency_halt()
+                                _maybe_clear_tick_protection()
                                 log.warning("health recovery: RESUMING TRADING — %s", detail)
                             else:
                                 log.critical(
@@ -444,6 +519,11 @@ async def _health_loop() -> None:
                 status["last_healthy_at"] = _LAST_HEALTHY_AT
             except Exception as e:  # noqa: BLE001
                 log.exception("health check: escalation ladder failed: %s", e)
+
+            try:
+                _record_component_heartbeats(status)
+            except Exception as e:  # noqa: BLE001
+                log.exception("health check: heartbeat persistence failed: %s", e)
 
             try:
                 storage.kv_set("health_status", status)

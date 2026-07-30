@@ -78,3 +78,18 @@ def test_positions_are_isolated_by_mode(tmp_path):
     remaining = s.all_positions()
     assert len(remaining) == 1
     assert remaining[0]["mode"] == "paper"
+
+
+def test_component_heartbeat_upsert_and_readback(tmp_path):
+    s = _fresh_storage(tmp_path)
+
+    s.record_component_heartbeat(component="scheduler", healthy=True, detail={"a": 1})
+    s.record_component_heartbeat(component="scheduler", healthy=False, detail={"a": 2})
+    s.record_component_heartbeat(component="websocket", healthy=True, detail={"b": "ok"})
+
+    heartbeats = s.get_component_heartbeats()
+    by_name = {h["component"]: h for h in heartbeats}
+
+    assert by_name["scheduler"]["healthy"] is False
+    assert by_name["scheduler"]["detail"]["a"] == 2
+    assert by_name["websocket"]["healthy"] is True
