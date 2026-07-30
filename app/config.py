@@ -273,7 +273,7 @@ class Settings(BaseSettings):
     # net-negative to net-positive and caps the bear-market drawdown. Spot is
     # long-only, so there is no edge to capture while the market bleeds — sit
     # in cash instead. FAIL-OPEN: missing BTC data always allows trading.
-    market_regime_gate_enabled: bool = True
+    market_regime_gate_enabled: bool = False
 
     # Agent thresholds (tunable without code change)
     rsi_oversold: int = Field(25, ge=5, le=50)                   # was 30

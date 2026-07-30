@@ -42,6 +42,12 @@ def test_spread_gate_settings_can_be_relaxed(monkeypatch):
     assert s.aggressive_max_spread_pct == 0.0030
 
 
+def test_market_regime_gate_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("MARKET_REGIME_GATE_ENABLED", "false")
+    s = Settings(_env_file=None)
+    assert s.market_regime_gate_enabled is False
+
+
 def test_live_mode_forces_live_flags():
     s = Settings(_env_file=None, live_mode=True, paper_trading=True, dry_run=True)
     assert s.live_mode is True
