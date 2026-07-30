@@ -60,6 +60,14 @@ def test_tick_lock_expires(tmp_path):
     assert s.try_acquire_lock("autopilot_tick", ttl_seconds=300, owner="proc-b") is True
 
 
+def test_tick_lock_releases_when_owner_process_is_dead(tmp_path):
+    s = _fresh_storage(tmp_path)
+    assert s.try_acquire_lock("autopilot_tick", ttl_seconds=300, owner="999999999-dead") is True
+    # A lock left behind by a dead process should be treated as stale and
+    # recoverable immediately.
+    assert s.try_acquire_lock("autopilot_tick", ttl_seconds=300, owner="proc-b") is True
+
+
 def test_positions_are_isolated_by_mode(tmp_path):
     s = _fresh_storage(tmp_path)
 

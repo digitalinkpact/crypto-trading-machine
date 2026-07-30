@@ -6,6 +6,7 @@ file lives under `data/trading.db` next to the OHLCV cache.
 from __future__ import annotations
 
 import json
+import os
 import pickle
 import sqlite3
 import threading
@@ -216,6 +217,33 @@ def _f(x: Any) -> float:
     return float(x)
 
 
+def _owner_is_alive(owner: str | None) -> bool:
+    """Best-effort process liveness check for lock owners.
+
+    The lock owner is stored as ``<pid>-<random>`` in the autopilot/risk-loop
+    mutexes. If the process has died, the stale row should be treated as free so
+    a restarted app can recover immediately rather than waiting for the lease
+    TTL to expire.
+    """
+    if not owner:
+        return False
+    prefix = owner.split("-", 1)[0]
+    if not prefix.isdigit():
+        # Non-pid owners (e.g. a UUID-ish string or explicit manual owner) are
+        # treated as alive by default so we don't incorrectly steal a lock from
+        # a legitimate, non-PID-based owner.
+        return True
+    try:
+        os.kill(int(prefix), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 class Storage:
     """Thread-safe SQLite helper. Synchronous; call from async via to_thread."""
 
@@ -342,9 +370,12 @@ class Storage:
                 if row:
                     try:
                         data = json.loads(row["value"])
-                        if float(data.get("expires", 0)) > now and data.get("owner") != owner:
-                            c.execute("COMMIT")
-                            return False
+                        existing_owner = data.get("owner")
+                        lease_expires = float(data.get("expires", 0))
+                        if lease_expires > now and existing_owner != owner:
+                            if _owner_is_alive(existing_owner):
+                                c.execute("COMMIT")
+                                return False
                     except (json.JSONDecodeError, ValueError, TypeError):
                         pass  # corrupt lock row — treat as free
                 payload = json.dumps({"owner": owner, "expires": now + ttl_seconds})
