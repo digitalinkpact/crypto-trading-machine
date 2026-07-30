@@ -205,10 +205,15 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _apply_live_mode_override(self) -> "Settings":
-        """If LIVE_MODE=true in .env, disable all safety toggles."""
+        """If LIVE_MODE=true in .env, disable safety gates that block real execution."""
         if self.live_mode:
             self.paper_trading = False
             self.dry_run = False
+            self.ml_gate_enabled = False
+            self.max_open_positions = 25
+            self.aggressive_max_open_positions = 25
+            self.rollback_max_open_positions = 25
+            self.max_long_exposure_pct = 1.0
         return self
 
     # Risk caps — fraction-of-equity, single source of truth for sizing/exposure.
