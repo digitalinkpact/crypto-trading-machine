@@ -48,6 +48,12 @@ def test_market_regime_gate_can_be_disabled(monkeypatch):
     assert s.market_regime_gate_enabled is False
 
 
+def test_emergency_halt_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("EMERGENCY_HALT_ENABLED", "false")
+    s = Settings(_env_file=None)
+    assert s.emergency_halt_enabled is False
+
+
 def test_live_mode_forces_live_flags():
     s = Settings(_env_file=None, live_mode=True, paper_trading=True, dry_run=True)
     assert s.live_mode is True

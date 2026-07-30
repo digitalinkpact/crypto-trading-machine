@@ -152,6 +152,8 @@ class Autopilot:
 
     def _entry_block_reason(self) -> Optional[str]:
         """Return a human-readable reason if new BUY entries must be blocked."""
+        if not get_settings().emergency_halt_enabled:
+            return None
         halt = storage.kv_get("emergency_halt") or {}
         if isinstance(halt, dict) and halt.get("active"):
             level = halt.get("level") or "new_entries_blocked"

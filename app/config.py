@@ -402,6 +402,11 @@ class Settings(BaseSettings):
     # Emergency-halt ladder tuning.
     emergency_halt_max_failures: int = Field(3, ge=1, le=100)
     emergency_halt_auto_clear_cycles: int = Field(3, ge=1, le=100)
+    # Allow live trading to continue even after watchdog detects a stale tick
+    # loop, so the bot can recover without getting perpetually blocked by a
+    # transient restart/reload event. Keep the safety logger in place but do not
+    # gate new entries on it unless explicitly enabled.
+    emergency_halt_enabled: bool = False
 
     # Storage
     data_cache_dir: Path = Path("./data/cache")

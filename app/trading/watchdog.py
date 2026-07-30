@@ -113,6 +113,9 @@ def trigger_emergency_halt(reason: str, *, level: str = "new_entries_blocked") -
     into the same halt mechanism the watchdog loop uses, instead of each
     inventing its own blocking flag.
     """
+    if not get_settings().emergency_halt_enabled:
+        log.warning("emergency halt suppressed by config: %s", reason)
+        return
     existing = storage.kv_get("emergency_halt") or {}
     if existing.get("active"):
         return  # already active — don't spam logs/kv on every iteration
