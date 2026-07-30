@@ -29,6 +29,14 @@ def test_runtime_settings_loadable():
     assert 0.0 < s.kelly_fraction_cap <= 1.0
 
 
+def test_spread_gate_settings_can_be_relaxed(monkeypatch):
+    monkeypatch.setenv("ROLLBACK_MAX_SPREAD_PCT", "0.0030")
+    monkeypatch.setenv("AGGRESSIVE_MAX_SPREAD_PCT", "0.0030")
+    s = Settings(_env_file=None)
+    assert s.rollback_max_spread_pct == 0.0030
+    assert s.aggressive_max_spread_pct == 0.0030
+
+
 def test_live_mode_forces_live_flags():
     s = Settings(_env_file=None, live_mode=True, paper_trading=True, dry_run=True)
     assert s.live_mode is True
