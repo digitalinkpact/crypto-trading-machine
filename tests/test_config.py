@@ -54,6 +54,14 @@ def test_emergency_halt_can_be_disabled(monkeypatch):
     assert s.emergency_halt_enabled is False
 
 
+def test_execution_defaults_are_more_permissive():
+    s = Settings(_env_file=None)
+    assert s.ml_gate_enabled is False
+    assert s.max_open_positions == 10
+    assert s.rollback_max_open_positions == 10
+    assert s.aggressive_max_open_positions == 10
+
+
 def test_live_mode_forces_live_flags():
     s = Settings(_env_file=None, live_mode=True, paper_trading=True, dry_run=True)
     assert s.live_mode is True
