@@ -240,7 +240,7 @@ class Settings(BaseSettings):
     trailing_stop_pct: float = Field(0.01, ge=0.005, le=0.20)    # 1.0% trail from HWM
     trailing_activation_pct: float = Field(0.02, ge=0.005, le=0.50)  # arm trailing after +2%
     max_hold_hours: int = Field(96, ge=1, le=10000)              # force-exit after 4 days
-    drawdown_circuit_breaker_pct: float = Field(0.10, ge=0.01, le=0.50)  # halt new BUYs after -10%
+    drawdown_circuit_breaker_pct: float = Field(0.25, ge=0.01, le=0.50)  # halt new BUYs after -25%
 
     # Entry gates
     min_signal_confidence: float = Field(0.65, ge=0.0, le=1.0)
