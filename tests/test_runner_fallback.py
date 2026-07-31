@@ -9,8 +9,7 @@ from app.config import Timeframe
 from app.signals import Signal, SignalAction
 
 
-@pytest.mark.asyncio
-async def test_run_all_agents_falls_back_when_profitstream_is_empty(monkeypatch):
+def _build_profitstream_fallback_fixture(monkeypatch, *, use_legacy_agents: bool):
     from app.agents import runner
 
     async def _symbols():
@@ -77,11 +76,28 @@ async def test_run_all_agents_falls_back_when_profitstream_is_empty(monkeypatch)
 
     class _Settings:
         profitstream_enabled = True
-        profitstream_use_legacy_agents = False
+        profitstream_use_legacy_agents = use_legacy_agents
         ml_gate_threshold = 0.5
         paper_trading = True
 
     monkeypatch.setattr(runner, "get_settings", lambda: _Settings())
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_run_all_agents_does_not_fall_back_when_legacy_disabled(monkeypatch):
+    runner = _build_profitstream_fallback_fixture(monkeypatch, use_legacy_agents=False)
+
+    signals = await runner.run_all_agents(use_llm=False)
+
+    # ProfitStream is the sole strategy here: an all-HOLD tick must stay
+    # all-HOLD, never silently reach for the noisier legacy ensemble.
+    assert signals == {}
+
+
+@pytest.mark.asyncio
+async def test_run_all_agents_falls_back_when_legacy_explicitly_enabled(monkeypatch):
+    runner = _build_profitstream_fallback_fixture(monkeypatch, use_legacy_agents=True)
 
     signals = await runner.run_all_agents(use_llm=False)
 
