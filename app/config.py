@@ -419,6 +419,31 @@ class Settings(BaseSettings):
     binance_base_url: str = "https://api.binance.us"
     binance_ws_url: str = "wss://stream.binance.us:9443"
 
+    @model_validator(mode="after")
+    def _enforce_binance_us_only(self) -> "Settings":
+        """Hard-fail startup if price/order endpoints are ever misconfigured to
+        binance.com (wrong domain, wrong geofence, wrong fee schedule/symbol
+        set). This is money-handling code — refuse to boot rather than trade
+        against the wrong exchange."""
+        import logging
+
+        offenders = [
+            ("binance_base_url", self.binance_base_url),
+            ("binance_ws_url", self.binance_ws_url),
+        ]
+        for field_name, value in offenders:
+            if "binance.com" in value.lower():
+                logging.getLogger("app.config").critical(
+                    "CRITICAL: %s=%r points at binance.com, not binance.us. "
+                    "Refusing to start — this app must only trade on Binance.US.",
+                    field_name, value,
+                )
+                raise ValueError(
+                    f"{field_name} must point at Binance.US (api.binance.us / "
+                    f"stream.binance.us), got {value!r}"
+                )
+        return self
+
     # Binance.US spot trading fees (tier 0 defaults).
     # See https://www.binance.us/fees — adjust via .env if your tier differs.
     # Market orders pay taker; limit orders that rest on the book pay maker.

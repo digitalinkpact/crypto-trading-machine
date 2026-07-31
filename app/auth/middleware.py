@@ -1,7 +1,7 @@
 """Session-based auth middleware. Replaces the old HTTP Basic guard.
 
 Rules:
-- /healthz is always public.
+- /healthz and /health are always public.
 - All /auth/* pages are public (login, signup-while-open, verify, forgot, reset).
 - /static/* (if ever added) is public.
 - IPs in `auth_ip_allowlist` skip the wall entirely.
@@ -21,7 +21,7 @@ from app.config import get_settings
 from .service import client_ip, current_user, ip_is_allowlisted
 
 _PUBLIC_PREFIXES = ("/auth/", "/static/")
-_PUBLIC_EXACT = {"/healthz", "/favicon.ico"}
+_PUBLIC_EXACT = {"/healthz", "/health", "/favicon.ico"}
 
 
 def _is_public(path: str) -> bool:

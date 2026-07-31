@@ -13,6 +13,7 @@ from typing import Optional
 from app.config import get_settings
 from app.exchange import BinanceUSClient, Order, OrderSide, OrderStatus, OrderType
 from app.logging_setup import get_logger
+from app.trading.risk import infer_exit_reason
 from app.storage import storage
 
 log = get_logger(__name__)
@@ -113,7 +114,10 @@ class PaperExchange:
                 raise RuntimeError(f"no {base} to sell in paper account")
             proceeds = qty * price - (qty * price * fee_rate)
             storage.paper_balance_add("USDT", proceeds)
-            storage.reduce_position(symbol=symbol, qty=qty, exit_price=price, mode="paper")
+            storage.close_position(
+                symbol=symbol, mode="paper", exit_price=price,
+                exit_reason=infer_exit_reason(agents),
+            )
             filled_qty = qty
             fee = qty * price * fee_rate
 

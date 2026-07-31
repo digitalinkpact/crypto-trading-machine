@@ -47,6 +47,18 @@ def clear_hwm(symbol: str) -> None:
     storage.kv_set(_hwm_key(symbol), None)
 
 
+def infer_exit_reason(agents: Optional[list[str]]) -> str:
+    """Derive a closed_trades `exit_reason` from an order's agent tags.
+
+    Risk-gate exits tag the order with `risk:<reason>` (see autopilot's
+    `_run_risk_gates`); anything else is an agent/signal-driven SELL.
+    """
+    for a in agents or []:
+        if isinstance(a, str) and a.startswith("risk:"):
+            return a.split(":", 1)[1] or "unknown"
+    return "signal"
+
+
 def get_hwm(symbol: str) -> Optional[Decimal]:
     cur = storage.kv_get(_hwm_key(symbol))
     if cur in (None, "None"):

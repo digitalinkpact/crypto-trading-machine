@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from html import escape
 
-from fastapi import APIRouter, Form, HTTPException
+from fastapi import APIRouter, Form, HTTPException, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.config import SYMBOLS, TIMEFRAMES, get_settings
@@ -630,8 +630,46 @@ async def autopilot_stop():
 
 
 @router.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health(response: Response) -> dict:
+    """Liveness+readiness probe for external supervisors (systemd timer,
+    watchdog.sh, uptime monitors). Returns HTTP 200 only when the process is
+    alive AND the last Binance.US price update is fresh (<`live_price_max_age_
+    seconds`, default 30s) AND the local SQLite DB is writable. Any failing
+    check drops the status to 503 so a monitor can tell "up but broken" apart
+    from "actually fine".
+    """
+    s = get_settings()
+    problems: list[str] = []
+
+    ws_status = live_prices.status()
+    price_age = ws_status.get("last_msg_age_s")
+    price_fresh = True
+    if ws_status.get("enabled"):
+        if price_age is None or price_age > s.live_price_max_age_seconds:
+            price_fresh = False
+            problems.append(
+                f"last Binance.US price update {price_age if price_age is not None else 'never'}s "
+                f"ago (max {s.live_price_max_age_seconds}s)"
+            )
+
+    db_writable = True
+    try:
+        storage.kv_set("healthz_probe", {"ts": datetime.now(timezone.utc).isoformat()})
+    except Exception as exc:  # noqa: BLE001
+        db_writable = False
+        problems.append(f"db not writable: {exc}")
+
+    body = {
+        "status": "ok" if not problems else "degraded",
+        "process_alive": True,
+        "price_fresh": price_fresh,
+        "price_age_s": price_age,
+        "db_writable": db_writable,
+        "problems": problems,
+    }
+    if problems:
+        response.status_code = 503
+    return body
 
 
 @router.get("/autopilot/status")

@@ -347,7 +347,10 @@ class Autopilot:
                             "below min — closing stale position", ex.symbol, ex.qty, avail,
                         )
                         try:
-                            storage.close_position(symbol=ex.symbol, exit_price=price)
+                            storage.close_position(
+                                symbol=ex.symbol, exit_price=price,
+                                exit_reason=f"{ex.reason}_stale_dust",
+                            )
                             risk.clear_hwm(ex.symbol)
                         except Exception as exc:  # noqa: BLE001
                             log.warning("stale close failed for %s: %s", ex.symbol, exc)
@@ -1817,7 +1820,10 @@ class Autopilot:
                         entry_price=price, agents=agents,
                     )
                 else:
-                    storage.close_position(symbol=symbol, mode="live", exit_price=price)
+                    storage.close_position(
+                        symbol=symbol, mode="live", exit_price=price,
+                        exit_reason=risk.infer_exit_reason(agents),
+                    )
             except Exception as exc:  # noqa: BLE001
                 log.warning("storage write failed for live order %s: %s", symbol, exc)
         self.state.trades_executed += 1

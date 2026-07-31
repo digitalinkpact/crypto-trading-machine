@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS closed_trades (
     pnl_pct REAL NOT NULL,
     entry_ts TEXT NOT NULL,
     exit_ts TEXT NOT NULL,
-    agents TEXT NOT NULL
+    agents TEXT NOT NULL,
+    exit_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_closed_trades_exit ON closed_trades(exit_ts);
 
@@ -286,6 +287,12 @@ class Storage:
                     "SELECT symbol, mode, qty, entry_price, entry_ts, agents FROM positions_old"
                 )
                 c.execute("DROP TABLE positions_old")
+            # Older DBs pre-date the exit_reason column — add it in place so
+            # every executed_sell/risk exit can record WHY the position closed
+            # (stop_loss/take_profit/trailing_stop/max_hold/signal/reconcile_stale).
+            ct_cols = [r["name"] for r in c.execute("PRAGMA table_info(closed_trades)").fetchall()]
+            if "exit_reason" not in ct_cols:
+                c.execute("ALTER TABLE closed_trades ADD COLUMN exit_reason TEXT")
 
     # ── KV (used for autopilot state) ────────────────────────────────
     def kv_set(self, key: str, value: Any) -> None:
@@ -477,8 +484,16 @@ class Storage:
         symbol: str,
         mode: Optional[str] = None,
         exit_price: Decimal | float,
+        exit_reason: Optional[str] = None,
     ) -> Optional[dict]:
-        """Close a position fully. Records to closed_trades and updates agent stats."""
+        """Close a position fully. Records to closed_trades and updates agent stats.
+
+        `exit_reason` should be one of stop_loss/take_profit/trailing_stop/
+        max_hold (risk exits), "signal" (agent-driven sell), or
+        "reconcile_stale" (exchange balance gone, book cleanup) — kept distinct
+        from `agents` (the entry agents) so a closed trade's WHY is always
+        traceable.
+        """
         with self._lock, self._conn() as c:
             if mode is None:
                 row = c.execute(
@@ -510,12 +525,13 @@ class Storage:
             entry_ts = row["entry_ts"]
             mode = row["mode"]
             now = _now()
+            reason = exit_reason or "unknown"
             c.execute("DELETE FROM positions WHERE symbol=? AND mode=?", (symbol, mode or row["mode"]))
             c.execute(
                 "INSERT INTO closed_trades(mode,symbol,qty,entry_price,exit_price,pnl,"
-                "pnl_pct,entry_ts,exit_ts,agents) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "pnl_pct,entry_ts,exit_ts,agents,exit_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (mode, symbol, qty, entry, exit_p, pnl, pnl_pct,
-                 entry_ts, now, agents_json),
+                 entry_ts, now, agents_json, reason),
             )
             won = pnl > 0
             for agent in agents_list:
@@ -531,7 +547,7 @@ class Storage:
             "symbol": symbol, "qty": qty, "entry_price": entry,
             "exit_price": exit_p, "pnl": pnl, "pnl_pct": pnl_pct,
             "agents": agents_list, "entry_ts": entry_ts, "exit_ts": now,
-            "mode": mode,
+            "mode": mode, "exit_reason": reason,
         }
 
     # ── Agent stats ──────────────────────────────────────────────────

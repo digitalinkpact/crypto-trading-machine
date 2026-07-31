@@ -23,7 +23,10 @@ async def reconcile_positions(mode: str) -> dict[str, int]:
         have = balances.get(base, Decimal("0"))
         if have <= 0:
             try:
-                storage.close_position(symbol=symbol, mode=mode, exit_price=Decimal(str(pos["entry_price"])))
+                storage.close_position(
+                    symbol=symbol, mode=mode, exit_price=Decimal(str(pos["entry_price"])),
+                    exit_reason="reconcile_stale",
+                )
                 closed += 1
                 log.warning("reconcile closed stale position: %s mode=%s", symbol, mode)
             except Exception as e:  # noqa: BLE001
