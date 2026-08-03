@@ -154,7 +154,15 @@ class ProfitStreamStrategy:
         df = await self._client.klines(symbol, interval, limit=limit)
         if "ema_20" not in df.columns:
             df = add_indicators(df)
-        return df.dropna()
+        df = df.dropna()
+        # Binance's klines endpoint includes the still-forming current bar. On
+        # Binance.US's thin books that bar's volume is usually near/exactly 0
+        # seconds after it opens, permanently failing the low-volume filter, and
+        # its OHLC keeps shifting mid-bar (flickering EMA/MACD crosses). Drop it
+        # so every indicator is computed off fully closed candles only.
+        if not df.empty and df.index[-1] > pd.Timestamp.now(tz="UTC"):
+            df = df.iloc[:-1]
+        return df
 
     def _ema_bull_cross(self, df: pd.DataFrame, *, short: int, long: int) -> bool:
         out = df.copy()
