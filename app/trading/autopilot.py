@@ -334,8 +334,19 @@ class Autopilot:
                     avail = free_balances.get(base, Decimal("0"))
                 else:
                     avail = None
-                # Clamp the exit to the real free balance when we know it.
-                sell_qty = ex.qty if avail is None else min(ex.qty, avail)
+                # Sell the real free balance, not the tracked book qty. min()
+                # alone only guarded against overselling when book > free; if
+                # free > book (drift from a missed pyramid-buy accumulation,
+                # a stale entry, etc.) the exit must still flatten the WHOLE
+                # real holding — otherwise the surplus is silently stranded
+                # with no further stop-loss/take-profit coverage forever.
+                if avail is not None and avail > ex.qty:
+                    log.warning(
+                        "risk-exit %s: free=%s exceeds tracked book=%s — "
+                        "selling the full free balance so nothing is left "
+                        "stranded untracked", ex.symbol, avail, ex.qty,
+                    )
+                sell_qty = ex.qty if avail is None else avail
                 qty = filters.round_qty(ex.symbol, sell_qty)
                 if qty <= 0 or not filters.meets_min(ex.symbol, qty, price):
                     # Nothing sellable (dust below min-notional, or the balance
