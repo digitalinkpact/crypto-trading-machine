@@ -44,12 +44,15 @@ class ProfitStreamStrategy:
         reasons: list[str] = []
         indicators: dict[str, Any] = {"symbol": symbol}
 
+        # add_indicators computes an ema_200, whose 199-row warmup is dropped by
+        # _candles()'s dropna() — fetch enough candles to leave >=60 valid rows
+        # after that warmup, or analyze_symbol always short-circuits to HOLD.
         try:
-            df_1m = await self._candles(symbol, "1m", 240)
-            df_5m = await self._candles(symbol, "5m", 240)
-            df_15m = await self._candles(symbol, "15m", 240)
-            df_1h = await self._candles(symbol, "1h", 240)
-            btc_1h = await self._candles("BTCUSDT", "1h", 240)
+            df_1m = await self._candles(symbol, "1m", 320)
+            df_5m = await self._candles(symbol, "5m", 320)
+            df_15m = await self._candles(symbol, "15m", 320)
+            df_1h = await self._candles(symbol, "1h", 320)
+            btc_1h = await self._candles("BTCUSDT", "1h", 320)
         except Exception as exc:  # noqa: BLE001
             reasons.append(f"data_unavailable:{exc}")
             return StrategyDecision(symbol, SignalAction.HOLD, 0, reasons, indicators)
