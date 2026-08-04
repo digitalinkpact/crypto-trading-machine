@@ -550,6 +550,80 @@ class Storage:
             "mode": mode, "exit_reason": reason,
         }
 
+    def reduce_position(
+        self,
+        *,
+        symbol: str,
+        mode: str,
+        qty: Decimal | float,
+        exit_price: Decimal | float,
+        exit_reason: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Close part or all of an open position and persist a closed-trade row."""
+        with self._lock, self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM positions WHERE symbol=? AND mode=?",
+                (symbol, mode),
+            ).fetchone()
+            if not row:
+                return None
+            pos_qty = float(row["qty"])
+            reduce_qty = min(pos_qty, _f(qty))
+            if reduce_qty <= 0:
+                return None
+            entry = float(row["entry_price"])
+            exit_p = _f(exit_price)
+            s = get_settings()
+            taker_fee = float(s.binance_taker_fee)
+            gross_pnl = (exit_p - entry) * reduce_qty
+            est_fees = (entry * reduce_qty * taker_fee) + (exit_p * reduce_qty * taker_fee)
+            pnl = gross_pnl - est_fees
+            entry_notional = entry * reduce_qty
+            pnl_pct = ((pnl / entry_notional) * 100) if entry_notional else 0.0
+            agents_json = row["agents"]
+            agents_list = json.loads(agents_json or "[]")
+            entry_ts = row["entry_ts"]
+            now = _now()
+            reason = exit_reason or "unknown"
+            remaining = pos_qty - reduce_qty
+            if remaining <= 1e-12:
+                c.execute("DELETE FROM positions WHERE symbol=? AND mode=?", (symbol, mode))
+            else:
+                c.execute(
+                    "UPDATE positions SET qty=? WHERE symbol=? AND mode=?",
+                    (remaining, symbol, mode),
+                )
+            c.execute(
+                "INSERT INTO closed_trades(mode,symbol,qty,entry_price,exit_price,pnl,"
+                "pnl_pct,entry_ts,exit_ts,agents,exit_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (mode, symbol, reduce_qty, entry, exit_p, pnl, pnl_pct,
+                 entry_ts, now, agents_json, reason),
+            )
+            won = pnl > 0
+            for agent in agents_list:
+                c.execute(
+                    "INSERT INTO agent_stats(agent,wins,losses,total_pnl,last_updated) "
+                    "VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(agent) DO UPDATE SET "
+                    "wins=wins+excluded.wins, losses=losses+excluded.losses, "
+                    "total_pnl=total_pnl+excluded.total_pnl, last_updated=excluded.last_updated",
+                    (agent, 1 if won else 0, 0 if won else 1, pnl, now),
+                )
+        return {
+            "symbol": symbol,
+            "qty": reduce_qty,
+            "remaining_qty": max(0.0, remaining),
+            "entry_price": entry,
+            "exit_price": exit_p,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "agents": agents_list,
+            "entry_ts": entry_ts,
+            "exit_ts": now,
+            "mode": mode,
+            "exit_reason": reason,
+        }
+
     # ── Agent stats ──────────────────────────────────────────────────
     def agent_stats(self) -> list[dict]:
         with self._lock, self._conn() as c:

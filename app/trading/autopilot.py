@@ -152,7 +152,7 @@ class Autopilot:
 
     def _entry_block_reason(self) -> Optional[str]:
         """Return a human-readable reason if new BUY entries must be blocked."""
-        if not get_settings().emergency_halt_enabled:
+        if not getattr(get_settings(), "emergency_halt_enabled", True):
             return None
         halt = storage.kv_get("emergency_halt") or {}
         if isinstance(halt, dict) and halt.get("active"):
@@ -260,21 +260,17 @@ class Autopilot:
                 except Exception as exc:  # noqa: BLE001
                     log.warning("filter load failed at tick start: %s", exc)
 
-                # 1. Risk gates — stop-loss / take-profit / trailing / max-hold.
-                #    Run BEFORE agents so we exit losers regardless of new signals.
-                try:
-                    await self._run_risk_gates()
-                except Exception as exc:  # noqa: BLE001
-                    log.exception("risk gate run failed: %s", exc)
-
-                # 2. Drawdown circuit breaker.
+                # 1. Drawdown circuit breaker.
                 try:
                     breaker_tripped = await self._check_circuit_breaker()
                 except Exception as exc:  # noqa: BLE001
                     log.warning("circuit breaker check failed: %s", exc)
                     breaker_tripped = False
 
-                # 3. Agent signals → execute (skip BUYs if breaker tripped).
+                # Risk exits run on the independent risk loop. Keeping them here
+                # too would submit the same protective SELLs from two cadences.
+
+                # 2. Agent signals → execute (skip BUYs if breaker tripped).
                 try:
                     signals = await run_all_agents(use_llm=get_settings().llm_in_trading_loop)
                 except Exception as exc:  # noqa: BLE001
@@ -363,6 +359,8 @@ class Autopilot:
                                 exit_reason=f"{ex.reason}_stale_dust",
                             )
                             risk.clear_hwm(ex.symbol)
+                            risk.clear_tp1(ex.symbol)
+                            risk.clear_tp2(ex.symbol)
                         except Exception as exc:  # noqa: BLE001
                             log.warning("stale close failed for %s: %s", ex.symbol, exc)
                     else:
@@ -404,7 +402,14 @@ class Autopilot:
                     filters={"meets_min": True},
                 )
                 if self._order_filled(order):
-                    risk.clear_hwm(ex.symbol)
+                    if ex.reason == "take_profit_1":
+                        risk.mark_tp1_taken(ex.symbol)
+                    elif ex.reason == "take_profit_2":
+                        risk.mark_tp2_taken(ex.symbol)
+                    else:
+                        risk.clear_hwm(ex.symbol)
+                        risk.clear_tp1(ex.symbol)
+                        risk.clear_tp2(ex.symbol)
                 else:
                     log.error(
                         "RISK EXIT %s did NOT fill (status=%s) — position remains "
@@ -882,6 +887,8 @@ class Autopilot:
                             if placed:
                                 skip_counter["executed_sell"] += 1
                                 risk.clear_hwm(symbol)
+                                risk.clear_tp1(symbol)
+                                risk.clear_tp2(symbol)
                                 self._clear_pyramid_adds_count(symbol)
                                 _finish(symbol, "executed_sell", aggressive_exit_reason, submitted=True, sig=sig)
                             else:
@@ -1128,6 +1135,9 @@ class Autopilot:
                     if not placed:
                         _finish(symbol, "filter_reject_buy", "exchange filters rejected computed qty", submitted=False, sig=sig)
                         continue
+                    risk.clear_hwm(symbol)
+                    risk.clear_tp1(symbol)
+                    risk.clear_tp2(symbol)
                     self.state.cooldowns[symbol] = now.isoformat()
                     if not is_pyramid:
                         open_count += 1
@@ -1160,6 +1170,8 @@ class Autopilot:
                         if placed:
                             skip_counter["executed_sell"] += 1
                             risk.clear_hwm(symbol)
+                            risk.clear_tp1(symbol)
+                            risk.clear_tp2(symbol)
                             self._clear_pyramid_adds_count(symbol)
                         else:
                             _bump("filter_reject_sell", symbol)
@@ -1831,8 +1843,8 @@ class Autopilot:
                         entry_price=price, agents=agents,
                     )
                 else:
-                    storage.close_position(
-                        symbol=symbol, mode="live", exit_price=price,
+                    storage.reduce_position(
+                        symbol=symbol, mode="live", qty=filled, exit_price=price,
                         exit_reason=risk.infer_exit_reason(agents),
                     )
             except Exception as exc:  # noqa: BLE001

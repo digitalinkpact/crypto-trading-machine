@@ -3,8 +3,8 @@ from app.config import SYMBOLS, TIMEFRAMES, Settings, Timeframe, get_settings
 
 
 def test_universe_size():
-    assert len(SYMBOLS) == 9
-    assert len(set(SYMBOLS)) == 9  # unique
+    assert len(SYMBOLS) == 25
+    assert len(set(SYMBOLS)) == 25  # unique
 
 
 def test_timeframes():

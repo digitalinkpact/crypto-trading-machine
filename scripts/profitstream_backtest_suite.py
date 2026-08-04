@@ -67,7 +67,7 @@ def _run_pf(df: pd.DataFrame, entries: pd.Series, exits: pd.Series):
         init_cash=1000.0,
         fees=s.binance_taker_fee,
         sl_stop=s.stop_loss_pct,
-        tp_stop=s.final_take_profit_pct,
+        tp_stop=s.take_profit_pct,
         freq="1d",
     )
     stats = pf.stats()

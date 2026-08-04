@@ -114,8 +114,8 @@ class PaperExchange:
                 raise RuntimeError(f"no {base} to sell in paper account")
             proceeds = qty * price - (qty * price * fee_rate)
             storage.paper_balance_add("USDT", proceeds)
-            storage.close_position(
-                symbol=symbol, mode="paper", exit_price=price,
+            storage.reduce_position(
+                symbol=symbol, mode="paper", qty=qty, exit_price=price,
                 exit_reason=infer_exit_reason(agents),
             )
             filled_qty = qty

@@ -45,18 +45,21 @@ from app.config import get_settings
 # KeyError deep in pandas' parse_timedelta_unit. Map those to a fixed span so
 # weekly/monthly backtests don't crash.
 def _as_timedelta_freq(freq: str) -> str:
+    normalized = freq.strip().upper()
+    if normalized in {"D", "H", "T", "MIN"}:
+        return {"D": "1D", "H": "1H", "T": "1T", "MIN": "1T"}[normalized]
     try:
         with warnings.catch_warnings():
             # "H"/"M" lowercase deprecations warn but still convert fine; only
             # genuinely unconvertible (anchored) aliases should fall through.
             warnings.simplefilter("ignore")
-            pd.Timedelta(freq)
-        return freq
+            pd.Timedelta(normalized)
+        return normalized
     except Exception as e:  # noqa: BLE001 — pandas raises ValueError/KeyError by version
         import logging
         logger = logging.getLogger(__name__)
         logger.warning("frequency conversion fallback for '%s': %s", freq, e)
-        f = freq.upper()
+        f = normalized
         if f.startswith("W"):
             return "7D"
         if f.startswith(("M", "BM", "MS")):

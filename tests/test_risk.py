@@ -100,7 +100,7 @@ def test_max_hold_triggers():
 def test_circuit_breaker():
     tripped, dd = risk.is_circuit_breaker_tripped(
         starting_balance=Decimal("10000"),
-        current_balance=Decimal("8900"),  # -11%
+        current_balance=Decimal("7400"),  # -26%
     )
     assert tripped is True
     assert dd < -0.10

@@ -106,6 +106,38 @@ async def test_market_gate_disabled_fail_open(monkeypatch):
     assert why == "market_gate_disabled"
 
 
+async def test_tick_does_not_run_risk_gates_inline(monkeypatch):
+    """Protective exits are owned by the independent risk loop, not tick()."""
+    ap = Autopilot()
+    ap.state.running = True
+
+    class _S:
+        paper_trading = True
+        llm_in_trading_loop = False
+
+    async def _boom(self):
+        raise AssertionError("tick() should not call _run_risk_gates")
+
+    async def _fake_breaker(self):
+        return False
+
+    async def _fake_execute(self, signals, allow_buys):
+        assert signals == {}
+        assert allow_buys is True
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    monkeypatch.setattr(autopilot_module.storage, "try_acquire_lock", lambda *a, **k: True, raising=True)
+    monkeypatch.setattr(autopilot_module.storage, "release_lock", lambda *a, **k: None, raising=True)
+    monkeypatch.setattr(autopilot_module.paper_exchange, "ensure_seeded", lambda: None, raising=True)
+    monkeypatch.setattr(autopilot_module.filters, "load", lambda: asyncio.sleep(0), raising=True)
+    monkeypatch.setattr(Autopilot, "_run_risk_gates", _boom, raising=True)
+    monkeypatch.setattr(Autopilot, "_check_circuit_breaker", _fake_breaker, raising=True)
+    monkeypatch.setattr(autopilot_module, "run_all_agents", lambda use_llm: asyncio.sleep(0, result={}), raising=True)
+    monkeypatch.setattr(Autopilot, "_execute", _fake_execute, raising=True)
+
+    await ap.tick()
+
+
 async def test_count_non_dust_positions_excludes_dust(monkeypatch):
     """Dust balances must not consume one of max_open_positions slots."""
     ap = Autopilot()
@@ -784,7 +816,7 @@ async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
     assert info["action"] == "BUY"
     assert info["filters"]["market_regime"]["ok"] is False
     assert info["filters"]["min_notional"]["ok"] is True
-    assert info["sizing"]["rounded_qty"] == "0.1200"
-    assert info["sizing"]["notional"] == "6.0000"
+    assert info["sizing"]["rounded_qty"] == "0.0600"
+    assert info["sizing"]["notional"] == "3.0000"
     assert info["final_reason"] == "market_gate"
     assert info["submitted"] is False

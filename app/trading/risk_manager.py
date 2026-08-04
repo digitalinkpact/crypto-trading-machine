@@ -43,7 +43,7 @@ class RiskManager:
         )
         position_pct = (
             getattr(s, "aggressive_position_pct", 0.06)
-            if aggressive_mode else getattr(s, "rollback_position_pct", getattr(s, "max_position_pct", 0.10))
+            if aggressive_mode else getattr(s, "rollback_position_pct", getattr(s, "max_position_pct", 0.03))
         )
 
         if (not is_pyramid) and open_positions >= max_open_positions:

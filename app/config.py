@@ -228,7 +228,7 @@ class Settings(BaseSettings):
     aggressive_max_spread_pct: float = Field(0.0025, ge=0.0, le=0.05)
     rollback_max_spread_pct: float = Field(0.0015, ge=0.0, le=0.05)
     aggressive_position_pct: float = Field(0.06, ge=0.005, le=1.0)
-    rollback_position_pct: float = Field(0.10, ge=0.005, le=1.0)
+    rollback_position_pct: float = Field(0.03, ge=0.005, le=1.0)
     aggressive_max_open_positions: int = Field(10, ge=1, le=25)
     rollback_max_open_positions: int = Field(10, ge=1, le=25)
     trend_gate_bypass_confidence: float = Field(0.85, ge=0.0, le=1.0)
@@ -410,7 +410,7 @@ class Settings(BaseSettings):
     # loop, so the bot can recover without getting perpetually blocked by a
     # transient restart/reload event. Keep the safety logger in place but do not
     # gate new entries on it unless explicitly enabled.
-    emergency_halt_enabled: bool = False
+    emergency_halt_enabled: bool = True
 
     # Storage
     data_cache_dir: Path = Path("./data/cache")

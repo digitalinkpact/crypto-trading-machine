@@ -1,17 +1,18 @@
-"""ProfitStream multi-timeframe strategy.
+"""ProfitStream strategy surface.
 
-Focus: quality entries, strict filters, and explicit rejection reasons.
+The original low-timeframe momentum stack was negative out of sample on this
+repository's walk-forward harness. The only candidate with a repeatable edge is
+daily dip-buy mean reversion gated by BTC's trend, so this module now follows
+that evidence instead of trying to tune the losing micro-timeframe confluence.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from statistics import pstdev
 from typing import Any, Optional
 
 import pandas as pd
-from ta.trend import EMAIndicator, MACD
 
 from app.config import get_settings
 from app.exchange import BinanceUSClient
@@ -34,76 +35,57 @@ class StrategyDecision:
 
 
 class ProfitStreamStrategy:
-    """Rule-based strategy with AI-like scoring and explainable rejects."""
+    """Evidence-led dip-buy strategy with explainable rejects."""
 
     def __init__(self, client: Optional[BinanceUSClient] = None) -> None:
         self._client = client or BinanceUSClient()
 
     async def analyze_symbol(self, symbol: str, *, mode: str) -> StrategyDecision:
-        s = get_settings()
         reasons: list[str] = []
         indicators: dict[str, Any] = {"symbol": symbol}
 
-        # add_indicators computes an ema_200, whose 199-row warmup is dropped by
-        # _candles()'s dropna() — fetch enough candles to leave >=60 valid rows
-        # after that warmup, or analyze_symbol always short-circuits to HOLD.
         try:
-            df_1m = await self._candles(symbol, "1m", 320)
-            df_5m = await self._candles(symbol, "5m", 320)
-            df_15m = await self._candles(symbol, "15m", 320)
-            df_1h = await self._candles(symbol, "1h", 320)
-            btc_1h = await self._candles("BTCUSDT", "1h", 320)
+            df_1d = await self._candles(symbol, "1d", 320)
+            btc_1d = await self._candles("BTCUSDT", "1d", 320)
         except Exception as exc:  # noqa: BLE001
             reasons.append(f"data_unavailable:{exc}")
             return StrategyDecision(symbol, SignalAction.HOLD, 0, reasons, indicators)
 
-        if min(len(df_1m), len(df_5m), len(df_15m), len(df_1h), len(btc_1h)) < 60:
+        if min(len(df_1d), len(btc_1d)) < 60:
             reasons.append("insufficient_history")
             return StrategyDecision(symbol, SignalAction.HOLD, 0, reasons, indicators)
 
-        # Exit-first logic: if held and 5m MACD reverses bearish, sell immediately.
         held = self._is_held(symbol, mode)
-        macd_reversal = self._macd_bear_reversal(df_5m)
-        indicators["macd_reversal_5m"] = macd_reversal
-        if held and macd_reversal:
-            indicators["decision"] = "sell_macd_reversal_5m"
-            return StrategyDecision(symbol, SignalAction.SELL, 95, reasons, indicators)
-
-        # Entry score components.
-        ema_cross = self._ema_bull_cross(df_1m, short=9, long=21)
-        rsi_ok, rsi_val = self._rsi_between(df_5m, s.profitstream_rsi_min, s.profitstream_rsi_max)
-        vol_spike, vol_ratio, quote_1m = self._volume_spike(df_1m, s.profitstream_volume_spike_multiple)
-        macd_bull = self._macd_bull(df_15m)
-        btc_aligned = self._btc_trend_aligned(btc_1h)
+        exit_ready, exit_rsi = self._mean_reversion_exit(df_1d)
+        dip_ready, dip_rsi = self._dip_buy_setup(df_1d)
+        btc_risk_on, btc_ema50, btc_ema200 = self._btc_risk_on(btc_1d)
+        daily_quote = self._latest_quote_volume(df_1d)
 
         indicators.update(
             {
-                "ema_cross_1m": ema_cross,
-                "rsi_5m": rsi_val,
-                "rsi_ok": rsi_ok,
-                "volume_spike_1m": vol_spike,
-                "volume_ratio_1m": vol_ratio,
-                "quote_volume_1m": quote_1m,
-                "macd_bull_15m": macd_bull,
-                "btc_aligned_1h": btc_aligned,
+                "rsi_1d": dip_rsi,
+                "exit_rsi_1d": exit_rsi,
+                "close_1d": float(df_1d.iloc[-1]["close"]),
+                "bb_lower_1d": float(df_1d.iloc[-1]["bb_lower"]),
+                "bb_mid_1d": float(df_1d.iloc[-1]["bb_mid"]),
+                "quote_volume_1d": daily_quote,
+                "btc_ema50_1d": btc_ema50,
+                "btc_ema200_1d": btc_ema200,
+                "btc_risk_on_1d": btc_risk_on,
             }
         )
 
-        # Market filters.
+        if held and exit_ready:
+            indicators["decision"] = "sell_mean_reversion_exit"
+            return StrategyDecision(symbol, SignalAction.SELL, 90, reasons, indicators)
+
         filt_ok = True
 
-        btc_vol = self._btc_volatility(btc_1h)
-        indicators["btc_volatility_1h"] = btc_vol
-        if btc_vol > s.profitstream_btc_volatility_threshold:
+        s = get_settings()
+        if daily_quote < s.profitstream_low_volume_quote_min:
             filt_ok = False
             reasons.append(
-                f"btc_volatility_high:{btc_vol:.4f}>{s.profitstream_btc_volatility_threshold:.4f}"
-            )
-
-        if quote_1m < s.profitstream_low_volume_quote_min:
-            filt_ok = False
-            reasons.append(
-                f"low_volume:{quote_1m:.2f}<{s.profitstream_low_volume_quote_min:.2f}"
+                f"low_volume:{daily_quote:.2f}<{s.profitstream_low_volume_quote_min:.2f}"
             )
 
         near_news, next_news = self._near_news_event()
@@ -118,34 +100,28 @@ class ProfitStreamStrategy:
             filt_ok = False
             reasons.append(f"spread_wide:{spread_pct:.4%}>0.2500%")
 
-        # Weighted score 0-100.
-        score = 0
-        score += 25 if ema_cross else 0
-        score += 15 if rsi_ok else 0
-        score += 15 if vol_spike else 0
-        score += 20 if macd_bull else 0
-        score += 15 if btc_aligned else 0
-        score += 10 if filt_ok else 0
-
-        if not ema_cross:
-            reasons.append("ema9_not_crossing_ema21")
-        if not rsi_ok:
-            reasons.append("rsi_outside_40_65")
-        if not vol_spike:
-            reasons.append("volume_spike_missing")
-        if not macd_bull:
-            reasons.append("macd_bull_confirmation_missing")
-        if not btc_aligned:
+        if not btc_risk_on:
+            filt_ok = False
             reasons.append("btc_trend_not_aligned")
 
-        # Overtrading guard: if already held, suppress duplicate BUY signals.
+        score = 0
+        score += 70 if dip_ready else 0
+        score += 20 if btc_risk_on else 0
+        score += 10 if filt_ok else 0
+
+        if not dip_ready:
+            if dip_rsi >= 30:
+                reasons.append("rsi_not_oversold")
+            if float(df_1d.iloc[-1]["close"]) > float(df_1d.iloc[-1]["bb_lower"]):
+                reasons.append("close_above_lower_band")
+
         if held:
             reasons.append("position_already_open")
             return StrategyDecision(symbol, SignalAction.HOLD, score, reasons, indicators)
 
-        if score >= s.profitstream_score_threshold and filt_ok:
+        if dip_ready and filt_ok:
             indicators["decision"] = "buy"
-            return StrategyDecision(symbol, SignalAction.BUY, score, reasons, indicators)
+            return StrategyDecision(symbol, SignalAction.BUY, max(score, 90), reasons, indicators)
 
         indicators["decision"] = "hold"
         return StrategyDecision(symbol, SignalAction.HOLD, score, reasons, indicators)
@@ -164,78 +140,41 @@ class ProfitStreamStrategy:
             df = df.iloc[:-1]
         return df
 
-    def _ema_bull_cross(self, df: pd.DataFrame, *, short: int, long: int) -> bool:
-        out = df.copy()
-        out["ema_s"] = EMAIndicator(close=out["close"], window=short).ema_indicator()
-        out["ema_l"] = EMAIndicator(close=out["close"], window=long).ema_indicator()
-        out = out.dropna()
-        if len(out) < 3:
-            return False
-        prev = out.iloc[-2]
-        cur = out.iloc[-1]
-        return bool(prev["ema_s"] <= prev["ema_l"] and cur["ema_s"] > cur["ema_l"])
-
-    def _rsi_between(self, df: pd.DataFrame, lo: int, hi: int) -> tuple[bool, float]:
-        if "rsi_14" not in df.columns or df.empty:
+    def _dip_buy_setup(self, df: pd.DataFrame) -> tuple[bool, float]:
+        out = df.dropna()
+        if out.empty or "rsi_14" not in out.columns or "bb_lower" not in out.columns:
             return False, 0.0
-        rsi = float(df.iloc[-1]["rsi_14"])
-        return lo <= rsi <= hi, rsi
-
-    def _volume_spike(self, df: pd.DataFrame, multiple: float) -> tuple[bool, float, float]:
-        out = df.copy()
-        out["vol_ma"] = out["volume"].rolling(20).mean()
-        out["quote"] = out["close"] * out["volume"]
-        out = out.dropna()
-        if out.empty:
-            return False, 0.0, 0.0
         last = out.iloc[-1]
-        ratio = float(last["volume"] / last["vol_ma"]) if float(last["vol_ma"]) > 0 else 0.0
-        quote = float(last["quote"])
-        return ratio >= multiple, ratio, quote
+        rsi = float(last["rsi_14"])
+        close = float(last["close"])
+        bb_lower = float(last["bb_lower"])
+        return bool(rsi < 30 and close <= bb_lower), rsi
 
-    def _macd_bull(self, df: pd.DataFrame) -> bool:
-        if df.empty:
-            return False
-        if "macd" in df.columns and "macd_signal" in df.columns:
-            last = df.iloc[-1]
-            return bool(float(last["macd"]) > float(last["macd_signal"]))
-        macd = MACD(close=df["close"])
-        line = macd.macd().dropna()
-        sig = macd.macd_signal().dropna()
-        if line.empty or sig.empty:
-            return False
-        return bool(float(line.iloc[-1]) > float(sig.iloc[-1]))
+    def _mean_reversion_exit(self, df: pd.DataFrame) -> tuple[bool, float]:
+        out = df.dropna()
+        if out.empty or "rsi_14" not in out.columns:
+            return False, 0.0
+        rsi = float(out.iloc[-1]["rsi_14"])
+        return rsi > 55, rsi
 
-    def _macd_bear_reversal(self, df: pd.DataFrame) -> bool:
-        out = df.dropna().copy()
-        if "macd" not in out.columns or "macd_signal" not in out.columns or len(out) < 3:
-            macd = MACD(close=out["close"])
-            out["macd"] = macd.macd()
-            out["macd_signal"] = macd.macd_signal()
-            out = out.dropna()
-            if len(out) < 3:
-                return False
-        prev = out.iloc[-2]
-        cur = out.iloc[-1]
-        return bool(float(prev["macd"]) >= float(prev["macd_signal"]) and float(cur["macd"]) < float(cur["macd_signal"]))
-
-    def _btc_trend_aligned(self, btc_1h: pd.DataFrame) -> bool:
-        out = btc_1h.dropna()
+    def _btc_risk_on(self, btc_1d: pd.DataFrame) -> tuple[bool, float, float]:
+        out = btc_1d.dropna()
         if len(out) < 60:
-            return False
-        ema20 = float(out.iloc[-1]["ema_20"])
+            return False, 0.0, 0.0
         ema50 = float(out.iloc[-1]["ema_50"])
-        close = float(out.iloc[-1]["close"])
-        return close > ema50 and ema20 > ema50
+        ema200 = float(out.iloc[-1]["ema_200"])
+        if ema200 <= 0:
+            return False, ema50, ema200
+        return ema50 >= ema200, ema50, ema200
 
-    def _btc_volatility(self, btc_1h: pd.DataFrame) -> float:
-        out = btc_1h.dropna()
-        if len(out) < 30:
+    def _latest_quote_volume(self, df: pd.DataFrame) -> float:
+        out = df.dropna()
+        if out.empty:
             return 0.0
-        rets = out["close"].pct_change().dropna().tail(24)
-        if rets.empty:
-            return 0.0
-        return float(pstdev(float(x) for x in rets.tolist()))
+        if "quote_volume" in out.columns:
+            return float(out.iloc[-1]["quote_volume"])
+        last = out.iloc[-1]
+        return float(last["close"] * last["volume"])
 
     def _near_news_event(self) -> tuple[bool, str]:
         s = get_settings()

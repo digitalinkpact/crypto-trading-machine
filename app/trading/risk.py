@@ -33,6 +33,14 @@ def _hwm_key(symbol: str) -> str:
     return f"hwm:{symbol}"
 
 
+def _tp1_key(symbol: str) -> str:
+    return f"tp1:{symbol}"
+
+
+def _tp2_key(symbol: str) -> str:
+    return f"tp2:{symbol}"
+
+
 def update_hwm(symbol: str, price: Decimal) -> Decimal:
     """Track per-position high-water mark for trailing-stop."""
     cur = storage.kv_get(_hwm_key(symbol))
@@ -45,6 +53,30 @@ def update_hwm(symbol: str, price: Decimal) -> Decimal:
 
 def clear_hwm(symbol: str) -> None:
     storage.kv_set(_hwm_key(symbol), None)
+
+
+def mark_tp1_taken(symbol: str) -> None:
+    storage.kv_set(_tp1_key(symbol), True)
+
+
+def clear_tp1(symbol: str) -> None:
+    storage.kv_set(_tp1_key(symbol), None)
+
+
+def tp1_taken(symbol: str) -> bool:
+    return bool(storage.kv_get(_tp1_key(symbol)))
+
+
+def mark_tp2_taken(symbol: str) -> None:
+    storage.kv_set(_tp2_key(symbol), True)
+
+
+def clear_tp2(symbol: str) -> None:
+    storage.kv_set(_tp2_key(symbol), None)
+
+
+def tp2_taken(symbol: str) -> bool:
+    return bool(storage.kv_get(_tp2_key(symbol)))
 
 
 def infer_exit_reason(agents: Optional[list[str]]) -> str:
@@ -109,8 +141,19 @@ def evaluate_exits(
             continue
 
         # 2. Take-profit
-        if change >= Decimal(str(s.take_profit_pct)):
-            out.append(ExitDecision(symbol, qty, "take_profit"))
+        tp1_pct = Decimal(str(getattr(s, "take_profit_1_pct", 0.08)))
+        tp1_fraction = Decimal(str(getattr(s, "take_profit_1_fraction", 0.50)))
+        tp2_pct = Decimal(str(getattr(s, "take_profit_2_pct", 0.15)))
+        tp2_fraction = Decimal(str(getattr(s, "take_profit_2_fraction", 0.25)))
+        if (not tp1_taken(symbol)) and change >= tp1_pct:
+            out.append(ExitDecision(symbol, qty * tp1_fraction, "take_profit_1"))
+            continue
+        if tp1_taken(symbol) and (not tp2_taken(symbol)) and change >= tp2_pct:
+            original_qty = qty
+            remainder_fraction = Decimal("1") - tp1_fraction
+            if remainder_fraction > 0:
+                original_qty = qty / remainder_fraction
+            out.append(ExitDecision(symbol, min(qty, original_qty * tp2_fraction), "take_profit_2"))
             continue
 
         # 3. Trailing stop (arm only after position gains the configured threshold)

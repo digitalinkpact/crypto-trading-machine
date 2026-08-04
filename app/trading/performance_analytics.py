@@ -125,19 +125,19 @@ def build_performance_snapshot(*, mode: str, lookback_days: int = 180) -> dict:
             strategy_profit[str(agent)] += pnl
 
     tick_rows = [r for r in storage.recent_tick_audit(limit=5000) if r.get("mode") == mode]
-    score_bins: dict[str, dict[str, float]] = defaultdict(lambda: {"count": 0, "wins": 0})
-    timeframe_bins: dict[str, dict[str, float]] = defaultdict(lambda: {"count": 0, "wins": 0})
+    score_bins: dict[str, dict[str, float]] = defaultdict(lambda: {"count": 0, "executed": 0})
+    timeframe_bins: dict[str, dict[str, float]] = defaultdict(lambda: {"count": 0, "executed": 0})
     for row in tick_rows:
         score = int(row.get("score") or 0)
         bucket = _score_bucket(score)
         score_bins[bucket]["count"] += 1
         if int(row.get("executed") or 0) == 1:
-            score_bins[bucket]["wins"] += 1
+            score_bins[bucket]["executed"] += 1
 
         tf = str(row.get("timeframe") or "unknown")
         timeframe_bins[tf]["count"] += 1
         if int(row.get("executed") or 0) == 1:
-            timeframe_bins[tf]["wins"] += 1
+            timeframe_bins[tf]["executed"] += 1
 
     best_symbols = sorted(symbol_profit.items(), key=lambda x: x[1], reverse=True)[:5]
     worst_symbols = sorted(symbol_profit.items(), key=lambda x: x[1])[:5]
@@ -146,14 +146,16 @@ def build_performance_snapshot(*, mode: str, lookback_days: int = 180) -> dict:
     score_ranges = {
         k: {
             "count": int(v["count"]),
-            "execution_rate": (v["wins"] / v["count"]) if v["count"] else 0.0,
+            "executed_count": int(v["executed"]),
+            "execution_rate": (v["executed"] / v["count"]) if v["count"] else 0.0,
         }
         for k, v in score_bins.items()
     }
     timeframe_quality = {
         k: {
             "count": int(v["count"]),
-            "execution_rate": (v["wins"] / v["count"]) if v["count"] else 0.0,
+            "executed_count": int(v["executed"]),
+            "execution_rate": (v["executed"] / v["count"]) if v["count"] else 0.0,
         }
         for k, v in timeframe_bins.items()
     }

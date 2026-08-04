@@ -16,6 +16,7 @@ from app.backtest.vbt import _as_timedelta_freq
         ("Q-DEC", "90D"),
         ("A-DEC", "365D"),
         ("Y", "365D"),
+        ("D", "1D"),
         ("1H", "1H"),      # already convertible — passed through unchanged
         ("4H", "4H"),
         ("1D", "1D"),
