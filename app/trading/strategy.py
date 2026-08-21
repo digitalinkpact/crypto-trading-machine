@@ -35,6 +35,17 @@ class StrategyDecision:
     indicators: dict[str, Any]
 
 
+@dataclass
+class EntryCandidate:
+    ready: bool
+    score: int
+    detail: dict[str, Any]
+
+
+def _clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+
+
 class ProfitStreamStrategy:
     """Evidence-led dip-buy strategy with explainable rejects."""
 
@@ -63,6 +74,17 @@ class ProfitStreamStrategy:
         btc_regime = compute_btc_regime_score(btc_1d)
         daily_quote = self._latest_quote_volume(df_1d)
         extended, extension_pct = self._dip_too_extended(df_1d)
+        # Candidate entry types under evaluation (2026-08-21 walk-forward):
+        # logged for every tick so forensic queries can see what each would
+        # have scored, but NONE of them drive the live BUY/SELL decision below
+        # except the existing dip-buy — only oversold_bounce showed a robust,
+        # regime-gated out-of-sample edge; pullback/breakout/ma_reversion did
+        # not (see scripts/walkforward.py --market-filter results) and are not
+        # wired into execution.
+        candidates = {
+            name: {"ready": c.ready, "score": c.score, **c.detail}
+            for name, c in self._score_entry_candidates(df_1d).items()
+        }
 
         indicators.update(
             {
@@ -78,6 +100,7 @@ class ProfitStreamStrategy:
                 "btc_regime_score": btc_regime.score,
                 "btc_regime_label": btc_regime.label,
                 "ema20_extension_pct": extension_pct,
+                "entry_candidates": candidates,
             }
         )
 
@@ -190,6 +213,70 @@ class ProfitStreamStrategy:
             return False, 0.0
         rsi = float(out.iloc[-1]["rsi_14"])
         return rsi > 55, rsi
+
+    def _score_entry_candidates(self, df: pd.DataFrame) -> dict[str, EntryCandidate]:
+        """Score 4 candidate entry types for observability (NOT for gating).
+
+        2026-08-21 walk-forward (scripts/walkforward.py --market-filter, 25
+        symbols, 1d, 3 folds): only `oversold_bounce` was ROBUST + (mean
+        +16.5%, positive in every fold with trades) when gated by the BTC
+        regime hard-block; `pullback_to_ema`/`ma_reversion` were negative in
+        most folds and `breakout_momentum` was mixed — none of the three
+        showed a validated edge, so they stay observability-only here.
+        """
+        out = df.dropna()
+        needed = {"rsi_14", "bb_lower", "ema_20", "ema_50", "macd_hist", "volume", "vol_sma_20"}
+        if out.empty or len(out) < 51 or not needed <= set(out.columns):
+            empty = EntryCandidate(False, 0, {"reason": "insufficient_data"})
+            return {k: empty for k in ("oversold_bounce", "pullback_to_ema", "breakout_momentum", "ma_reversion")}
+
+        last = out.iloc[-1]
+        close = float(last["close"])
+        rsi = float(last["rsi_14"])
+        bb_lower = float(last["bb_lower"])
+        ema20 = float(last["ema_20"])
+        ema50 = float(last["ema_50"])
+        macd_hist = float(last["macd_hist"])
+        prev_macd_hist = float(out.iloc[-2]["macd_hist"])
+        vol = float(last["volume"])
+        vol_avg = float(last["vol_sma_20"])
+        low5 = float(out["low"].tail(5).min())
+        high20_excl_last = float(out["high"].iloc[-21:-1].max()) if len(out) > 20 else float("inf")
+        sma50 = float(out["close"].tail(50).mean())
+        prev_close = float(out.iloc[-2]["close"])
+        prev2_close = float(out.iloc[-3]["close"]) if len(out) > 2 else prev_close
+
+        # 1. OVERSOLD_BOUNCE — deeper/looser dip-buy than the live one, but
+        # requires the price already off its 5-day low (not still in free-fall).
+        bounce_ready = bool(rsi < 40 and close < bb_lower * 1.02 and low5 > 0 and close > low5 * 1.05)
+        bounce_score = _clamp(70 + int(15 * max(0.0, (40 - rsi) / 40)), 70, 85) if bounce_ready else 0
+
+        # 2. PULLBACK_TO_EMA — uptrend pullback to EMA20, RSI cooled to 45-55,
+        # MACD histogram turning back up.
+        ema_dist_pct = abs(close - ema20) / ema20 if ema20 > 0 else 1.0
+        pullback_ready = bool(
+            ema_dist_pct <= 0.02 and 45 <= rsi <= 55 and ema20 > ema50 and macd_hist > prev_macd_hist
+        )
+        pullback_score = _clamp(75 + int(15 * (1 - min(ema_dist_pct / 0.02, 1.0))), 75, 90) if pullback_ready else 0
+
+        # 3. BREAKOUT_MOMENTUM — 20-day high break on >1.5x volume, RSI rising
+        # but not yet overbought.
+        vol_ratio = (vol / vol_avg) if vol_avg > 0 else 0.0
+        breakout_ready = bool(close > high20_excl_last and vol_ratio > 1.5 and 55 < rsi < 75)
+        breakout_score = _clamp(80 + int(15 * min((vol_ratio - 1.5) / 1.5, 1.0)), 80, 95) if breakout_ready else 0
+
+        # 4. MA_REVERSION ("VWAP_REVERSION" requested; daily candles have no
+        # intraday VWAP, so this is a literal 50-day SMA reversion instead).
+        sma_dist_pct = abs(close - sma50) / sma50 if sma50 > 0 else 1.0
+        ma_reversion_ready = bool(sma_dist_pct <= 0.01 and rsi < 50 and prev_close > prev2_close)
+        ma_reversion_score = _clamp(65 + int(15 * (50 - rsi) / 50), 65, 80) if ma_reversion_ready else 0
+
+        return {
+            "oversold_bounce": EntryCandidate(bounce_ready, bounce_score, {"rsi": rsi, "low5": low5}),
+            "pullback_to_ema": EntryCandidate(pullback_ready, pullback_score, {"ema_dist_pct": ema_dist_pct, "rsi": rsi}),
+            "breakout_momentum": EntryCandidate(breakout_ready, breakout_score, {"vol_ratio": vol_ratio, "rsi": rsi}),
+            "ma_reversion": EntryCandidate(ma_reversion_ready, ma_reversion_score, {"sma_dist_pct": sma_dist_pct, "rsi": rsi}),
+        }
 
     def _btc_risk_on(self, btc_1d: pd.DataFrame) -> tuple[bool, float, float]:
         out = btc_1d.dropna()

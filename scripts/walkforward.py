@@ -91,12 +91,65 @@ def s_donchian_trend(df: pd.DataFrame) -> Signals:
     return _cross_up(entries).fillna(False), exits.fillna(False)
 
 
+# ── Candidate entry types under evaluation (not yet live) ──────────────
+# Requested as a replacement for the single dip-buy signal. Measuring each
+# independently, out-of-sample, before any of them touch live gates — per
+# "each component must be tested independently" / "do not force more trades".
+
+def s_oversold_bounce(df: pd.DataFrame) -> Signals:
+    """RSI<40 dip near/below the lower band, but already showing recovery
+    (price >5% above its own 5-day low) rather than still free-falling."""
+    close, rsi = df["close"], df["rsi_14"]
+    low5 = df["low"].rolling(5).min()
+    entries = (rsi < 40) & (close < df["bb_lower"] * 1.02) & (close > low5 * 1.05)
+    exits = rsi > 55
+    return _cross_up(entries).fillna(False), exits.fillna(False)
+
+
+def s_pullback_to_ema(df: pd.DataFrame) -> Signals:
+    """Uptrend (EMA20>EMA50) pullback to within 2% of EMA20, RSI cooled to
+    45-55, MACD histogram turning back up (momentum shift)."""
+    close, ema20, ema50, rsi, mh = df["close"], df["ema_20"], df["ema_50"], df["rsi_14"], df["macd_hist"]
+    near_ema = (close - ema20).abs() / ema20 <= 0.02
+    entries = near_ema & (rsi >= 45) & (rsi <= 55) & (ema20 > ema50) & (mh > mh.shift(1))
+    exits = ema20 < ema50
+    return _cross_up(entries).fillna(False), exits.fillna(False)
+
+
+def s_breakout_momentum(df: pd.DataFrame) -> Signals:
+    """20-day high breakout on >1.5x average volume, RSI rising but not
+    yet overbought (55-75) — trend continuation, not a blow-off top."""
+    close, rsi, vol, vol_avg = df["close"], df["rsi_14"], df["volume"], df["vol_sma_20"]
+    hi20 = df["high"].rolling(20).max().shift(1)
+    entries = (close > hi20) & (vol > vol_avg * 1.5) & (rsi > 55) & (rsi < 75)
+    exits = close < df["ema_20"]
+    return _cross_up(entries).fillna(False), exits.fillna(False)
+
+
+def s_ma_reversion(df: pd.DataFrame) -> Signals:
+    """Price settling back to its 50-day MA (not EMA) after cooling off
+    (RSI<50), with the prior day's momentum still positive. Requested as
+    "VWAP_REVERSION" but daily candles have no intraday VWAP — this is a
+    literal 50-day simple-moving-average reversion instead."""
+    close, rsi = df["close"], df["rsi_14"]
+    sma50 = close.rolling(50).mean()
+    prev_up = close.shift(1) > close.shift(2)
+    near_sma = (close - sma50).abs() / sma50 <= 0.01
+    entries = near_sma & (rsi < 50) & prev_up
+    exits = rsi > 60
+    return _cross_up(entries).fillna(False), exits.fillna(False)
+
+
 STRATEGIES: dict[str, Strategy] = {
     "baseline":         s_baseline,
     "dip_buy":          s_dip_buy,
     "trend_follow":     s_trend_follow,
     "trend_confluence": s_trend_confluence,
     "donchian_trend":   s_donchian_trend,
+    "oversold_bounce":  s_oversold_bounce,
+    "pullback_to_ema":  s_pullback_to_ema,
+    "breakout_momentum": s_breakout_momentum,
+    "ma_reversion":     s_ma_reversion,
 }
 
 

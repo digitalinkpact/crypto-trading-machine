@@ -134,3 +134,90 @@ async def test_profitstream_allows_modest_dip_within_extension_band(monkeypatch)
     decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
 
     assert decision.action == SignalAction.BUY
+
+
+# ── candidate entry-type scoring (observability only, not live-gating) ─────
+
+
+def _candidate_frame(n: int = 55, **col_overrides) -> pd.DataFrame:
+    idx = pd.date_range("2026-01-01", periods=n, freq="1D", tz="UTC")
+    base = {
+        "close": [100.0] * n,
+        "high": [100.0] * n,
+        "low": [100.0] * n,
+        "volume": [500.0] * n,
+        "rsi_14": [50.0] * n,
+        "bb_lower": [100.0] * n,
+        "ema_20": [100.0] * n,
+        "ema_50": [100.0] * n,
+        "macd_hist": [0.0] * n,
+        "vol_sma_20": [500.0] * n,
+    }
+    for key, tail_values in col_overrides.items():
+        base[key][-len(tail_values):] = tail_values
+    return pd.DataFrame(base, index=idx)
+
+
+def test_oversold_bounce_ready_when_recovering_off_5day_low():
+    strategy = ProfitStreamStrategy()
+    df = _candidate_frame(
+        low=[80, 82, 84, 86, 88],
+        close=[82, 84, 86, 90, 94],
+        rsi_14=[50, 50, 50, 50, 25],
+        bb_lower=[100.0] * 5,
+    )
+    candidates = strategy._score_entry_candidates(df)
+    c = candidates["oversold_bounce"]
+    assert c.ready is True
+    assert 70 <= c.score <= 85
+
+
+def test_pullback_to_ema_ready_on_uptrend_pullback():
+    strategy = ProfitStreamStrategy()
+    df = _candidate_frame(
+        ema_20=[100.0] * 5,
+        ema_50=[95.0] * 5,
+        close=[101.0] * 5,
+        rsi_14=[50.0] * 5,
+        macd_hist=[0.0, 0.0, 0.0, 0.2, 0.5],
+    )
+    candidates = strategy._score_entry_candidates(df)
+    c = candidates["pullback_to_ema"]
+    assert c.ready is True
+    assert 75 <= c.score <= 90
+
+
+def test_breakout_momentum_ready_on_high_break_with_volume():
+    strategy = ProfitStreamStrategy()
+    df = _candidate_frame(
+        high=[100.0] * 20 + [110.0],
+        close=[100.0] * 20 + [110.0],
+        rsi_14=[50.0] * 20 + [60.0],
+        volume=[500.0] * 20 + [1000.0],
+        vol_sma_20=[500.0] * 21,
+    )
+    candidates = strategy._score_entry_candidates(df)
+    c = candidates["breakout_momentum"]
+    assert c.ready is True
+    assert 80 <= c.score <= 95
+
+
+def test_ma_reversion_ready_near_sma50_with_positive_carryover():
+    strategy = ProfitStreamStrategy()
+    df = _candidate_frame(
+        close=[100.0, 100.1, 100.3, 100.5],
+        rsi_14=[50.0, 50.0, 50.0, 40.0],
+    )
+    candidates = strategy._score_entry_candidates(df)
+    c = candidates["ma_reversion"]
+    assert c.ready is True
+    assert 65 <= c.score <= 80
+
+
+def test_candidates_not_ready_when_no_setup_present():
+    strategy = ProfitStreamStrategy()
+    df = _candidate_frame()  # flat, neutral RSI — nothing should qualify
+    candidates = strategy._score_entry_candidates(df)
+    for name, c in candidates.items():
+        assert c.ready is False, name
+        assert c.score == 0, name
