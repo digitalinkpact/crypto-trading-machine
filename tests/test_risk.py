@@ -145,3 +145,50 @@ def test_max_long_exposure_cap():
     blocked, why = risk.can_open_new_position(open_positions=1, long_exposure_pct=0.65)
     assert blocked is False
     assert "long_exposure" in why
+
+
+def test_daily_loss_limit_trips_on_todays_realized_losses(monkeypatch):
+    """Distinct from the cumulative drawdown breaker: sums only TODAY's
+    realized pnl and halts new BUYs once it exceeds daily_loss_limit_pct."""
+    now = datetime.now(timezone.utc)
+    yesterday = now - timedelta(days=1, hours=1)
+    trades = [
+        {"mode": "live", "pnl": -60.0, "exit_ts": now.isoformat()},
+        {"mode": "live", "pnl": -50.0, "exit_ts": now.isoformat()},
+        # Old loss from a prior day must NOT count toward today's total.
+        {"mode": "live", "pnl": -500.0, "exit_ts": yesterday.isoformat()},
+        # Different mode must not bleed into this mode's total.
+        {"mode": "paper", "pnl": -1000.0, "exit_ts": now.isoformat()},
+    ]
+    monkeypatch.setattr(risk.storage, "closed_trades", lambda limit=500: trades, raising=True)
+
+    tripped, today_pnl = risk.is_daily_loss_limit_tripped(
+        mode="live", starting_balance=Decimal("1000"), now=now
+    )
+    assert tripped is True  # -110 realized vs 5% of 1000 = -50 limit
+    assert today_pnl == Decimal("-110.0")
+
+
+def test_daily_loss_limit_not_tripped_within_band(monkeypatch):
+    now = datetime.now(timezone.utc)
+    trades = [{"mode": "live", "pnl": -10.0, "exit_ts": now.isoformat()}]
+    monkeypatch.setattr(risk.storage, "closed_trades", lambda limit=500: trades, raising=True)
+
+    tripped, today_pnl = risk.is_daily_loss_limit_tripped(
+        mode="live", starting_balance=Decimal("1000"), now=now
+    )
+    assert tripped is False
+    assert today_pnl == Decimal("-10.0")
+
+
+def test_daily_loss_limit_disabled_never_trips(monkeypatch):
+    class _S:
+        daily_loss_limit_enabled = False
+        daily_loss_limit_pct = 0.05
+
+    monkeypatch.setattr(risk, "get_settings", lambda: _S())
+    tripped, pnl = risk.is_daily_loss_limit_tripped(
+        mode="live", starting_balance=Decimal("1000")
+    )
+    assert tripped is False
+    assert pnl == Decimal("0")

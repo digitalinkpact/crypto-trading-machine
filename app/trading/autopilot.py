@@ -144,6 +144,11 @@ class Autopilot:
         # The regime is portfolio-wide, so it is computed once and reused for
         # every symbol within a tick instead of refetching BTC per candidate.
         self._market_regime_cache: Optional[tuple[bool, str, float]] = None
+        # Scored BTC regime (-2..+2) from the most recent _market_gate() call.
+        # Defaults to "bull" (2) so unit tests that mock _market_gate wholesale
+        # never trip the sideways-tier stricter-score check below by accident;
+        # real ticks always overwrite this before it's read.
+        self._last_regime_score: int = 2
         self._orderbook_retry_tasks: dict[tuple[str, str], asyncio.Task] = {}
 
     # ── persistence ────────────────────────────────────────────────────
@@ -434,7 +439,22 @@ class Autopilot:
                 f"DRAWDOWN BREAKER TRIPPED at {dd:.1%} — new BUYs halted"
             )
             log.warning(self.state.last_error)
-        return tripped
+            return True
+
+        # Distinct from cumulative drawdown: halts new BUYs once TODAY's
+        # realized losses exceed daily_loss_limit_pct of starting equity.
+        # Existing positions are still protected/managed either way.
+        daily_tripped, today_pnl = risk.is_daily_loss_limit_tripped(
+            mode=self.state.mode,
+            starting_balance=self.state.starting_balance_usdt,
+        )
+        if daily_tripped:
+            self.state.last_error = (
+                f"DAILY LOSS LIMIT TRIPPED (today's realized pnl={today_pnl:.2f}) — new BUYs halted"
+            )
+            log.warning(self.state.last_error)
+            return True
+        return False
 
     # ── execution ──────────────────────────────────────────────────────
     async def _execute_signal(self, symbol: str, sig, *, allow_buys: bool) -> tuple[bool, str]:
@@ -656,6 +676,7 @@ class Autopilot:
                 entry.setdefault(
                     "agents", list(getattr(sig, "contributing_agents", []) or [])
                 )
+                entry.setdefault("quality_score", getattr(sig, "quality_score", None))
             entry.setdefault("filters", {})
             return entry
 
@@ -672,6 +693,7 @@ class Autopilot:
             entry["final_reason"] = reason
             entry["submitted"] = submitted
             _bump(reason, sym, detail)
+            audit_detail = {"detail": detail, **_jsonable(entry)}
             min_notional_info = (entry.get("filters") or {}).get("min_notional") or {}
             min_notional_passed = min_notional_info.get("ok") if min_notional_info else None
             signal_val = entry.get("action") or (getattr(sig.action, "value", "HOLD") if sig is not None else "HOLD")
@@ -697,7 +719,7 @@ class Autopilot:
                 binance_response=("SUCCESS" if submitted else "REJECTED"),
                 exception=None,
                 final_outcome=reason,
-                detail={"detail": detail},
+                detail=audit_detail,
             )
             if entry.get("action") == SignalAction.BUY.value:
                 log.info("[BUY_TRACE] %s %s", sym, json.dumps(_jsonable(entry), sort_keys=True))
@@ -1005,6 +1027,16 @@ class Autopilot:
                         ("cooldown bypassed for pyramid add" if is_pyramid else f"cooldown window clear ({cooldown})"),
                         sig,
                     )
+                    # Extra, reason-specific cooldown after a stop-loss exit —
+                    # don't let the bot immediately re-enter the exact setup
+                    # that just lost money. Separate from the flat time cooldown
+                    # above (which applies after any BUY, win or loss).
+                    sl_cooldown, sl_why = self._stop_loss_cooldown_active(symbol)
+                    if sl_cooldown and not is_pyramid:
+                        _set_filter(symbol, "stop_loss_cooldown", False, sl_why, sig)
+                        _finish(symbol, "stop_loss_cooldown", sl_why, submitted=False, sig=sig)
+                        continue
+                    _set_filter(symbol, "stop_loss_cooldown", True, "ok", sig)
                     entry_price = current_price if current_price is not None else await self._price(symbol)
                     current_position_notional = None
                     if open_pos is not None:
@@ -1044,6 +1076,18 @@ class Autopilot:
                         sig,
                     )
 
+                    # Correlation / basket exposure cap — BTC/ETH/SOL/... tend to
+                    # move together, so stacking several "independent" longs in
+                    # the same basket is really one concentrated bet.
+                    corr_ok, corr_why = await self._correlation_basket_gate(
+                        symbol, per_trade_usdt, open_positions, total_eq
+                    )
+                    _set_filter(symbol, "correlation_gate", corr_ok, corr_why, sig)
+                    if not corr_ok:
+                        _finish(symbol, "correlation_gate", corr_why, submitted=False, sig=sig)
+                        log.info("skip %s BUY: %s", symbol, corr_why)
+                        continue
+
                     # Market-regime kill-switch — block ALL new longs while the
                     # broad market (BTC) is in a confirmed downtrend. Spot is
                     # long-only; walk-forward backtests show every sustained loss
@@ -1054,6 +1098,38 @@ class Autopilot:
                         _finish(symbol, "market_gate", market_why, submitted=False, sig=sig)
                         log.info("skip %s BUY: %s", symbol, market_why)
                         continue
+
+                    # Sideways-tier stricter setup requirement: when BTC's scored
+                    # regime is neutral (neither confirmed bull nor bear), only
+                    # take the trade if the strategy's own quality score clears
+                    # an extra bonus bar above the normal threshold.
+                    regime_score = self._last_regime_score
+                    _entry(symbol, sig)["btc_regime_score"] = regime_score
+                    if regime_score == 0:
+                        bonus = int(getattr(s, "market_regime_sideways_score_bonus", 15))
+                        required_score = int(getattr(s, "profitstream_score_threshold", 80)) + bonus
+                        local_score = int(getattr(sig, "quality_score", 0) or 0)
+                        sideways_ok = local_score >= required_score
+                        _set_filter(
+                            symbol,
+                            "market_regime_sideways",
+                            sideways_ok,
+                            f"local_score={local_score} required>={required_score} (sideways BTC regime)",
+                            sig,
+                        )
+                        if not sideways_ok:
+                            _finish(
+                                symbol,
+                                "market_regime_sideways",
+                                f"local_score={local_score}<{required_score} required in sideways BTC regime",
+                                submitted=False,
+                                sig=sig,
+                            )
+                            log.info(
+                                "skip %s BUY: sideways regime needs stronger setup (score=%s<%s)",
+                                symbol, local_score, required_score,
+                            )
+                            continue
 
                     # Long-term trend filter — don't buy an asset below its
                     # 200-EMA. Spot is long-only, so a downtrend long just feeds
@@ -1289,6 +1365,84 @@ class Autopilot:
         if not last:
             return False
         return (now - last) < cooldown
+
+    def _stop_loss_cooldown_active(self, symbol: str) -> tuple[bool, str]:
+        """Longer, reason-specific cooldown after a stop-loss exit.
+
+        Distinct from the flat `buy_cooldown_minutes` (which applies after any
+        BUY fill regardless of outcome): this specifically blocks immediately
+        re-entering a symbol that JUST stopped out, so the bot can't repeatedly
+        lose money re-buying the same failed setup. Only the symbol's most
+        recent closed trade matters — a win since then clears this cooldown.
+        """
+        s = get_settings()
+        minutes = int(getattr(s, "stop_loss_cooldown_minutes", 60))
+        if minutes <= 0:
+            return False, "ok"
+        trades = [
+            t for t in storage.closed_trades(limit=10)
+            if t.get("symbol") == symbol and t.get("mode") == self.state.mode
+        ]
+        if not trades:
+            return False, "ok"
+        last = trades[0]  # closed_trades() is ORDER BY id DESC — most recent first
+        if last.get("exit_reason") != "stop_loss":
+            return False, "ok"
+        exit_ts = _parse_dt(last.get("exit_ts"))
+        if exit_ts is None:
+            return False, "ok"
+        if exit_ts.tzinfo is None:
+            exit_ts = exit_ts.replace(tzinfo=timezone.utc)
+        resume_at = exit_ts + timedelta(minutes=minutes)
+        now = datetime.now(timezone.utc)
+        if now < resume_at:
+            return True, f"stop_loss_cooldown active until {resume_at.isoformat()}"
+        return False, "ok"
+
+    async def _correlation_basket_gate(
+        self,
+        symbol: str,
+        proposed_notional: Decimal,
+        open_positions: list[dict],
+        total_eq: Decimal,
+    ) -> tuple[bool, str]:
+        """Cap combined exposure to a basket of correlated symbols.
+
+        BTC/ETH/SOL/... tend to move together, so several "independent" longs
+        in the same basket are really one concentrated bet. FAIL-OPEN: disabled,
+        symbol not in a configured group, or a price lookup failure always
+        allows the trade (this is a concentration guard on top of the existing
+        per-position and long-exposure caps, not a replacement for them).
+        """
+        s = get_settings()
+        if not getattr(s, "correlation_gate_enabled", True):
+            return True, "correlation_gate_disabled"
+        group = next(
+            (g for g in getattr(s, "correlated_symbol_groups", ()) if symbol in g),
+            None,
+        )
+        if group is None:
+            return True, "not_in_correlated_group"
+        if total_eq <= 0:
+            return True, "no_equity_data"
+
+        basket_notional = proposed_notional
+        for pos in open_positions:
+            if pos.get("symbol") not in group or pos.get("symbol") == symbol:
+                continue
+            try:
+                qty = Decimal(str(pos.get("qty") or "0"))
+                price = await self._price(pos["symbol"])
+                basket_notional += qty * price
+            except Exception as exc:  # noqa: BLE001
+                log.debug("[CORRELATION] price lookup failed for %s: %s", pos.get("symbol"), exc)
+                return True, f"correlation_unavailable:{exc}"
+
+        cap_pct = float(getattr(s, "max_correlated_exposure_pct", 0.35))
+        basket_pct = float(basket_notional / total_eq)
+        if basket_pct > cap_pct:
+            return False, f"correlated_basket_exposure={basket_pct:.1%}>{cap_pct:.0%} group={group}"
+        return True, f"correlated_basket_exposure={basket_pct:.1%}<={cap_pct:.0%}"
 
     def _pyramid_adds_key(self, symbol: str) -> str:
         return f"pyramid_adds:{self.state.mode}:{symbol}"
@@ -1668,41 +1822,49 @@ class Autopilot:
     async def _market_gate(self) -> tuple[bool, str]:
         """Portfolio-wide kill-switch: block new longs in a BTC downtrend.
 
-        Risk-OFF when BTC's 50-EMA is below its 200-EMA (a confirmed "death
-        cross"). Walk-forward backtests show every sustained loss occurs while
-        the broad market bleeds; spot is long-only so there is no edge to take
-        there — stay in cash. The verdict is identical for every symbol in a
-        tick, so it is cached briefly to avoid refetching BTC per candidate.
+        Uses the multi-factor scored regime (app/regime/btc_regime.py, -2..+2)
+        rather than a single EMA cross. BULL/STRONG_BULL (score>=1) allows
+        entries; BEAR/STRONG_BEAR (score<=-1) blocks ALL new longs — spot is
+        long-only, so there is no edge to take there and no walk-forward-
+        validated reversal setup exists to justify a bypass. SIDEWAYS
+        (score==0) still returns allowed=True here; `_execute` additionally
+        requires a higher-quality local setup in that tier (see
+        `market_regime_sideways_score_bonus`) via `self._last_regime_score`.
+        The verdict is identical for every symbol in a tick, so it is cached
+        briefly to avoid refetching BTC per candidate.
         FAIL-OPEN: disabled or missing BTC data always allows trading.
         """
         s = get_settings()
         if not getattr(s, "market_regime_gate_enabled", True):
+            self._last_regime_score = 2
             return True, "market_gate_disabled"
         cache = self._market_regime_cache
         if cache is not None and (asyncio.get_event_loop().time() - cache[2]) < 300.0:
+            self._last_regime_score = cache[3] if len(cache) > 3 else 2
             return cache[0], cache[1]
-        allowed, reason = True, "market_no_data"
+        allowed, reason, score = True, "market_no_data", 2
         try:
             from app.data import OHLCVRepository
+            from app.regime.btc_regime import compute_btc_regime_score
             from app.ta import add_indicators
 
             df = await OHLCVRepository().get("BTCUSDT", Timeframe.D1, refresh=False)
             df = add_indicators(df).dropna()
             if not df.empty and {"ema_50", "ema_200"} <= set(df.columns):
-                last = df.iloc[-1]
-                ema50 = float(last["ema_50"])
-                ema200 = float(last["ema_200"])
-                if ema200 > 0:
-                    if ema50 < ema200:
-                        allowed = False
-                        reason = f"BTC risk-off (ema50 {ema50:.0f} < ema200 {ema200:.0f})"
-                    else:
-                        allowed = True
-                        reason = f"BTC risk-on (ema50 {ema50:.0f} >= ema200 {ema200:.0f})"
+                result = compute_btc_regime_score(df)
+                score = result.score
+                if score <= -1:
+                    allowed = False
+                    reason = f"BTC regime {result.label} score={score} risk-off ({result.detail})"
+                else:
+                    allowed = True
+                    reason = f"BTC regime {result.label} score={score} risk-on ({result.detail})"
         except Exception as exc:  # noqa: BLE001
             log.debug("[MARKET] regime gate failed (%s) — allowing", exc)
             reason = f"market_unavailable:{exc}"
-        self._market_regime_cache = (allowed, reason, asyncio.get_event_loop().time())
+            score = 2
+        self._market_regime_cache = (allowed, reason, asyncio.get_event_loop().time(), score)
+        self._last_regime_score = score
         return allowed, reason
 
     async def _onchain_gate(self, symbol: str) -> tuple[bool, str]:

@@ -279,6 +279,46 @@ class Settings(BaseSettings):
     # long-only, so there is no edge to capture while the market bleeds — sit
     # in cash instead. FAIL-OPEN: missing BTC data always allows trading.
     market_regime_gate_enabled: bool = False
+    # The gate now scores BTC's regime -2..+2 (app/regime/btc_regime.py) instead
+    # of a single binary EMA cross: BULL/STRONG_BULL (score>=1) allows normal
+    # entries, BEAR/STRONG_BEAR (score<=-1) blocks all new longs (no bypass —
+    # we have no walk-forward-validated reversal setup to justify one), and
+    # SIDEWAYS (score==0) allows entries only if the strategy's own quality
+    # score clears this extra bonus above `profitstream_score_threshold`.
+    market_regime_sideways_score_bonus: int = Field(15, ge=0, le=100)
+
+    # ── Anti-chase / extension guard ──────────────────────────────────
+    # A dip-buy that is too far *below* its EMA20 is more likely a falling
+    # knife/capitulation event than a healthy pullback — reject it instead of
+    # chasing the crash. Distance is (ema20 - close) / ema20.
+    max_dip_extension_pct: float = Field(0.15, ge=0.01, le=0.60)
+
+    # ── Correlation / basket exposure cap ─────────────────────────────
+    # Treat these symbols as one "basket" (they tend to move together with
+    # BTC) and cap their COMBINED exposure separately from the general
+    # max_long_exposure_pct, so the bot can't stack several correlated bets
+    # that are effectively one trade (e.g. BTC + ETH + SOL all long at once).
+    correlation_gate_enabled: bool = True
+    correlated_symbol_groups: tuple[tuple[str, ...], ...] = (
+        ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"),
+    )
+    max_correlated_exposure_pct: float = Field(0.35, ge=0.0, le=1.0)
+
+    # ── Entry cooldown after a stop-out ────────────────────────────────
+    # A plain time cooldown (buy_cooldown_minutes) applies after every BUY
+    # fill; this ADDS a longer, reason-specific cooldown after a stop-loss
+    # exit specifically, so the bot can't immediately re-enter the exact
+    # setup that just lost money. The regular market/trend/risk gates still
+    # apply on top once this cooldown clears (fresh signal + regime check).
+    stop_loss_cooldown_minutes: int = Field(60, ge=0, le=1440)
+
+    # ── Daily loss limit ───────────────────────────────────────────────
+    # Distinct from drawdown_circuit_breaker_pct (which trips on cumulative
+    # drawdown since the process started). This resets every UTC day and
+    # halts new BUYs once today's realized losses exceed this fraction of
+    # starting equity — existing positions are still protected/managed.
+    daily_loss_limit_enabled: bool = True
+    daily_loss_limit_pct: float = Field(0.05, ge=0.0, le=1.0)
 
     # Agent thresholds (tunable without code change)
     rsi_oversold: int = Field(25, ge=5, le=50)                   # was 30

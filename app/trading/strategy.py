@@ -18,6 +18,7 @@ from app.config import get_settings
 from app.exchange import BinanceUSClient
 from app.exchange.orderbook import analyze_order_book
 from app.logging_setup import get_logger
+from app.regime.btc_regime import compute_btc_regime_score
 from app.signals import SignalAction
 from app.storage import storage
 from app.ta import add_indicators
@@ -59,7 +60,9 @@ class ProfitStreamStrategy:
         exit_ready, exit_rsi = self._mean_reversion_exit(df_1d)
         dip_ready, dip_rsi = self._dip_buy_setup(df_1d)
         btc_risk_on, btc_ema50, btc_ema200 = self._btc_risk_on(btc_1d)
+        btc_regime = compute_btc_regime_score(btc_1d)
         daily_quote = self._latest_quote_volume(df_1d)
+        extended, extension_pct = self._dip_too_extended(df_1d)
 
         indicators.update(
             {
@@ -72,6 +75,9 @@ class ProfitStreamStrategy:
                 "btc_ema50_1d": btc_ema50,
                 "btc_ema200_1d": btc_ema200,
                 "btc_risk_on_1d": btc_risk_on,
+                "btc_regime_score": btc_regime.score,
+                "btc_regime_label": btc_regime.label,
+                "ema20_extension_pct": extension_pct,
             }
         )
 
@@ -86,6 +92,12 @@ class ProfitStreamStrategy:
             filt_ok = False
             reasons.append(
                 f"low_volume:{daily_quote:.2f}<{s.profitstream_low_volume_quote_min:.2f}"
+            )
+
+        if extended:
+            filt_ok = False
+            reasons.append(
+                f"extension_too_deep_falling_knife:{extension_pct:.2%}>{s.max_dip_extension_pct:.2%}"
             )
 
         near_news, next_news = self._near_news_event()
@@ -149,6 +161,28 @@ class ProfitStreamStrategy:
         close = float(last["close"])
         bb_lower = float(last["bb_lower"])
         return bool(rsi < 30 and close <= bb_lower), rsi
+
+    def _dip_too_extended(self, df: pd.DataFrame) -> tuple[bool, float]:
+        """Anti-chase / falling-knife guard.
+
+        A dip-buy is a healthy pullback when price is modestly below its
+        EMA20; once the distance passes `max_dip_extension_pct` it's more
+        likely a capitulation event still accelerating downward than a
+        reward/risk-favorable entry. Returns (too_extended, extension_pct).
+        extension_pct is positive when price is below the EMA (0.0 or
+        negative when at/above it, which is never "too extended").
+        """
+        s = get_settings()
+        out = df.dropna()
+        if out.empty or "ema_20" not in out.columns:
+            return False, 0.0
+        last = out.iloc[-1]
+        ema20 = float(last["ema_20"])
+        close = float(last["close"])
+        if ema20 <= 0:
+            return False, 0.0
+        extension_pct = (ema20 - close) / ema20
+        return extension_pct > s.max_dip_extension_pct, extension_pct
 
     def _mean_reversion_exit(self, df: pd.DataFrame) -> tuple[bool, float]:
         out = df.dropna()

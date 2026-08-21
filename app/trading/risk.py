@@ -198,6 +198,53 @@ def is_circuit_breaker_tripped(
     return (dd <= -threshold), float(dd)
 
 
+# ─── Daily loss limit ───────────────────────────────────────────────────────
+
+
+def is_daily_loss_limit_tripped(
+    *,
+    mode: str,
+    starting_balance: Optional[Decimal],
+    now: Optional[datetime] = None,
+) -> tuple[bool, Decimal]:
+    """Return (tripped, today_realized_pnl).
+
+    Distinct from the cumulative drawdown breaker: sums realized PnL from
+    `closed_trades` for the current UTC calendar day and halts new BUYs once
+    the loss exceeds `daily_loss_limit_pct` of starting equity. Resets at UTC
+    midnight simply because trades from a prior day no longer match `today`.
+    FAIL-OPEN: disabled, or no starting balance known, never trips.
+    """
+    s = get_settings()
+    if not getattr(s, "daily_loss_limit_enabled", True):
+        return False, Decimal("0")
+    if not starting_balance or starting_balance <= 0:
+        return False, Decimal("0")
+
+    now = now or datetime.now(timezone.utc)
+    today = now.date()
+    today_pnl = Decimal("0")
+    for t in storage.closed_trades(limit=500):
+        if t.get("mode") != mode:
+            continue
+        exit_ts_raw = t.get("exit_ts")
+        if not exit_ts_raw:
+            continue
+        try:
+            exit_ts = datetime.fromisoformat(str(exit_ts_raw))
+            if exit_ts.tzinfo is None:
+                exit_ts = exit_ts.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if exit_ts.date() != today:
+            continue
+        today_pnl += Decimal(str(t.get("pnl", 0)))
+
+    limit = starting_balance * Decimal(str(s.daily_loss_limit_pct))
+    return (today_pnl <= -limit), today_pnl
+
+
+
 # ─── Position sizing helpers ───────────────────────────────────────────────
 
 

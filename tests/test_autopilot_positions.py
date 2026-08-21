@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pandas as pd
@@ -77,23 +78,39 @@ def _patch_market_data(monkeypatch, df: pd.DataFrame, *, enabled: bool = True) -
 
 
 async def test_market_gate_blocks_btc_downtrend(monkeypatch):
-    """BTC 50-EMA below 200-EMA (death cross) must veto ALL new longs."""
+    """A confirmed multi-factor bear regime (falling ema50 well below ema200,
+    price below ema50) must veto ALL new longs."""
     ap = Autopilot()
-    df = pd.DataFrame({"close": [100.0], "ema_50": [90.0], "ema_200": [100.0]})
+    df = pd.DataFrame(
+        {
+            "close": [110, 108, 106, 104, 102, 100, 98, 96],
+            "ema_50": [130, 128, 126, 124, 122, 120, 118, 116],
+            "ema_200": [150] * 8,
+        }
+    )
     _patch_market_data(monkeypatch, df)
     ok, why = await ap._market_gate()
     assert ok is False
     assert "risk-off" in why
+    assert ap._last_regime_score <= -1
 
 
 async def test_market_gate_allows_btc_uptrend(monkeypatch):
-    """BTC 50-EMA at/above 200-EMA (golden cross) must allow longs."""
+    """A confirmed multi-factor bull regime (rising ema50 well above ema200,
+    price above ema50) must allow longs."""
     ap = Autopilot()
-    df = pd.DataFrame({"close": [100.0], "ema_50": [110.0], "ema_200": [100.0]})
+    df = pd.DataFrame(
+        {
+            "close": [90, 92, 94, 96, 98, 100, 102, 104],
+            "ema_50": [70, 72, 74, 76, 78, 80, 82, 84],
+            "ema_200": [75] * 8,
+        }
+    )
     _patch_market_data(monkeypatch, df)
     ok, why = await ap._market_gate()
     assert ok is True
     assert "risk-on" in why
+    assert ap._last_regime_score >= 1
 
 
 async def test_market_gate_disabled_fail_open(monkeypatch):
@@ -820,3 +837,147 @@ async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
     assert info["sizing"]["notional"] == "3.0000"
     assert info["final_reason"] == "market_gate"
     assert info["submitted"] is False
+
+
+# ── stop-loss re-entry cooldown ─────────────────────────────────────────────
+
+
+def test_stop_loss_cooldown_blocks_immediate_reentry(monkeypatch):
+    ap = Autopilot()
+    ap.state.mode = "live"
+
+    class _S:
+        stop_loss_cooldown_minutes = 60
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    recent_stop = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    monkeypatch.setattr(
+        autopilot_module.storage,
+        "closed_trades",
+        lambda limit=10: [
+            {"symbol": "BTCUSDT", "mode": "live", "exit_reason": "stop_loss", "exit_ts": recent_stop}
+        ],
+        raising=True,
+    )
+
+    cooled, why = ap._stop_loss_cooldown_active("BTCUSDT")
+    assert cooled is True
+    assert "stop_loss_cooldown" in why
+
+
+def test_stop_loss_cooldown_clears_after_window(monkeypatch):
+    ap = Autopilot()
+    ap.state.mode = "live"
+
+    class _S:
+        stop_loss_cooldown_minutes = 60
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    old_stop = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
+    monkeypatch.setattr(
+        autopilot_module.storage,
+        "closed_trades",
+        lambda limit=10: [
+            {"symbol": "BTCUSDT", "mode": "live", "exit_reason": "stop_loss", "exit_ts": old_stop}
+        ],
+        raising=True,
+    )
+
+    cooled, why = ap._stop_loss_cooldown_active("BTCUSDT")
+    assert cooled is False
+    assert why == "ok"
+
+
+def test_stop_loss_cooldown_ignores_non_stop_loss_exit(monkeypatch):
+    ap = Autopilot()
+    ap.state.mode = "live"
+
+    class _S:
+        stop_loss_cooldown_minutes = 60
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    monkeypatch.setattr(
+        autopilot_module.storage,
+        "closed_trades",
+        lambda limit=10: [
+            {"symbol": "BTCUSDT", "mode": "live", "exit_reason": "take_profit_1", "exit_ts": recent}
+        ],
+        raising=True,
+    )
+
+    cooled, why = ap._stop_loss_cooldown_active("BTCUSDT")
+    assert cooled is False
+    assert why == "ok"
+
+
+# ── correlation / basket exposure cap ───────────────────────────────────────
+
+
+def _corr_settings(**overrides):
+    class _S:
+        correlation_gate_enabled = True
+        correlated_symbol_groups = (("BTCUSDT", "ETHUSDT", "SOLUSDT"),)
+        max_correlated_exposure_pct = 0.35
+
+    for k, v in overrides.items():
+        setattr(_S, k, v)
+    return _S()
+
+
+async def test_correlation_basket_gate_blocks_over_cap(monkeypatch):
+    ap = Autopilot()
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _corr_settings())
+
+    async def _fake_price(_self, symbol: str) -> Decimal:
+        return Decimal("100")
+
+    monkeypatch.setattr(Autopilot, "_price", _fake_price, raising=True)
+    open_positions = [{"symbol": "ETHUSDT", "qty": Decimal("3"), "mode": "live"}]  # $300 held
+
+    ok, why = await ap._correlation_basket_gate(
+        "BTCUSDT", Decimal("100"), open_positions, Decimal("1000")
+    )
+    # (300 held + 100 proposed) / 1000 = 40% > 35% cap
+    assert ok is False
+    assert "correlated_basket_exposure" in why
+
+
+async def test_correlation_basket_gate_allows_under_cap(monkeypatch):
+    ap = Autopilot()
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _corr_settings())
+
+    async def _fake_price(_self, symbol: str) -> Decimal:
+        return Decimal("100")
+
+    monkeypatch.setattr(Autopilot, "_price", _fake_price, raising=True)
+    open_positions = [{"symbol": "ETHUSDT", "qty": Decimal("1"), "mode": "live"}]  # $100 held
+
+    ok, why = await ap._correlation_basket_gate(
+        "BTCUSDT", Decimal("100"), open_positions, Decimal("1000")
+    )
+    # (100 held + 100 proposed) / 1000 = 20% < 35% cap
+    assert ok is True
+
+
+async def test_correlation_basket_gate_disabled_allows(monkeypatch):
+    ap = Autopilot()
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _corr_settings(correlation_gate_enabled=False))
+
+    ok, why = await ap._correlation_basket_gate(
+        "BTCUSDT", Decimal("100"), [{"symbol": "ETHUSDT", "qty": Decimal("100"), "mode": "live"}], Decimal("1000")
+    )
+    assert ok is True
+    assert why == "correlation_gate_disabled"
+
+
+async def test_correlation_basket_gate_symbol_not_in_group_allows(monkeypatch):
+    ap = Autopilot()
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _corr_settings())
+
+    ok, why = await ap._correlation_basket_gate(
+        "DOGEUSDT", Decimal("100"), [], Decimal("1000")
+    )
+    assert ok is True
+    assert why == "not_in_correlated_group"
+
