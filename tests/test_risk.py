@@ -90,11 +90,56 @@ def test_no_exit_when_within_band():
 def test_max_hold_triggers():
     """Position held longer than max_hold_hours should force-exit."""
     positions = [_pos("BTCUSDT", 1.0, 100.0, hours_ago=200)]  # default max_hold=96h
-    prices = {"BTCUSDT": Decimal("100.5")}  # within band
+    # +5%: clear of the stale-exit's 2% band so this isolates max_hold itself,
+    # and below TP1 (8%) so no take-profit fires first.
+    prices = {"BTCUSDT": Decimal("105")}
     risk.clear_hwm("BTCUSDT")
     exits = risk.evaluate_exits(positions=positions, prices=prices)
     assert len(exits) == 1
     assert exits[0].reason == "max_hold"
+
+
+def test_stale_dead_money_exit_triggers_before_max_hold():
+    """Held >48h with <2% gain should exit as stale, well before max_hold (96h)."""
+    positions = [_pos("BTCUSDT", 1.0, 100.0, hours_ago=50)]
+    prices = {"BTCUSDT": Decimal("101")}  # +1%, below the 2% stale threshold
+    risk.clear_hwm("BTCUSDT")
+    exits = risk.evaluate_exits(positions=positions, prices=prices)
+    assert len(exits) == 1
+    assert exits[0].reason == "stale_dead_money"
+
+
+def test_stale_dead_money_exit_does_not_trigger_on_a_real_winner():
+    """A position that's actually moved >=2% is not 'dead money' — leave it
+    to stop/TP/trailing, don't force-close a genuine winner early."""
+    positions = [_pos("BTCUSDT", 1.0, 100.0, hours_ago=50)]
+    prices = {"BTCUSDT": Decimal("103")}  # +3%, above the 2% stale threshold
+    risk.clear_hwm("BTCUSDT")
+    exits = risk.evaluate_exits(positions=positions, prices=prices)
+    assert exits == []
+
+
+def test_stale_dead_money_exit_disabled(monkeypatch):
+    class _S:
+        stop_loss_pct = 0.015
+        take_profit_pct = 0.05
+        take_profit_1_pct = 0.08
+        take_profit_1_fraction = 0.50
+        take_profit_2_pct = 0.15
+        take_profit_2_fraction = 0.25
+        trailing_activation_pct = 0.02
+        trailing_stop_pct = 0.01
+        max_hold_hours = 96
+        stale_exit_enabled = False
+        stale_exit_hours = 48
+        stale_exit_max_pnl_pct = 0.02
+
+    monkeypatch.setattr(risk, "get_settings", lambda: _S())
+    positions = [_pos("BTCUSDT", 1.0, 100.0, hours_ago=50)]
+    prices = {"BTCUSDT": Decimal("101")}
+    risk.clear_hwm("BTCUSDT")
+    exits = risk.evaluate_exits(positions=positions, prices=prices)
+    assert exits == []
 
 
 def test_circuit_breaker():

@@ -18,7 +18,7 @@ Stored state:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -164,12 +164,23 @@ def evaluate_exits(
                 out.append(ExitDecision(symbol, qty, "trailing_stop"))
                 continue
 
-        # 4. Max hold time
+        # 4. Stale / "dead money" exit — held a while without meaningfully
+        # moving in our favor. Only ever forces an EXIT (frees the slot for a
+        # fresher signal); never loosens a stop or widens a target.
         try:
             entry_ts = datetime.fromisoformat(pos["entry_ts"])
             if entry_ts.tzinfo is None:
                 entry_ts = entry_ts.replace(tzinfo=timezone.utc)
-            if now - entry_ts > timedelta(hours=s.max_hold_hours):
+            hours_held = (now - entry_ts).total_seconds() / 3600.0
+            if getattr(s, "stale_exit_enabled", True):
+                stale_hours = getattr(s, "stale_exit_hours", 48)
+                stale_max_pnl = Decimal(str(getattr(s, "stale_exit_max_pnl_pct", 0.02)))
+                if hours_held > stale_hours and change < stale_max_pnl:
+                    out.append(ExitDecision(symbol, qty, "stale_dead_money"))
+                    continue
+
+            # 5. Max hold time
+            if hours_held > s.max_hold_hours:
                 out.append(ExitDecision(symbol, qty, "max_hold"))
         except Exception as e:  # noqa: BLE001
             log.exception("Trade execution failure: %s", e)

@@ -140,6 +140,28 @@ def s_ma_reversion(df: pd.DataFrame) -> Signals:
     return _cross_up(entries).fillna(False), exits.fillna(False)
 
 
+def s_multi_factor_score(df: pd.DataFrame) -> Signals:
+    """0-100 weighted score (RSI + BB position + volume spike + recovery-off-
+    low + trend alignment), entering at score>=60 instead of the single
+    RSI<30-and-below-band condition. Compared directly against s_dip_buy to
+    see whether the extra factors add or dilute the existing edge."""
+    close, rsi, bb_lower, bb_mid = df["close"], df["rsi_14"], df["bb_lower"], df["bb_mid"]
+    ema20, ema50, vol, low = df["ema_20"], df["ema_50"], df["volume"], df["low"]
+    vol_avg = vol.rolling(20).mean()
+    low5 = low.rolling(5).min()
+
+    score = pd.Series(0.0, index=df.index)
+    score += np.select([rsi < 30, rsi < 40, rsi < 50], [25, 20, 10], default=0)
+    score += np.select([close <= bb_lower, close <= bb_lower * 1.02, close <= bb_mid], [25, 20, 10], default=0)
+    score += np.select([vol > vol_avg * 1.5, vol > vol_avg * 1.2], [20, 10], default=0)
+    score += np.where(close / low5 > 1.02, 15, 0)
+    score += np.where(ema20 > ema50, 15, 0)
+
+    entries = score >= 60
+    exits = rsi > 55
+    return _cross_up(entries).fillna(False), exits.fillna(False)
+
+
 STRATEGIES: dict[str, Strategy] = {
     "baseline":         s_baseline,
     "dip_buy":          s_dip_buy,
@@ -150,6 +172,7 @@ STRATEGIES: dict[str, Strategy] = {
     "pullback_to_ema":  s_pullback_to_ema,
     "breakout_momentum": s_breakout_momentum,
     "ma_reversion":     s_ma_reversion,
+    "multi_factor_score": s_multi_factor_score,
 }
 
 

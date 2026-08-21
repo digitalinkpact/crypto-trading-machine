@@ -247,6 +247,13 @@ class Settings(BaseSettings):
     max_hold_hours: int = Field(96, ge=1, le=10000)              # force-exit after 4 days
     drawdown_circuit_breaker_pct: float = Field(0.25, ge=0.01, le=0.50)  # halt new BUYs after -25%
 
+    # Stale / "dead money" exit — frees the slot early if a position has sat
+    # for a while without meaningfully moving in our favor. Only ever forces
+    # an exit; never loosens the stop-loss or widens a take-profit target.
+    stale_exit_enabled: bool = True
+    stale_exit_hours: int = Field(48, ge=1, le=10000)
+    stale_exit_max_pnl_pct: float = Field(0.02, ge=0.0, le=0.50)
+
     # Entry gates
     min_signal_confidence: float = Field(0.65, ge=0.0, le=1.0)
     buy_cooldown_minutes: int = Field(20, ge=0, le=1440)
