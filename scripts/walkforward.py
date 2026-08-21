@@ -140,26 +140,36 @@ def s_ma_reversion(df: pd.DataFrame) -> Signals:
     return _cross_up(entries).fillna(False), exits.fillna(False)
 
 
-def s_multi_factor_score(df: pd.DataFrame) -> Signals:
+def make_multi_factor_score(min_score: int = 60, trend_gate: bool = True) -> Strategy:
     """0-100 weighted score (RSI + BB position + volume spike + recovery-off-
-    low + trend alignment), entering at score>=60 instead of the single
+    low + trend alignment), entering at score>=min_score instead of the single
     RSI<30-and-below-band condition. Compared directly against s_dip_buy to
-    see whether the extra factors add or dilute the existing edge."""
-    close, rsi, bb_lower, bb_mid = df["close"], df["rsi_14"], df["bb_lower"], df["bb_mid"]
-    ema20, ema50, vol, low = df["ema_20"], df["ema_50"], df["volume"], df["low"]
-    vol_avg = vol.rolling(20).mean()
-    low5 = low.rolling(5).min()
+    see whether the extra factors add or dilute the existing edge. Parameterized
+    so --min-score / --no-trend-gate can sweep it from the CLI."""
 
-    score = pd.Series(0.0, index=df.index)
-    score += np.select([rsi < 30, rsi < 40, rsi < 50], [25, 20, 10], default=0)
-    score += np.select([close <= bb_lower, close <= bb_lower * 1.02, close <= bb_mid], [25, 20, 10], default=0)
-    score += np.select([vol > vol_avg * 1.5, vol > vol_avg * 1.2], [20, 10], default=0)
-    score += np.where(close / low5 > 1.02, 15, 0)
-    score += np.where(ema20 > ema50, 15, 0)
+    def strat(df: pd.DataFrame) -> Signals:
+        close, rsi, bb_lower, bb_mid = df["close"], df["rsi_14"], df["bb_lower"], df["bb_mid"]
+        ema20, ema50, vol, low = df["ema_20"], df["ema_50"], df["volume"], df["low"]
+        vol_avg = vol.rolling(20).mean()
+        low5 = low.rolling(5).min()
 
-    entries = score >= 60
-    exits = rsi > 55
-    return _cross_up(entries).fillna(False), exits.fillna(False)
+        score = pd.Series(0.0, index=df.index)
+        score += np.select([rsi < 30, rsi < 40, rsi < 50], [25, 20, 10], default=0)
+        score += np.select([close <= bb_lower, close <= bb_lower * 1.02, close <= bb_mid], [25, 20, 10], default=0)
+        score += np.select([vol > vol_avg * 1.5, vol > vol_avg * 1.2], [20, 10], default=0)
+        score += np.where(close / low5 > 1.02, 15, 0)
+        score += np.where(ema20 > ema50, 15, 0)
+
+        entries = score >= min_score
+        if trend_gate:
+            entries = entries & (close > df["ema_200"])
+        exits = rsi > 55
+        return _cross_up(entries).fillna(False), exits.fillna(False)
+
+    return strat
+
+
+s_multi_factor_score = make_multi_factor_score()
 
 
 STRATEGIES: dict[str, Strategy] = {
@@ -241,7 +251,8 @@ def _eval_fold(
 
 
 async def main_async(
-    tf: Timeframe, folds: int, sl: float, tp: float, bars: int, market_filter: bool
+    tf: Timeframe, folds: int, sl: float, tp: float, bars: int, market_filter: bool,
+    min_score: int = 60, trend_gate: bool = True, only: list[str] | None = None,
 ) -> None:
     fees = get_settings().binance_taker_fee
     repo = OHLCVRepository()
@@ -264,13 +275,19 @@ async def main_async(
     span = min(df.index.min() for df in frames.values()), max(df.index.max() for df in frames.values())
     print(f"loaded {len(frames)} symbols on {tf.value} | exits: signal+SL {sl:.0%}/TP {tp:.0%} "
           f"| fees {fees:.2%}/side | market_filter={'BTC 50>200 EMA' if market is not None else 'off'}")
+    print(f"multi_factor_score: min_score={min_score} trend_gate(ema200)={trend_gate}")
     print(f"window ~ {span[0].date()} → {span[1].date()}, {folds} folds\n")
+
+    strategies = dict(STRATEGIES)
+    strategies["multi_factor_score"] = make_multi_factor_score(min_score, trend_gate)
+    if only:
+        strategies = {k: v for k, v in strategies.items() if k in only}
 
     print(f"{'strategy':>17} {'fold':>5} {'ret':>9} {'median':>9} {'pos%':>6} "
           f"{'sharpe':>8} {'trades':>7} {'syms':>5}")
     print("-" * 76)
     summary: dict[str, list[float]] = {}
-    for name, strat in STRATEGIES.items():
+    for name, strat in strategies.items():
         fold_rets: list[float] = []
         for f in range(folds):
             m = _eval_fold(frames, strat, f, folds, sl, tp, fees, market)
@@ -309,9 +326,16 @@ def main() -> None:
     p.add_argument("--bars", type=int, default=1000, help="bars to fetch per symbol")
     p.add_argument("--market-filter", action="store_true",
                    help="only allow entries when BTC 50-EMA > 200-EMA (risk-on)")
+    p.add_argument("--min-score", type=int, default=60,
+                   help="multi_factor_score entry threshold (0-100)")
+    p.add_argument("--trend-gate", action=argparse.BooleanOptionalAction, default=True,
+                   help="gate multi_factor_score entries by close>ema_200 (default: on; use --no-trend-gate to disable)")
+    p.add_argument("--only", nargs="*", default=None,
+                   help="restrict output to these strategy names (e.g. --only dip_buy multi_factor_score)")
     args = p.parse_args()
     asyncio.run(main_async(Timeframe(args.timeframe), args.folds, args.sl, args.tp,
-                           args.bars, args.market_filter))
+                           args.bars, args.market_filter, args.min_score,
+                           args.trend_gate, args.only))
 
 
 if __name__ == "__main__":
