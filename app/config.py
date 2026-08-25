@@ -102,6 +102,13 @@ class Settings(BaseSettings):
     volume_refresh_seconds: int = Field(1800, ge=30, le=86_400)
     # Max concurrent per-symbol liquidity probes (depth + listing age).
     liquidity_probe_concurrency: int = Field(8, ge=1, le=50)
+    # Hard blocklist — never opened as a NEW entry regardless of how the
+    # universe is sourced (static/dynamic/liquidity-ranked); wired via
+    # app/exchange/symbol_source.py's `_apply_blocklist`. Existing risk gates
+    # still close any position already open in these symbols; only NEW BUYs
+    # are blocked. Empty by default — populate via .env (BLOCKED_SYMBOLS) if a
+    # specific coin proves to be a chronic tail-loss producer.
+    blocked_symbols: tuple[str, ...] = ()
     # API rate limit/backoff
     api_retry_attempts: int = Field(3, ge=1, le=10)
     api_retry_backoff_base: int = Field(2, ge=1, le=10)
@@ -205,15 +212,22 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _apply_live_mode_override(self) -> "Settings":
-        """If LIVE_MODE=true in .env, disable safety gates that block real execution."""
+        """If LIVE_MODE=true in .env, force real execution — and NOTHING else.
+
+        LIVE_MODE must only decide *whether orders reach the exchange*, never
+        *how much risk is allowed*. An earlier version of this override also
+        widened max_open_positions/max_long_exposure_pct and force-disabled
+        ml_gate_enabled whenever live mode was on — i.e. flipping one flag to
+        "use real money" silently also removed several unrelated risk caps at
+        the same time. That is exactly the failure mode this project's own
+        audit checklist warns against: enabling live trading must never
+        implicitly weaken position limits, exposure caps, or quality gates.
+        Every risk parameter is controlled independently via its own setting
+        (.env), regardless of live_mode.
+        """
         if self.live_mode:
             self.paper_trading = False
             self.dry_run = False
-            self.ml_gate_enabled = False
-            self.max_open_positions = 25
-            self.aggressive_max_open_positions = 25
-            self.rollback_max_open_positions = 25
-            self.max_long_exposure_pct = 1.0
         return self
 
     # Risk caps — fraction-of-equity, single source of truth for sizing/exposure.
@@ -271,6 +285,17 @@ class Settings(BaseSettings):
     # Example: "2026-07-20T12:30:00+00:00,2026-08-01T14:00:00+00:00"
     profitstream_news_events_utc: str = ""
     profitstream_news_buffer_minutes: int = Field(30, ge=0, le=240)
+    # Gate on the RSI-recovery ("mean reversion exit") SELL signal: only honor
+    # it when the position's unrealized PnL is at/above this fraction (0.0 =
+    # breakeven). Evidence (scripts/daily_forensic_report.py against real live
+    # trade history): this signal-driven exit was the single worst-performing
+    # exit path (8.8% win rate over 90d, 3.2% over the 5 days right after the
+    # regime-gating deploy) — RSI merely ticking back above the exit threshold
+    # doesn't mean the trade recovered, and closing there regardless of price
+    # pre-empts the empirically much healthier stop-loss/trailing-stop/stale-
+    # exit ladder. Below this PnL, the position is left for the risk ladder to
+    # manage instead of being closed at a loss by a technical-only signal.
+    mean_reversion_exit_min_pnl_pct: float = Field(0.0, ge=-0.20, le=0.20)
     # Long-term trend filter — only open longs when the latest daily close is
     # above its 200-EMA. Spot is long-only, so buying assets in a downtrend just
     # feeds the stop-loss gate. Backtest-validated: cuts losses ~3x and max

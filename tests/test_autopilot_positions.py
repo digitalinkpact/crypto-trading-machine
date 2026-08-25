@@ -123,6 +123,33 @@ async def test_market_gate_disabled_fail_open(monkeypatch):
     assert why == "market_gate_disabled"
 
 
+async def test_market_gate_blocks_on_missing_data(monkeypatch):
+    """Enabled + insufficient/empty BTC data must FAIL CLOSED (block new
+    entries) — the bot must never open a position while it can't verify the
+    broad market regime."""
+    ap = Autopilot()
+    df = pd.DataFrame({"close": [], "ema_50": [], "ema_200": []})
+    _patch_market_data(monkeypatch, df, enabled=True)
+    ok, why = await ap._market_gate()
+    assert ok is False
+    assert ap._last_regime_score == -1
+
+
+async def test_market_gate_blocks_on_fetch_exception(monkeypatch):
+    """Enabled + a data-fetch exception must FAIL CLOSED, not allow trading."""
+    ap = Autopilot()
+
+    class _RaisingRepo:
+        async def get(self, *_a, **_k):
+            raise RuntimeError("exchange unavailable")
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _market_settings(True))
+    monkeypatch.setattr(data_module, "OHLCVRepository", lambda: _RaisingRepo())
+    ok, why = await ap._market_gate()
+    assert ok is False
+    assert "market_unavailable" in why
+
+
 async def test_tick_does_not_run_risk_gates_inline(monkeypatch):
     """Protective exits are owned by the independent risk loop, not tick()."""
     ap = Autopilot()

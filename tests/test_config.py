@@ -79,21 +79,25 @@ def test_live_mode_from_env_forces_live(monkeypatch):
     assert s.dry_run is False
 
 
-def test_live_mode_disables_ml_gate(monkeypatch):
+def test_live_mode_does_not_disable_ml_gate(monkeypatch):
+    # LIVE_MODE must only switch execution mode (paper/dry_run off) — it must
+    # never silently disable an independently-configured risk/quality gate.
     monkeypatch.setenv("LIVE_MODE", "true")
     monkeypatch.setenv("ML_GATE_ENABLED", "true")
     s = Settings(_env_file=None)
     assert s.live_mode is True
-    assert s.ml_gate_enabled is False
+    assert s.ml_gate_enabled is True
 
 
-def test_live_mode_relaxes_risk_caps(monkeypatch):
+def test_live_mode_does_not_relax_risk_caps(monkeypatch):
+    # LIVE_MODE must not widen max_open_positions/max_long_exposure_pct either
+    # — those are controlled solely by their own settings, live or not.
     monkeypatch.setenv("LIVE_MODE", "true")
     monkeypatch.setenv("MAX_OPEN_POSITIONS", "5")
     monkeypatch.setenv("MAX_LONG_EXPOSURE_PCT", "0.60")
     s = Settings(_env_file=None)
     assert s.live_mode is True
-    assert s.max_open_positions == 25
-    assert s.aggressive_max_open_positions == 25
-    assert s.rollback_max_open_positions == 25
-    assert s.max_long_exposure_pct == 1.0
+    assert s.max_open_positions == 5
+    assert s.aggressive_max_open_positions == 10
+    assert s.rollback_max_open_positions == 10
+    assert s.max_long_exposure_pct == 0.60

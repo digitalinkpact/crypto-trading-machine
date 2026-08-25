@@ -1,9 +1,10 @@
 """Order-book analysis and a pre-trade liquidity gate.
 
 Before sending an entry, we inspect the live L2 book so we don't market into a
-thin or wide spread and eat avoidable slippage. The gate is intentionally
-*fail-open*: if the book can't be fetched (network blip, delisted symbol), the
-trade is allowed and the existing technicals-based logic is unaffected.
+thin or wide spread and eat avoidable slippage. The gate is *fail-closed*: if
+the book can't be fetched or comes back empty (network blip, delisted symbol),
+the entry is rejected rather than sized against liquidity we never actually
+verified. Only BUY-side entries call this gate — exits are never blocked by it.
 
 Pure functions here (`analyze_order_book`, `estimate_slippage`) take already
 -parsed bid/ask ladders so they're trivially unit-testable without the network.
@@ -141,8 +142,11 @@ async def liquidity_gate(
 ) -> tuple[bool, str]:
     """Decide whether `symbol` has a tight enough book for a `trade_quote` entry.
 
-    Returns (ok, detail). FAIL-OPEN: any fetch/parse error returns (True, ...)
-    so a transient outage never blocks trading. Also logs estimated slippage.
+    Returns (ok, detail). FAIL-CLOSED: a fetch/parse error or an empty book
+    rejects the trade — an entry must never be sized against liquidity the
+    bot couldn't actually verify. Exits are never routed through this gate
+    (only BUY-side entries call it), so an outage blocks new risk, it never
+    traps an existing position. Also logs estimated slippage.
     """
     s = get_settings()
     if not s.orderbook_gate_enabled:
@@ -152,15 +156,15 @@ async def liquidity_gate(
     try:
         raw = await client.order_book(symbol, limit=s.orderbook_depth_limit)
     except Exception as exc:  # noqa: BLE001
-        log.debug("[OB_GATE] %s book fetch failed (%s) — allowing (fail-open)", symbol, exc)
-        return True, f"book_unavailable:{exc}"
+        log.warning("[OB_GATE] %s book fetch failed (%s) — rejecting (fail-closed)", symbol, exc)
+        return False, f"book_unavailable:{exc}"
 
     bids = _parse_levels(raw.get("bids", []))
     asks = _parse_levels(raw.get("asks", []))
     metrics = analyze_order_book(bids, asks, near_pct=s.orderbook_near_pct)
     if metrics is None:
-        log.debug("[OB_GATE] %s empty book — allowing (fail-open)", symbol)
-        return True, "empty_book"
+        log.warning("[OB_GATE] %s empty book — rejecting (fail-closed)", symbol)
+        return False, "empty_book"
 
     taker_ladder = asks if side == SignalAction.BUY else bids
     slippage = estimate_slippage(taker_ladder, trade_quote, side=side)

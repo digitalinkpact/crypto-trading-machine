@@ -55,6 +55,7 @@ class ProfitStreamStrategy:
     async def analyze_symbol(self, symbol: str, *, mode: str) -> StrategyDecision:
         reasons: list[str] = []
         indicators: dict[str, Any] = {"symbol": symbol}
+        s = get_settings()
 
         try:
             df_1d = await self._candles(symbol, "1d", 320)
@@ -105,12 +106,35 @@ class ProfitStreamStrategy:
         )
 
         if held and exit_ready:
-            indicators["decision"] = "sell_mean_reversion_exit"
-            return StrategyDecision(symbol, SignalAction.SELL, 90, reasons, indicators)
+            # Evidence (scripts/daily_forensic_report.py against real live
+            # trade history, both a 90-day and a 5-day post-deploy window):
+            # this RSI-recovery exit was by FAR the worst-performing exit
+            # path — 137 trades/8.8% win-rate/-$31.64 over 90d, and 31
+            # trades/3.2% win-rate/-$7.61 in just the 5 days after the
+            # regime-gating deploy — dwarfing stop_loss's own -$13.85 and
+            # completely eclipsing take_profit/trailing_stop's positive
+            # totals. RSI ticking back above 55 is only "no longer deeply
+            # oversold", not "the trade worked" — closing here regardless of
+            # price often locks in a small loss on a position that hasn't
+            # recovered, pre-empting the (empirically much healthier)
+            # stop-loss/trailing-stop/stale-exit ladder. Only honor this
+            # signal-based exit when the position is at or above breakeven;
+            # otherwise let the risk ladder keep managing the downside.
+            close_now = float(df_1d.iloc[-1]["close"])
+            held_pos = self._held_position(symbol, mode)
+            entry_price = float((held_pos or {}).get("entry_price") or 0.0)
+            held_pnl_pct = ((close_now - entry_price) / entry_price) if entry_price > 0 else 0.0
+            indicators["held_pnl_pct"] = held_pnl_pct
+            if held_pnl_pct >= s.mean_reversion_exit_min_pnl_pct:
+                indicators["decision"] = "sell_mean_reversion_exit"
+                return StrategyDecision(symbol, SignalAction.SELL, 90, reasons, indicators)
+            reasons.append(
+                f"mean_reversion_exit_suppressed_at_loss:pnl={held_pnl_pct:.2%}"
+                f"<{s.mean_reversion_exit_min_pnl_pct:.2%}"
+            )
 
         filt_ok = True
 
-        s = get_settings()
         if daily_quote < s.profitstream_low_volume_quote_min:
             filt_ok = False
             reasons.append(
@@ -328,4 +352,10 @@ class ProfitStreamStrategy:
             return None
 
     def _is_held(self, symbol: str, mode: str) -> bool:
-        return any(p["symbol"] == symbol and p["mode"] == mode for p in storage.all_positions())
+        return self._held_position(symbol, mode) is not None
+
+    def _held_position(self, symbol: str, mode: str) -> Optional[dict]:
+        return next(
+            (p for p in storage.all_positions() if p["symbol"] == symbol and p["mode"] == mode),
+            None,
+        )

@@ -1832,7 +1832,13 @@ class Autopilot:
         `market_regime_sideways_score_bonus`) via `self._last_regime_score`.
         The verdict is identical for every symbol in a tick, so it is cached
         briefly to avoid refetching BTC per candidate.
-        FAIL-OPEN: disabled or missing BTC data always allows trading.
+        FAIL-CLOSED: if the gate is enabled but BTC regime data can't be
+        computed (fetch error, empty/short history), NEW entries are blocked —
+        the bot must not open a position while it cannot verify the broad
+        market isn't in a downtrend; missing a trade is always safer than
+        buying blind. Explicitly disabling the gate
+        (`market_regime_gate_enabled=False`) is the only way to skip this
+        check entirely.
         """
         s = get_settings()
         if not getattr(s, "market_regime_gate_enabled", True):
@@ -1842,7 +1848,7 @@ class Autopilot:
         if cache is not None and (asyncio.get_event_loop().time() - cache[2]) < 300.0:
             self._last_regime_score = cache[3] if len(cache) > 3 else 2
             return cache[0], cache[1]
-        allowed, reason, score = True, "market_no_data", 2
+        allowed, reason, score = False, "market_no_data", -1
         try:
             from app.data import OHLCVRepository
             from app.regime.btc_regime import compute_btc_regime_score
@@ -1859,10 +1865,12 @@ class Autopilot:
                 else:
                     allowed = True
                     reason = f"BTC regime {result.label} score={score} risk-on ({result.detail})"
+            else:
+                log.warning("[MARKET] BTC regime data unavailable/insufficient — blocking new entries (fail-closed)")
         except Exception as exc:  # noqa: BLE001
-            log.debug("[MARKET] regime gate failed (%s) — allowing", exc)
+            log.warning("[MARKET] regime gate failed (%s) — blocking new entries (fail-closed)", exc)
             reason = f"market_unavailable:{exc}"
-            score = 2
+            score = -1
         self._market_regime_cache = (allowed, reason, asyncio.get_event_loop().time(), score)
         self._last_regime_score = score
         return allowed, reason

@@ -83,11 +83,40 @@ async def test_profitstream_exits_held_position_on_daily_mean_reversion(monkeypa
     monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: True, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_held_position", lambda *_a, **_k: {"entry_price": 100.0}, raising=True)
 
     decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
 
     assert decision.action == SignalAction.SELL
     assert decision.indicators["decision"] == "sell_mean_reversion_exit"
+
+
+async def test_profitstream_suppresses_mean_reversion_exit_while_at_a_loss(monkeypatch):
+    """Evidence (scripts/daily_forensic_report.py): the RSI-recovery exit was
+    the worst-performing exit path in real live trading (~8.8% win rate over
+    90d) because it closes regardless of price. It must not fire while the
+    position is still below its entry price — the risk ladder (stop-loss/
+    trailing/stale-exit) should manage the downside instead."""
+    strategy = ProfitStreamStrategy()
+    frames = {
+        ("ETHUSDT", "1d"): _frame(close=90, rsi=60, bb_lower=80, bb_mid=85, ema50=100, ema200=95),
+        ("BTCUSDT", "1d"): _frame(close=100000, rsi=55, bb_lower=95000, bb_mid=98000, ema50=99000, ema200=97000),
+    }
+
+    async def _candles(self, symbol: str, interval: str, limit: int):
+        return frames[(symbol, interval)]
+
+    monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: True, raising=True)
+    # Entry was 100, close is 90 -> -10% unrealized, below the 0% threshold.
+    monkeypatch.setattr(ProfitStreamStrategy, "_held_position", lambda *_a, **_k: {"entry_price": 100.0}, raising=True)
+
+    decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
+
+    assert decision.action == SignalAction.HOLD
+    assert any("mean_reversion_exit_suppressed_at_loss" in r for r in decision.reasons)
 
 
 async def test_profitstream_rejects_falling_knife_extension(monkeypatch):

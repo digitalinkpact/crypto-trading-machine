@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from app.exchange.orderbook import analyze_order_book, estimate_slippage
+from app.exchange.orderbook import analyze_order_book, estimate_slippage, liquidity_gate
 from app.signals import SignalAction
 
 
@@ -54,3 +54,46 @@ def test_estimate_slippage_sell_side():
     bids = _ladder([(100.0, 5), (99.0, 10)])
     slip = estimate_slippage(bids, Decimal("600"), side=SignalAction.SELL)
     assert slip is not None and slip > 0
+
+
+class _FakeClient:
+    def __init__(self, *, raises: bool = False, book: dict | None = None) -> None:
+        self._raises = raises
+        self._book = book if book is not None else {"bids": [], "asks": []}
+
+    async def order_book(self, symbol, limit=10):
+        if self._raises:
+            raise RuntimeError("network blip")
+        return self._book
+
+
+async def test_liquidity_gate_fails_closed_on_fetch_error():
+    """A book fetch error must REJECT the entry, not silently allow it — an
+    entry must never be sized against liquidity the bot couldn't verify."""
+    ok, why = await liquidity_gate(
+        "BTCUSDT", SignalAction.BUY, Decimal("50"), client=_FakeClient(raises=True),
+    )
+    assert ok is False
+    assert "book_unavailable" in why
+
+
+async def test_liquidity_gate_fails_closed_on_empty_book():
+    ok, why = await liquidity_gate(
+        "BTCUSDT", SignalAction.BUY, Decimal("50"), client=_FakeClient(),
+    )
+    assert ok is False
+    assert why == "empty_book"
+
+
+async def test_liquidity_gate_disabled_still_allows(monkeypatch):
+    import app.exchange.orderbook as ob_module
+
+    class _S:
+        orderbook_gate_enabled = False
+
+    monkeypatch.setattr(ob_module, "get_settings", lambda: _S())
+    ok, why = await liquidity_gate(
+        "BTCUSDT", SignalAction.BUY, Decimal("50"), client=_FakeClient(raises=True),
+    )
+    assert ok is True
+    assert why == "gate_disabled"
