@@ -592,11 +592,19 @@ class Settings(BaseSettings):
                 )
         return self
 
-    # Binance.US spot trading fees (tier 0 defaults).
-    # See https://www.binance.us/fees — adjust via .env if your tier differs.
-    # Market orders pay taker; limit orders that rest on the book pay maker.
-    binance_maker_fee: float = Field(0.0040, ge=0.0, le=0.01)
-    binance_taker_fee: float = Field(0.0040, ge=0.0, le=0.01)
+    # Binance.US spot trading fees.
+    # CORRECTED 2026-08-25 (forensic audit): the 0.40% tier-0 default here had
+    # never matched this account's REAL negotiated rate — `client.trade_fees()`
+    # against the live account returned maker=0.00%, taker=0.02%, a 20x gap
+    # that had been silently overstating every historical trade's modeled
+    # cost. Fees are now also read directly from each fill's actual commission
+    # when available (see app/exchange/client.py `_extract_commission` /
+    # `Order.commission`) — these settings are only the FALLBACK estimate used
+    # when the real per-fill commission can't be determined (paper mode, a
+    # missing/mixed-asset commission field). Re-verify via `client.trade_fees()`
+    # if your account's tier or fee schedule changes.
+    binance_maker_fee: float = Field(0.0002, ge=0.0, le=0.01)
+    binance_taker_fee: float = Field(0.0002, ge=0.0, le=0.01)
 
 
 @lru_cache(maxsize=1)

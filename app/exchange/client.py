@@ -9,7 +9,7 @@ import asyncio
 import re
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
 import pandas as pd
@@ -70,6 +70,34 @@ def _extract_avg_fill_price(raw: dict[str, Any]) -> Optional[Decimal]:
     return None
 
 
+def _extract_commission(raw: dict[str, Any]) -> tuple[Optional[Decimal], Optional[str]]:
+    """Sum the REAL commission Binance charged, from the order's fills[].
+
+    Returns (total_commission, commission_asset) only when every fill paid
+    commission in the SAME asset — a mixed-asset order (e.g. partially paid
+    in BNB, partially in the quote asset) can't be summed into one honest
+    number, so this returns (None, None) rather than fabricate one. Callers
+    must fall back to a modeled fee estimate in that case.
+    """
+    fills = raw.get("fills")
+    if not isinstance(fills, list) or not fills:
+        return None, None
+    total = Decimal("0")
+    asset: Optional[str] = None
+    for fill in fills:
+        try:
+            commission = Decimal(str(fill.get("commission", "0")))
+        except (InvalidOperation, ValueError, TypeError):
+            return None, None
+        fill_asset = fill.get("commissionAsset")
+        if asset is None:
+            asset = fill_asset
+        elif fill_asset != asset:
+            return None, None  # mixed commission assets — don't guess
+        total += commission
+    return (total, asset) if asset else (None, None)
+
+
 def _safe_order_status(raw_status: Any) -> OrderStatus:
     try:
         return OrderStatus(str(raw_status or "NEW"))
@@ -110,6 +138,7 @@ class BinanceUSClient:
                 submitted_at = datetime.fromtimestamp(float(transact_ms) / 1000.0, tz=timezone.utc)
         except (TypeError, ValueError):
             submitted_at = None
+        commission, commission_asset = _extract_commission(raw)
         return Order(
             symbol=symbol,
             side=side,
@@ -121,6 +150,8 @@ class BinanceUSClient:
             submitted_at=submitted_at,
             filled_quantity=Decimal(str(raw.get("executedQty", "0"))),
             avg_fill_price=_extract_avg_fill_price(raw),
+            commission=commission,
+            commission_asset=commission_asset,
             raw=raw,
         )
 
@@ -263,12 +294,15 @@ class BinanceUSClient:
 
         log.info("Submitting order coid=%s symbol=%s side=%s", coid, symbol, side.value)
         raw = await asyncio.to_thread(self._spot.new_order, **params)
+        commission, commission_asset = _extract_commission(raw)
         return order.model_copy(
             update={
                 "status": OrderStatus(raw.get("status", "NEW")),
                 "exchange_order_id": str(raw.get("orderId")),
                 "filled_quantity": Decimal(str(raw.get("executedQty", "0"))),
                 "avg_fill_price": _extract_avg_fill_price(raw),
+                "commission": commission,
+                "commission_asset": commission_asset,
                 "raw": raw,
             }
         )

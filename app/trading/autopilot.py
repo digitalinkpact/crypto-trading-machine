@@ -287,6 +287,34 @@ class Autopilot:
                     await self._execute(signals, allow_buys=not breaker_tripped)
                 finally:
                     self._save()
+                    # Explicit ENTRY_HALTED vs SYSTEM_OFFLINE distinction: the
+                    # breaker/emergency-halt/tick-protection flags above only
+                    # ever block NEW BUYS inside _execute — the scheduler,
+                    # this tick, the independent risk loop, watchdog, and
+                    # reconciliation all keep running regardless. Persist one
+                    # explicit, single-source-of-truth status so that fact is
+                    # visible externally (API/dashboard) instead of only
+                    # implicit in the code structure. `system_offline` is
+                    # always False here on purpose — the very fact this line
+                    # is executing proves the system is online; true offline
+                    # detection is the watchdog's heartbeat-staleness checks
+                    # (trade_loop_alive/risk_loop_alive), not a flag a dead
+                    # process would have to set for itself.
+                    try:
+                        reasons = []
+                        if breaker_tripped:
+                            reasons.append("drawdown_circuit_breaker")
+                        entry_block_reason = self._entry_block_reason()
+                        if entry_block_reason:
+                            reasons.append(entry_block_reason)
+                        storage.kv_set("entry_status", {
+                            "entry_halted": bool(reasons),
+                            "reasons": reasons,
+                            "system_offline": False,
+                            "checked_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("entry_status persist failed: %s", exc)
             finally:
                 storage.release_lock("autopilot_tick", owner=self._owner)
 
@@ -996,6 +1024,17 @@ class Autopilot:
                         _finish(symbol, "breaker_tripped", buy_block_detail, submitted=False, sig=sig)
                         continue
                     _set_filter(symbol, "drawdown_breaker", True, "circuit breaker allows BUY", sig)
+                    # Defense-in-depth: the universe builder (get_symbols/
+                    # _apply_blocklist) already excludes blocked_symbols from
+                    # what agents ever see, but a hard re-check here means a
+                    # blocked symbol can never receive a new entry regardless
+                    # of which code path produced the signal.
+                    blocked = tuple(b.upper() for b in getattr(s, "blocked_symbols", ()) or ())
+                    if symbol.upper() in blocked:
+                        _set_filter(symbol, "blocked_symbol", False, f"{symbol} is in blocked_symbols", sig)
+                        _finish(symbol, "blocked_symbol", f"{symbol} is in blocked_symbols", submitted=False, sig=sig)
+                        continue
+                    _set_filter(symbol, "blocked_symbol", True, "not blocked", sig)
                     if symbol in held_symbols and not is_pyramid:
                         reason = "existing position already held"
                         if open_pos and aggressive_mode and sig.confidence >= pyramid_threshold and pyramid_adds >= max_pyramid_adds:
@@ -2024,17 +2063,27 @@ class Autopilot:
                 )
             try:
                 price = order.avg_fill_price or order.price or await self._price(symbol)
+                order_fee_usdt = (
+                    float(order.commission)
+                    if order.commission is not None and order.commission_asset == "USDT"
+                    else 0
+                )
                 storage.record_order(
                     mode="live", symbol=symbol, side=side.value,
-                    qty=filled, price=price,
+                    qty=filled, price=price, fee=order_fee_usdt,
                     client_order_id=order.client_order_id, agents=agents,
                 )
                 if side is OrderSide.BUY:
+                    entry_fee_usdt = (
+                        float(order.commission)
+                        if order.commission is not None and order.commission_asset == "USDT"
+                        else None
+                    )
                     storage.open_position(
                         symbol=symbol, mode="live", qty=filled,
                         entry_price=price, agents=agents,
                         entry_confidence=entry_confidence, entry_strategy=entry_strategy,
-                        entry_btc_regime=entry_btc_regime,
+                        entry_btc_regime=entry_btc_regime, entry_fee_usdt=entry_fee_usdt,
                     )
                 else:
                     pos = next(
@@ -2044,10 +2093,30 @@ class Autopilot:
                     mfe_pct, mae_pct = risk.mfe_mae_pct(
                         symbol, Decimal(str((pos or {}).get("entry_price") or 0))
                     )
+                    # Exchange fill reconciliation: use the REAL commission
+                    # Binance charged (from the order's fills[]) instead of a
+                    # modeled estimate — but only when BOTH the original
+                    # entry's and this exit's commission are known and were
+                    # paid in the quote asset (USDT). A commission paid in
+                    # another asset (e.g. BNB fee discount) isn't directly a
+                    # USDT cost without a conversion we don't have here, and
+                    # mixing one real leg with one modeled leg would blur
+                    # `fee_source` — storage.reduce_position falls back to a
+                    # fully modeled estimate for the whole trade rather than
+                    # fabricate a partial number.
+                    actual_fee_usdt = None
+                    entry_fee = (pos or {}).get("entry_fee_usdt")
+                    if (
+                        entry_fee is not None
+                        and order.commission is not None
+                        and order.commission_asset == "USDT"
+                    ):
+                        actual_fee_usdt = float(entry_fee) + float(order.commission)
                     storage.reduce_position(
                         symbol=symbol, mode="live", qty=filled, exit_price=price,
                         exit_reason=risk.infer_exit_reason(agents),
                         mfe_pct=mfe_pct, mae_pct=mae_pct,
+                        actual_fee_usdt=actual_fee_usdt,
                     )
             except Exception as exc:  # noqa: BLE001
                 log.warning("storage write failed for live order %s: %s", symbol, exc)

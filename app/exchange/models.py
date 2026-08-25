@@ -45,4 +45,11 @@ class Order(BaseModel):
     submitted_at: Optional[datetime] = None
     filled_quantity: Decimal = Decimal("0")
     avg_fill_price: Optional[Decimal] = None
+    # Actual commission Binance charged on this order (summed across fills),
+    # only populated when every fill's commission was paid in the same asset
+    # — see app/exchange/client.py `_extract_commission`. None means the real
+    # commission couldn't be determined unambiguously; callers must fall back
+    # to a modeled fee estimate rather than fabricate a number.
+    commission: Optional[Decimal] = None
+    commission_asset: Optional[str] = None
     raw: Optional[dict] = None

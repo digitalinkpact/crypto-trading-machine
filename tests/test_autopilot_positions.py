@@ -831,6 +831,67 @@ async def test_execute_buy_rejects_when_pyramid_limit_is_reached(monkeypatch):
     assert kv_state["pyramid_adds:live:BTCUSDT"] == 2
 
 
+async def test_execute_buy_rejects_blocked_symbol(monkeypatch):
+    """Defense-in-depth: a symbol in blocked_symbols must never receive a new
+    entry even if it somehow reaches `_execute` (the universe builder already
+    excludes it, but this is a second, independent hard stop)."""
+    ap = Autopilot()
+    ap.state.mode = "live"
+    placed: list[tuple[str, Decimal]] = []
+
+    class _Settings:
+        min_signal_confidence = 0.40
+        dynamic_threshold_enabled = False
+        ml_gate_enabled = False
+        buy_cooldown_minutes = 30
+        aggressive_mode_enabled = False
+        aggressive_rollback_min_trades = 30
+        aggressive_rollback_min_win_rate = 0.50
+        rollback_position_pct = 0.05
+        rollback_max_open_positions = 10
+        max_long_exposure_pct = 0.99
+        risk_per_trade_pct = 0.01
+        stop_loss_pct = 0.015
+        kelly_fraction_cap = 1.0
+        blocked_symbols = ("BTCUSDT",)
+
+    async def _snapshot(*, mode):
+        return {
+            "usdt_cash": Decimal("100"),
+            "total_usdt": Decimal("1000"),
+            "all_balances": {"USDT": Decimal("100")},
+            "free_balances": {"USDT": Decimal("100")},
+        }
+
+    async def _place_buy(_self, symbol: str, _sig, per_trade_usdt: Decimal) -> bool:
+        placed.append((symbol, per_trade_usdt))
+        return True
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _Settings())
+    monkeypatch.setattr(autopilot_module, "portfolio_snapshot", _snapshot)
+    monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [])
+    monkeypatch.setattr(autopilot_module.storage, "kv_get", lambda key, default=None: default)
+    monkeypatch.setattr(autopilot_module.storage, "kv_set", lambda key, value: None)
+    monkeypatch.setattr(Autopilot, "_price", lambda *_a, **_k: asyncio.sleep(0, result=Decimal("100")), raising=True)
+    monkeypatch.setattr(Autopilot, "_count_non_dust_positions", lambda *_a, **_k: asyncio.sleep(0, result=(0, set())), raising=True)
+    monkeypatch.setattr(Autopilot, "_record_signal_event", lambda *_a, **_k: asyncio.sleep(0), raising=True)
+    monkeypatch.setattr(Autopilot, "_persist_skip_stats", lambda *_a, **_k: None, raising=True)
+    monkeypatch.setattr(Autopilot, "_persist_gate_stats", lambda *_a, **_k: None, raising=True)
+    monkeypatch.setattr(autopilot_module.trade_audit_logger, "log_event", lambda **_k: None)
+    monkeypatch.setattr(autopilot_module.filters, "is_listed", lambda _s: True, raising=True)
+    monkeypatch.setattr(Autopilot, "_place_buy", _place_buy, raising=True)
+
+    class _Sig:
+        action = autopilot_module.SignalAction.BUY
+        confidence = 0.80
+        contributing_agents = ["test"]
+        timeframe = autopilot_module.Timeframe.D1
+
+    await ap._execute({"BTCUSDT": _Sig()}, allow_buys=True)
+
+    assert placed == []
+
+
 async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
     ap = Autopilot()
     ap.state.mode = "live"

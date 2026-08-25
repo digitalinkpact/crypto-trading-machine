@@ -316,10 +316,27 @@ class Storage:
             ):
                 if col not in ct_cols:
                     c.execute(f"ALTER TABLE closed_trades ADD COLUMN {col} {decl}")
+            # Fee-accuracy audit (2026-08-25): the modeled taker fee had been
+            # 0.40% vs the account's REAL 0.02% for the entire trading history
+            # — a 20x overstatement of costs. `pnl`/`pnl_pct` are NEVER
+            # rewritten for existing rows (preserve the historical record
+            # exactly as recorded); these new columns hold the breakdown for
+            # NEW rows going forward (gross_pnl before fees, the fee actually
+            # charged, and whether it came from the exchange's real per-fill
+            # commission or a modeled estimate) plus a `_corrected` pair that
+            # scripts/backfill_corrected_pnl.py populates for OLD rows using
+            # the corrected fee assumption — a separate, additive field, never
+            # a destructive rewrite of `pnl`.
+            for col, decl in (
+                ("gross_pnl", "REAL"), ("fee_amount", "REAL"), ("fee_source", "TEXT"),
+                ("pnl_corrected", "REAL"), ("pnl_pct_corrected", "REAL"),
+            ):
+                if col not in ct_cols:
+                    c.execute(f"ALTER TABLE closed_trades ADD COLUMN {col} {decl}")
             pos_cols = [r["name"] for r in c.execute("PRAGMA table_info(positions)").fetchall()]
             for col, decl in (
                 ("entry_confidence", "REAL"), ("entry_strategy", "TEXT"),
-                ("entry_btc_regime", "INTEGER"),
+                ("entry_btc_regime", "INTEGER"), ("entry_fee_usdt", "REAL"),
             ):
                 if col not in pos_cols:
                     c.execute(f"ALTER TABLE positions ADD COLUMN {col} {decl}")
@@ -486,13 +503,14 @@ class Storage:
         entry_confidence: Optional[float] = None,
         entry_strategy: Optional[str] = None,
         entry_btc_regime: Optional[int] = None,
+        entry_fee_usdt: Optional[float] = None,
     ) -> None:
         agents_json = json.dumps(list(agents))
         with self._lock, self._conn() as c:
             c.execute(
                 "INSERT INTO positions(symbol,mode,qty,entry_price,entry_ts,agents,"
-                "entry_confidence,entry_strategy,entry_btc_regime) "
-                "VALUES(?,?,?,?,?,?,?,?,?) "
+                "entry_confidence,entry_strategy,entry_btc_regime,entry_fee_usdt) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(symbol,mode) DO UPDATE SET qty=qty+excluded.qty, "
                 "entry_price=((qty*entry_price + excluded.qty*excluded.entry_price)/"
                 "(qty+excluded.qty)), "
@@ -501,10 +519,16 @@ class Storage:
                 # position) with the add's own values.
                 "entry_confidence=COALESCE(positions.entry_confidence, excluded.entry_confidence), "
                 "entry_strategy=COALESCE(positions.entry_strategy, excluded.entry_strategy), "
-                "entry_btc_regime=COALESCE(positions.entry_btc_regime, excluded.entry_btc_regime)",
+                "entry_btc_regime=COALESCE(positions.entry_btc_regime, excluded.entry_btc_regime), "
+                # Fee, unlike the other entry-context fields, ACCUMULATES —
+                # every pyramid add pays its own real buy-side commission, so
+                # the total is the sum of all buy-side fees paid into the
+                # position so far (used at close time for a fully-actual,
+                # never-fabricated realized PnL — see close_position/reduce_position).
+                "entry_fee_usdt=COALESCE(positions.entry_fee_usdt,0)+COALESCE(excluded.entry_fee_usdt,0)",
                 (
                     symbol, mode, _f(qty), _f(entry_price), _now(), agents_json,
-                    entry_confidence, entry_strategy, entry_btc_regime,
+                    entry_confidence, entry_strategy, entry_btc_regime, entry_fee_usdt,
                 ),
             )
 
@@ -530,6 +554,7 @@ class Storage:
         exit_reason: Optional[str] = None,
         mfe_pct: Optional[float] = None,
         mae_pct: Optional[float] = None,
+        actual_fee_usdt: Optional[float] = None,
     ) -> Optional[dict]:
         """Close a position fully. Records to closed_trades and updates agent stats.
 
@@ -541,7 +566,10 @@ class Storage:
         traceable. `mfe_pct`/`mae_pct` (maximum favorable/adverse excursion,
         see app/trading/risk.py `mfe_mae_pct`) answer whether the ENTRY was bad
         (price never moved favorably) or the EXIT was bad (price moved
-        favorably first, then this trade still lost).
+        favorably first, then this trade still lost). `actual_fee_usdt`, when
+        the caller can supply Binance's REAL per-fill commission (see
+        `app.exchange.client._extract_commission`), is used in place of the
+        modeled fee estimate — never fabricated when unavailable.
         """
         with self._lock, self._conn() as c:
             if mode is None:
@@ -561,12 +589,19 @@ class Storage:
             entry = float(row["entry_price"])
             exit_p = _f(exit_price)
             # Closed-trade PnL should reflect execution costs so diagnostics,
-            # adaptive weights, and win/loss labels track real net edge.
+            # adaptive weights, and win/loss labels track real net edge. Use
+            # the REAL exchange commission when the caller has it; otherwise
+            # fall back to the modeled per-side taker-fee estimate.
             s = get_settings()
             taker_fee = float(s.binance_taker_fee)
             gross_pnl = (exit_p - entry) * qty
-            est_fees = (entry * qty * taker_fee) + (exit_p * qty * taker_fee)
-            pnl = gross_pnl - est_fees
+            if actual_fee_usdt is not None:
+                fee_amount = float(actual_fee_usdt)
+                fee_source = "actual"
+            else:
+                fee_amount = (entry * qty * taker_fee) + (exit_p * qty * taker_fee)
+                fee_source = "modeled"
+            pnl = gross_pnl - fee_amount
             entry_notional = entry * qty
             pnl_pct = ((pnl / entry_notional) * 100) if entry_notional else 0.0
             agents_json = row["agents"]
@@ -583,11 +618,13 @@ class Storage:
             c.execute(
                 "INSERT INTO closed_trades(mode,symbol,qty,entry_price,exit_price,pnl,"
                 "pnl_pct,entry_ts,exit_ts,agents,exit_reason,mfe_pct,mae_pct,holding_hours,"
-                "entry_confidence,entry_strategy,entry_btc_regime) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "entry_confidence,entry_strategy,entry_btc_regime,gross_pnl,fee_amount,"
+                "fee_source,pnl_corrected,pnl_pct_corrected) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (mode, symbol, qty, entry, exit_p, pnl, pnl_pct,
                  entry_ts, now, agents_json, reason, mfe_pct, mae_pct, holding_hours,
-                 entry_confidence, entry_strategy, entry_btc_regime),
+                 entry_confidence, entry_strategy, entry_btc_regime,
+                 gross_pnl, fee_amount, fee_source, pnl, pnl_pct),
             )
             won = pnl > 0
             for agent in agents_list:
@@ -604,7 +641,8 @@ class Storage:
             "exit_price": exit_p, "pnl": pnl, "pnl_pct": pnl_pct,
             "agents": agents_list, "entry_ts": entry_ts, "exit_ts": now,
             "mode": mode, "exit_reason": reason, "mfe_pct": mfe_pct, "mae_pct": mae_pct,
-            "holding_hours": holding_hours,
+            "holding_hours": holding_hours, "gross_pnl": gross_pnl,
+            "fee_amount": fee_amount, "fee_source": fee_source,
         }
 
     def reduce_position(
@@ -617,6 +655,7 @@ class Storage:
         exit_reason: Optional[str] = None,
         mfe_pct: Optional[float] = None,
         mae_pct: Optional[float] = None,
+        actual_fee_usdt: Optional[float] = None,
     ) -> Optional[dict]:
         """Close part or all of an open position and persist a closed-trade row."""
         with self._lock, self._conn() as c:
@@ -635,8 +674,13 @@ class Storage:
             s = get_settings()
             taker_fee = float(s.binance_taker_fee)
             gross_pnl = (exit_p - entry) * reduce_qty
-            est_fees = (entry * reduce_qty * taker_fee) + (exit_p * reduce_qty * taker_fee)
-            pnl = gross_pnl - est_fees
+            if actual_fee_usdt is not None:
+                fee_amount = float(actual_fee_usdt)
+                fee_source = "actual"
+            else:
+                fee_amount = (entry * reduce_qty * taker_fee) + (exit_p * reduce_qty * taker_fee)
+                fee_source = "modeled"
+            pnl = gross_pnl - fee_amount
             entry_notional = entry * reduce_qty
             pnl_pct = ((pnl / entry_notional) * 100) if entry_notional else 0.0
             agents_json = row["agents"]
@@ -659,11 +703,13 @@ class Storage:
             c.execute(
                 "INSERT INTO closed_trades(mode,symbol,qty,entry_price,exit_price,pnl,"
                 "pnl_pct,entry_ts,exit_ts,agents,exit_reason,mfe_pct,mae_pct,holding_hours,"
-                "entry_confidence,entry_strategy,entry_btc_regime) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "entry_confidence,entry_strategy,entry_btc_regime,gross_pnl,fee_amount,"
+                "fee_source,pnl_corrected,pnl_pct_corrected) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (mode, symbol, reduce_qty, entry, exit_p, pnl, pnl_pct,
                  entry_ts, now, agents_json, reason, mfe_pct, mae_pct, holding_hours,
-                 entry_confidence, entry_strategy, entry_btc_regime),
+                 entry_confidence, entry_strategy, entry_btc_regime,
+                 gross_pnl, fee_amount, fee_source, pnl, pnl_pct),
             )
             won = pnl > 0
             for agent in agents_list:
@@ -691,6 +737,9 @@ class Storage:
             "mfe_pct": mfe_pct,
             "mae_pct": mae_pct,
             "holding_hours": holding_hours,
+            "gross_pnl": gross_pnl,
+            "fee_amount": fee_amount,
+            "fee_source": fee_source,
         }
 
     # ── Agent stats ──────────────────────────────────────────────────

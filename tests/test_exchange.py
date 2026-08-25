@@ -91,6 +91,69 @@ async def test_live_order_sets_avg_fill_price_from_cum_quote():
 
 
 @pytest.mark.asyncio
+async def test_live_order_extracts_actual_commission_single_asset():
+    settings = Settings(dry_run=False, paper_trading=False)
+    c = BinanceUSClient(settings=settings)
+    c._spot = MagicMock()
+    c._spot.new_order.return_value = {
+        "status": "FILLED",
+        "orderId": 101,
+        "executedQty": "2",
+        "fills": [
+            {"price": "100", "qty": "1", "commission": "0.02", "commissionAsset": "USDT"},
+            {"price": "102", "qty": "1", "commission": "0.0204", "commissionAsset": "USDT"},
+        ],
+    }
+    order = await c.place_order(
+        "BTCUSDT", OrderSide.BUY, OrderType.MARKET, Decimal("2"),
+        client_order_id="ctm-test-commission",
+    )
+    assert order.commission == Decimal("0.0404")
+    assert order.commission_asset == "USDT"
+
+
+@pytest.mark.asyncio
+async def test_live_order_commission_none_when_assets_mixed():
+    """A commission paid in more than one asset (e.g. partial BNB discount)
+    can't be summed into one honest USDT number — must not fabricate one."""
+    settings = Settings(dry_run=False, paper_trading=False)
+    c = BinanceUSClient(settings=settings)
+    c._spot = MagicMock()
+    c._spot.new_order.return_value = {
+        "status": "FILLED",
+        "orderId": 102,
+        "executedQty": "2",
+        "fills": [
+            {"price": "100", "qty": "1", "commission": "0.0001", "commissionAsset": "BNB"},
+            {"price": "102", "qty": "1", "commission": "0.0204", "commissionAsset": "USDT"},
+        ],
+    }
+    order = await c.place_order(
+        "BTCUSDT", OrderSide.BUY, OrderType.MARKET, Decimal("2"),
+        client_order_id="ctm-test-mixed-commission",
+    )
+    assert order.commission is None
+    assert order.commission_asset is None
+
+
+@pytest.mark.asyncio
+async def test_live_order_commission_none_when_no_fills():
+    settings = Settings(dry_run=False, paper_trading=False)
+    c = BinanceUSClient(settings=settings)
+    c._spot = MagicMock()
+    c._spot.new_order.return_value = {
+        "status": "FILLED", "orderId": 103, "executedQty": "2",
+        "cummulativeQuoteQty": "202",
+    }
+    order = await c.place_order(
+        "BTCUSDT", OrderSide.BUY, OrderType.MARKET, Decimal("2"),
+        client_order_id="ctm-test-no-fills",
+    )
+    assert order.commission is None
+    assert order.commission_asset is None
+
+
+@pytest.mark.asyncio
 async def test_trade_fees_prefers_commission_rates(client):
     client._spot.account.return_value = {
         "commissionRates": {"maker": "0.001", "taker": "0.001"},

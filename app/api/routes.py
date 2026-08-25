@@ -675,6 +675,7 @@ async def health(response: Response) -> dict:
 @router.get("/autopilot/status")
 async def autopilot_status() -> dict:
     s = autopilot.state
+    entry_status = storage.kv_get("entry_status") or {}
     return {
         "running": s.running,
         "mode": s.mode,
@@ -684,6 +685,13 @@ async def autopilot_status() -> dict:
         "trades_executed": s.trades_executed,
         "last_action": s.last_action,
         "last_error": s.last_error,
+        # ENTRY_HALTED (new BUYs blocked, e.g. drawdown breaker/emergency halt)
+        # is distinct from SYSTEM_OFFLINE (the whole process/scheduler down).
+        # Existing positions keep receiving stop-loss/TP/trailing/reconciliation
+        # regardless of entry_halted — see Autopilot.tick().
+        "entry_halted": bool(entry_status.get("entry_halted")),
+        "entry_halted_reasons": entry_status.get("reasons") or [],
+        "system_offline": bool(entry_status.get("system_offline", False)),
     }
 
 

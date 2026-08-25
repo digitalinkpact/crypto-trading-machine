@@ -5,6 +5,8 @@ explicit (non-generic) exit_reason threading via `risk.infer_exit_reason`.
 """
 from __future__ import annotations
 
+import pytest
+
 from app.storage.db import Storage
 from app.trading.risk import infer_exit_reason
 
@@ -106,3 +108,55 @@ def test_infer_exit_reason_uses_explicit_signal_exit_tag():
 
 def test_infer_exit_reason_falls_back_to_generic_signal():
     assert infer_exit_reason(["profitstream_strategy"]) == "signal"
+
+
+def test_close_position_uses_modeled_fee_when_no_actual_fee_given(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(symbol="ETHUSDT", mode="paper", qty=1.0, entry_price=100.0, agents=[])
+    closed = s.close_position(symbol="ETHUSDT", mode="paper", exit_price=105.0)
+    assert closed["fee_source"] == "modeled"
+    assert closed["gross_pnl"] == 5.0
+    assert closed["fee_amount"] > 0
+    assert closed["pnl"] == closed["gross_pnl"] - closed["fee_amount"]
+
+    row = s.closed_trades(limit=1)[0]
+    assert row["fee_source"] == "modeled"
+    # pnl_corrected/gross_pnl are populated for every new row (not just backfill).
+    assert row["gross_pnl"] == 5.0
+    assert row["pnl_corrected"] == row["pnl"]
+
+
+def test_close_position_uses_actual_fee_when_provided(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(symbol="ETHUSDT", mode="live", qty=1.0, entry_price=100.0, agents=[])
+    closed = s.close_position(
+        symbol="ETHUSDT", mode="live", exit_price=105.0, actual_fee_usdt=0.03,
+    )
+    assert closed["fee_source"] == "actual"
+    assert closed["fee_amount"] == 0.03
+    assert closed["pnl"] == 5.0 - 0.03
+
+
+def test_reduce_position_uses_actual_fee_when_provided(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(symbol="ETHUSDT", mode="live", qty=2.0, entry_price=100.0, agents=[])
+    result = s.reduce_position(
+        symbol="ETHUSDT", mode="live", qty=1.0, exit_price=108.0, actual_fee_usdt=0.02,
+    )
+    assert result["fee_source"] == "actual"
+    assert result["fee_amount"] == 0.02
+    assert result["pnl"] == 8.0 - 0.02
+
+
+def test_open_position_accumulates_entry_fee_across_pyramid_adds(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(
+        symbol="ETHUSDT", mode="live", qty=1.0, entry_price=100.0, agents=[],
+        entry_fee_usdt=0.02,
+    )
+    s.open_position(
+        symbol="ETHUSDT", mode="live", qty=1.0, entry_price=110.0, agents=[],
+        entry_fee_usdt=0.022,
+    )
+    pos = s.get_position("ETHUSDT")
+    assert pos["entry_fee_usdt"] == pytest.approx(0.042)
