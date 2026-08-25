@@ -29,9 +29,13 @@ def test_runtime_settings_loadable():
     assert 0.0 < s.kelly_fraction_cap <= 1.0
 
 
-def test_drawdown_breaker_default_is_more_permissive():
+def test_drawdown_breaker_default_tightened_by_real_data(monkeypatch):
+    # Tightened 0.25->0.15 (2026-08-25): a replay of 250 real live closed
+    # trades never realized more than 14.34% drawdown, so 0.15 gives a real
+    # protective margin at zero historical cost (scripts/drawdown_threshold_sweep.py).
+    monkeypatch.delenv("DRAWDOWN_CIRCUIT_BREAKER_PCT", raising=False)
     s = Settings(_env_file=None)
-    assert s.drawdown_circuit_breaker_pct == 0.25
+    assert s.drawdown_circuit_breaker_pct == 0.15
 
 
 def test_spread_gate_settings_can_be_relaxed(monkeypatch):

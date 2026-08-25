@@ -254,12 +254,23 @@ class Settings(BaseSettings):
     orderbook_retry_attempts: int = Field(3, ge=1, le=10)
 
     # Exit gates (hard rules, evaluated every risk-tick)
-    stop_loss_pct: float = Field(0.015, ge=0.005, le=0.20)       # 1.5% hard stop
+    stop_loss_pct: float = Field(0.015, ge=0.005, le=0.20)       # 1.5% hard stop (unchanged this pass — see MAE/MFE note)
     take_profit_pct: float = Field(0.05, ge=0.005, le=0.50)      # 5% take-profit (unused by the
     # live TP1/TP2 ladder below; kept only as a display value + the
     # trailing_activation_pct getattr fallback in risk.py — do not read it
     # for exit logic, use take_profit_1_pct/take_profit_2_pct instead.
-    trailing_stop_pct: float = Field(0.01, ge=0.005, le=0.20)    # 1.0% trail from HWM
+    # trailing_stop_pct (distance) widened 1.0%->2.0% (2026-08-25 optimization
+    # pass, scripts/strategy_lab.py trailing sweep): a 3x3 activation x
+    # distance grid on real daily OHLCV showed distance=2.0% strictly
+    # outperforming 1.0%/1.25%/1.50% at EVERY activation level tested, in
+    # BOTH walk-forward folds independently (not just pooled) — expectancy
+    # +4.40%->+4.74%, avg_win +10.84%->+11.48%, mfe_captured 64.5%->66.6%,
+    # with IDENTICAL max_drawdown/max_losing_streak. The 1.0% distance was
+    # getting shaken out by ordinary volatility before winners could run.
+    # trailing_activation_pct's own sweep (2.0/2.5/3.0%) showed only a
+    # marginal, inconsistent edge from moving off 2.0% — left unchanged as
+    # the more robust choice per "prefer ranges over one curve-fitted value".
+    trailing_stop_pct: float = Field(0.02, ge=0.005, le=0.20)    # 2.0% trail from HWM
     trailing_activation_pct: float = Field(0.02, ge=0.005, le=0.50)  # arm trailing after +2%
     # TP1/TP2 scale-out ladder actually used by risk.evaluate_exits(). These
     # fields had been silently dropped from Settings (same class of gap as
@@ -268,13 +279,23 @@ class Settings(BaseSettings):
     # ladder was quietly hardcoded and NOT tunable via .env despite the
     # extensive comments in risk.py implying otherwise. Restored with the
     # exact same values risk.py was already falling back to, so this is a
-    # configurability fix with zero behavior change.
+    # configurability fix with zero behavior change. Left UNCHANGED this
+    # optimization pass per explicit instruction (first determine bad-entry
+    # vs premature-exit before touching TP structure).
     take_profit_1_pct: float = Field(0.08, ge=0.005, le=0.50)     # scale out at +8%
     take_profit_1_fraction: float = Field(0.50, ge=0.05, le=1.0)  # sell 50% of the position
     take_profit_2_pct: float = Field(0.15, ge=0.005, le=1.0)      # scale out at +15%
     take_profit_2_fraction: float = Field(0.25, ge=0.05, le=1.0)  # sell 25% of the ORIGINAL stake
     max_hold_hours: int = Field(96, ge=1, le=10000)              # force-exit after 4 days
-    drawdown_circuit_breaker_pct: float = Field(0.25, ge=0.01, le=0.50)  # halt new BUYs after -25%
+    # Tightened 0.25->0.15 (2026-08-25 optimization pass,
+    # scripts/drawdown_threshold_sweep.py against 250 real live closed
+    # trades): the realized max drawdown in that replay never exceeded
+    # 14.34%, so thresholds >=15% NEVER would have engaged historically —
+    # 0.15 provides a real protective margin just above the observed worst
+    # case at ZERO historical cost (0 halts, identical trade count/return to
+    # 0.25 in the replay), whereas 0.25 offered no real backstop at all since
+    # it sat far above anything that ever happened.
+    drawdown_circuit_breaker_pct: float = Field(0.15, ge=0.01, le=0.50)  # halt new BUYs after -15%
 
     # Stale / "dead money" exit — frees the slot early if a position has sat
     # for a while without meaningfully moving in our favor. Only ever forces
