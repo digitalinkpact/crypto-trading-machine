@@ -63,6 +63,24 @@ def s_dip_buy(df: pd.DataFrame) -> Signals:
     return _cross_up(entries).fillna(False), exits.fillna(False)
 
 
+def s_dip_buy_confirmed_exit(df: pd.DataFrame) -> Signals:
+    """Same dip_buy entry, but the RSI-recovery exit additionally requires
+    momentum deterioration (MACD histogram declining) OR price confirmation
+    (close back below EMA20) — mirrors the live fix in
+    ProfitStreamStrategy._mean_reversion_exit (2026-08-25). vectorbt's simple
+    entries/exits signal API has no notion of running position PnL, so this
+    approximates only the confirmation half of the live fix; the
+    breakeven-or-better PnL floor is NOT modeled here (see the live code for
+    that part — it needs per-position state this simple boolean-mask backtest
+    doesn't carry)."""
+    close, rsi, mh = df["close"], df["rsi_14"], df["macd_hist"]
+    entries = (rsi < 30) & (close <= df["bb_lower"])
+    momentum_deteriorating = mh < mh.shift(1)
+    price_confirmation = close < df["ema_20"]
+    exits = (rsi > 55) & (momentum_deteriorating | price_confirmation)
+    return _cross_up(entries).fillna(False), exits.fillna(False)
+
+
 def s_trend_follow(df: pd.DataFrame) -> Signals:
     """Long-only trend following: enter when EMA20>EMA50 AND price>EMA200."""
     close, ema20, ema50, ema200 = df["close"], df["ema_20"], df["ema_50"], df["ema_200"]
@@ -175,6 +193,7 @@ s_multi_factor_score = make_multi_factor_score()
 STRATEGIES: dict[str, Strategy] = {
     "baseline":         s_baseline,
     "dip_buy":          s_dip_buy,
+    "dip_buy_confirmed_exit": s_dip_buy_confirmed_exit,
     "trend_follow":     s_trend_follow,
     "trend_confluence": s_trend_confluence,
     "donchian_trend":   s_donchian_trend,

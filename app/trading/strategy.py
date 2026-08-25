@@ -70,7 +70,10 @@ class ProfitStreamStrategy:
 
         held = self._is_held(symbol, mode)
         exit_ready, exit_rsi = self._mean_reversion_exit(df_1d)
-        dip_ready, dip_rsi = self._dip_buy_setup(df_1d)
+        if s.entry_strategy == "oversold_bounce":
+            dip_ready, dip_rsi = self._oversold_bounce_setup(df_1d)
+        else:
+            dip_ready, dip_rsi = self._dip_buy_setup(df_1d)
         btc_risk_on, btc_ema50, btc_ema200 = self._btc_risk_on(btc_1d)
         btc_regime = compute_btc_regime_score(btc_1d)
         daily_quote = self._latest_quote_volume(df_1d)
@@ -113,25 +116,57 @@ class ProfitStreamStrategy:
             # trades/3.2% win-rate/-$7.61 in just the 5 days after the
             # regime-gating deploy — dwarfing stop_loss's own -$13.85 and
             # completely eclipsing take_profit/trailing_stop's positive
-            # totals. RSI ticking back above 55 is only "no longer deeply
-            # oversold", not "the trade worked" — closing here regardless of
-            # price often locks in a small loss on a position that hasn't
-            # recovered, pre-empting the (empirically much healthier)
-            # stop-loss/trailing-stop/stale-exit ladder. Only honor this
-            # signal-based exit when the position is at or above breakeven;
-            # otherwise let the risk ladder keep managing the downside.
+            # totals. RSI ticking back above the recovery threshold only
+            # means "no longer deeply oversold", not "the trade worked", so
+            # this exit now requires ALL of: breakeven-or-better PnL, the
+            # position not already having run into TP/trailing territory,
+            # and (when enabled) an independent momentum or price
+            # confirmation that the move is actually rolling over — not RSI
+            # alone.
             close_now = float(df_1d.iloc[-1]["close"])
             held_pos = self._held_position(symbol, mode)
             entry_price = float((held_pos or {}).get("entry_price") or 0.0)
             held_pnl_pct = ((close_now - entry_price) / entry_price) if entry_price > 0 else 0.0
             indicators["held_pnl_pct"] = held_pnl_pct
-            if held_pnl_pct >= s.mean_reversion_exit_min_pnl_pct:
-                indicators["decision"] = "sell_mean_reversion_exit"
-                return StrategyDecision(symbol, SignalAction.SELL, 90, reasons, indicators)
-            reasons.append(
-                f"mean_reversion_exit_suppressed_at_loss:pnl={held_pnl_pct:.2%}"
-                f"<{s.mean_reversion_exit_min_pnl_pct:.2%}"
-            )
+
+            if held_pnl_pct < s.mean_reversion_exit_min_pnl_pct:
+                reasons.append(
+                    f"mean_reversion_exit_suppressed_at_loss:pnl={held_pnl_pct:.2%}"
+                    f"<{s.mean_reversion_exit_min_pnl_pct:.2%}"
+                )
+            elif (
+                s.mean_reversion_exit_defer_to_risk_ladder
+                and held_pnl_pct >= float(s.trailing_activation_pct)
+            ):
+                # Already running into "let it ride" territory — the trailing
+                # stop is armed (or about to be) and TP1/TP2 are better judges
+                # of when to bank a real winner than a bare technical signal.
+                reasons.append(
+                    f"mean_reversion_exit_deferred_to_risk_ladder:pnl={held_pnl_pct:.2%}"
+                    f">={float(s.trailing_activation_pct):.2%}"
+                )
+            else:
+                momentum_confirmed = self._momentum_deteriorating(df_1d)
+                price_confirmed = self._bearish_price_confirmation(df_1d)
+                indicators["mean_reversion_momentum_confirmed"] = momentum_confirmed
+                indicators["mean_reversion_price_confirmed"] = price_confirmed
+                need_momentum = s.mean_reversion_exit_require_momentum_confirmation
+                need_price = s.mean_reversion_exit_require_price_confirmation
+                if need_momentum or need_price:
+                    confirmed = (need_momentum and momentum_confirmed) or (need_price and price_confirmed)
+                else:
+                    confirmed = True  # no confirmation configured -> plain RSI+PnL gate
+                if confirmed:
+                    if need_momentum and momentum_confirmed:
+                        exit_reason = "mean_reversion_rsi_momentum"
+                    elif need_price and price_confirmed:
+                        exit_reason = "mean_reversion_rsi_price"
+                    else:
+                        exit_reason = "mean_reversion_rsi"
+                    indicators["decision"] = "sell_mean_reversion_exit"
+                    indicators["exit_reason"] = exit_reason
+                    return StrategyDecision(symbol, SignalAction.SELL, 90, reasons, indicators)
+                reasons.append("mean_reversion_exit_awaiting_confirmation")
 
         filt_ok = True
 
@@ -169,9 +204,11 @@ class ProfitStreamStrategy:
         score += 10 if filt_ok else 0
 
         if not dip_ready:
-            if dip_rsi >= 30:
+            rsi_bar = s.oversold_bounce_rsi_max if s.entry_strategy == "oversold_bounce" else 30
+            bb_mult = s.oversold_bounce_bb_multiplier if s.entry_strategy == "oversold_bounce" else 1.0
+            if dip_rsi >= rsi_bar:
                 reasons.append("rsi_not_oversold")
-            if float(df_1d.iloc[-1]["close"]) > float(df_1d.iloc[-1]["bb_lower"]):
+            if float(df_1d.iloc[-1]["close"]) > float(df_1d.iloc[-1]["bb_lower"]) * bb_mult:
                 reasons.append("close_above_lower_band")
 
         if held:
@@ -180,6 +217,7 @@ class ProfitStreamStrategy:
 
         if dip_ready and filt_ok:
             indicators["decision"] = "buy"
+            indicators["entry_strategy"] = s.entry_strategy
             return StrategyDecision(symbol, SignalAction.BUY, max(score, 90), reasons, indicators)
 
         indicators["decision"] = "hold"
@@ -209,6 +247,27 @@ class ProfitStreamStrategy:
         bb_lower = float(last["bb_lower"])
         return bool(rsi < 30 and close <= bb_lower), rsi
 
+    def _oversold_bounce_setup(self, df: pd.DataFrame) -> tuple[bool, float]:
+        """Looser dip-buy (Fix 5 A/B candidate): also requires price already
+        off its 5-day low, i.e. not still in free-fall. Selected in place of
+        `_dip_buy_setup` when `entry_strategy=oversold_bounce`."""
+        s = get_settings()
+        out = df.dropna()
+        if out.empty or "rsi_14" not in out.columns or "bb_lower" not in out.columns:
+            return False, 0.0
+        last = out.iloc[-1]
+        rsi = float(last["rsi_14"])
+        close = float(last["close"])
+        bb_lower = float(last["bb_lower"])
+        low5 = float(out["low"].tail(5).min()) if len(out) >= 5 else close
+        bounced = low5 > 0 and close > low5 * (1 + s.oversold_bounce_min_bounce_pct)
+        ready = bool(
+            rsi < s.oversold_bounce_rsi_max
+            and close < bb_lower * s.oversold_bounce_bb_multiplier
+            and bounced
+        )
+        return ready, rsi
+
     def _dip_too_extended(self, df: pd.DataFrame) -> tuple[bool, float]:
         """Anti-chase / falling-knife guard.
 
@@ -232,11 +291,30 @@ class ProfitStreamStrategy:
         return extension_pct > s.max_dip_extension_pct, extension_pct
 
     def _mean_reversion_exit(self, df: pd.DataFrame) -> tuple[bool, float]:
+        s = get_settings()
         out = df.dropna()
         if out.empty or "rsi_14" not in out.columns:
             return False, 0.0
         rsi = float(out.iloc[-1]["rsi_14"])
-        return rsi > 55, rsi
+        return rsi > s.mean_reversion_exit_rsi, rsi
+
+    def _momentum_deteriorating(self, df: pd.DataFrame) -> bool:
+        """MACD histogram declining bar-over-bar — momentum losing steam even
+        if RSI/price still look fine. Used as one of the two independent
+        confirmations required before the RSI-recovery exit is honored."""
+        out = df.dropna()
+        if len(out) < 2 or "macd_hist" not in out.columns:
+            return False
+        return float(out.iloc[-1]["macd_hist"]) < float(out.iloc[-2]["macd_hist"])
+
+    def _bearish_price_confirmation(self, df: pd.DataFrame) -> bool:
+        """Price has dropped back below its own EMA20 — the short-term trend
+        itself has turned, not just a single indicator wobble."""
+        out = df.dropna()
+        if out.empty or "ema_20" not in out.columns:
+            return False
+        last = out.iloc[-1]
+        return float(last["close"]) < float(last["ema_20"])
 
     def _score_entry_candidates(self, df: pd.DataFrame) -> dict[str, EntryCandidate]:
         """Score 4 candidate entry types for observability (NOT for gating).

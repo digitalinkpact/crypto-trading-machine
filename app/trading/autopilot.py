@@ -1902,7 +1902,12 @@ class Autopilot:
             log.info("skip %s BUY: filters reject qty=%s price=%s", symbol, qty, price)
             return False
         agents = list(getattr(sig, "contributing_agents", []) or [])
-        order = await self._submit(symbol, OrderSide.BUY, qty, agents)
+        order = await self._submit(
+            symbol, OrderSide.BUY, qty, agents,
+            entry_confidence=float(getattr(sig, "confidence", 0.0) or 0.0),
+            entry_strategy=(str(getattr(sig, "entry_strategy", "") or "") or None),
+            entry_btc_regime=getattr(sig, "entry_btc_regime", None),
+        )
         return self._order_filled(order)
 
     async def _buy_order_plan(self, symbol: str, per_trade_usdt: Decimal) -> dict[str, Decimal | bool | None]:
@@ -1930,6 +1935,13 @@ class Autopilot:
             log.info("skip %s SELL: filters reject qty=%s", symbol, qty)
             return False
         agents = list(getattr(sig, "contributing_agents", []) or [])
+        # Carry the strategy's own declared exit reason (e.g.
+        # "mean_reversion_rsi_price") through to closed_trades instead of
+        # letting it collapse into the generic "signal" bucket — required so
+        # forensic queries can tell exactly which exit path produced a trade.
+        sig_exit_reason = str(getattr(sig, "exit_reason", "") or "")
+        if sig_exit_reason:
+            agents = [*agents, f"exit:{sig_exit_reason}"]
         order = await self._submit(symbol, OrderSide.SELL, qty, agents)
         return self._order_filled(order)
 
@@ -1949,11 +1961,21 @@ class Autopilot:
         return order.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED) and filled > 0
 
     async def _submit(
-        self, symbol: str, side: OrderSide, qty: Decimal, agents: list[str]
+        self,
+        symbol: str,
+        side: OrderSide,
+        qty: Decimal,
+        agents: list[str],
+        *,
+        entry_confidence: Optional[float] = None,
+        entry_strategy: Optional[str] = None,
+        entry_btc_regime: Optional[int] = None,
     ) -> Optional[Order]:
         if self.state.mode == "paper":
             order = await paper_exchange.place_order(
                 symbol=symbol, side=side, quantity=qty, agents=agents,
+                entry_confidence=entry_confidence, entry_strategy=entry_strategy,
+                entry_btc_regime=entry_btc_regime,
             )
         else:
             client = BinanceUSClient()
@@ -2011,11 +2033,21 @@ class Autopilot:
                     storage.open_position(
                         symbol=symbol, mode="live", qty=filled,
                         entry_price=price, agents=agents,
+                        entry_confidence=entry_confidence, entry_strategy=entry_strategy,
+                        entry_btc_regime=entry_btc_regime,
                     )
                 else:
+                    pos = next(
+                        (p for p in storage.all_positions() if p["symbol"] == symbol and p["mode"] == "live"),
+                        None,
+                    )
+                    mfe_pct, mae_pct = risk.mfe_mae_pct(
+                        symbol, Decimal(str((pos or {}).get("entry_price") or 0))
+                    )
                     storage.reduce_position(
                         symbol=symbol, mode="live", qty=filled, exit_price=price,
                         exit_reason=risk.infer_exit_reason(agents),
+                        mfe_pct=mfe_pct, mae_pct=mae_pct,
                     )
             except Exception as exc:  # noqa: BLE001
                 log.warning("storage write failed for live order %s: %s", symbol, exc)

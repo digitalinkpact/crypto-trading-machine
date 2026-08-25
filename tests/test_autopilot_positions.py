@@ -179,6 +179,58 @@ async def test_tick_does_not_run_risk_gates_inline(monkeypatch):
     monkeypatch.setattr(autopilot_module, "run_all_agents", lambda use_llm: asyncio.sleep(0, result={}), raising=True)
     monkeypatch.setattr(Autopilot, "_execute", _fake_execute, raising=True)
 
+
+async def test_run_risk_gates_executes_stop_loss_even_when_entry_gates_blocked(monkeypatch):
+    """Protective exits (app/trading/risk.py evaluate_exits, run via the
+    independent risk loop) must fire regardless of ANY entry-side gate state
+    — emergency halt, a failed BTC-regime check, a failed order-book check,
+    etc. all block NEW BUYs only. This directly exercises `_run_risk_gates`
+    end-to-end with `_entry_block_reason` forced to a blocking value and
+    confirms a stop-loss SELL is still submitted."""
+    ap = Autopilot()
+    ap.state.mode = "paper"
+
+    position = {
+        "symbol": "ETHUSDT", "mode": "paper", "qty": 1.0,
+        "entry_price": 100.0, "entry_ts": datetime.now(timezone.utc).isoformat(),
+        "agents": "[]",
+    }
+
+    async def _fake_snapshot(**_kwargs):
+        return {"free_balances": {"ETH": 1.0}, "all_balances": {"ETH": 1.0}}
+
+    submitted: list[tuple] = []
+
+    async def _fake_submit(self, symbol, side, qty, agents):
+        submitted.append((symbol, side, qty, agents))
+        return Order(
+            symbol=symbol, side=side, type=OrderType.MARKET, quantity=qty,
+            client_order_id="test", status=OrderStatus.FILLED,
+            filled_quantity=qty, avg_fill_price=Decimal("90"),
+        )
+
+    monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [position], raising=True)
+    monkeypatch.setattr(autopilot_module, "portfolio_snapshot", _fake_snapshot, raising=True)
+    monkeypatch.setattr(Autopilot, "_price", lambda self, symbol: asyncio.sleep(0, result=Decimal("90")), raising=True)
+    monkeypatch.setattr(Autopilot, "_entry_block_reason", lambda self: "emergency_halt: simulated", raising=True)
+    monkeypatch.setattr(autopilot_module.filters, "round_qty", lambda symbol, qty: qty, raising=True)
+    monkeypatch.setattr(autopilot_module.filters, "meets_min", lambda symbol, qty, price: True, raising=True)
+    monkeypatch.setattr(autopilot_module.storage, "record_tick_audit", lambda **_k: None, raising=True)
+    monkeypatch.setattr(Autopilot, "_submit", _fake_submit, raising=True)
+
+    # Confirm the (blocked) entry-protection state really is active — this
+    # test would be meaningless if it weren't.
+    assert ap._entry_block_reason() is not None
+
+    await ap._run_risk_gates()
+
+    assert len(submitted) == 1
+    symbol, side, qty, agents = submitted[0]
+    assert symbol == "ETHUSDT"
+    assert side == OrderSide.SELL
+    assert any(a == "risk:stop_loss" for a in agents)
+
+
     await ap.tick()
 
 

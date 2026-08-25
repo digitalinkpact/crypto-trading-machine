@@ -4,6 +4,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
+
 from app.config import get_settings
 from app.trading import risk
 
@@ -237,3 +239,34 @@ def test_daily_loss_limit_disabled_never_trips(monkeypatch):
     )
     assert tripped is False
     assert pnl == Decimal("0")
+
+
+def test_lwm_tracks_the_lowest_price_seen():
+    risk.clear_hwm("ADAUSDT")
+    risk.clear_lwm("ADAUSDT")
+    positions = [_pos("ADAUSDT", 1.0, 1.0)]
+    risk.evaluate_exits(positions=positions, prices={"ADAUSDT": Decimal("0.90")})
+    risk.evaluate_exits(positions=positions, prices={"ADAUSDT": Decimal("0.95")})
+    assert risk.get_lwm("ADAUSDT") == Decimal("0.90")
+
+
+def test_mfe_mae_pct_computed_relative_to_entry():
+    risk.clear_hwm("SOLUSDT")
+    risk.clear_lwm("SOLUSDT")
+    positions = [_pos("SOLUSDT", 1.0, 100.0)]
+    # Ran up to 112 (peak), then pulled back to 97 (trough) before being read.
+    risk.evaluate_exits(positions=positions, prices={"SOLUSDT": Decimal("112")})
+    risk.evaluate_exits(positions=positions, prices={"SOLUSDT": Decimal("97")})
+    mfe, mae = risk.mfe_mae_pct("SOLUSDT", Decimal("100"))
+    assert mfe == pytest.approx(0.12)
+    assert mae == pytest.approx(0.03)
+    risk.clear_hwm("SOLUSDT")
+    risk.clear_lwm("SOLUSDT")
+
+
+def test_mfe_mae_pct_none_when_never_tracked():
+    risk.clear_hwm("NEWCOINUSDT")
+    risk.clear_lwm("NEWCOINUSDT")
+    mfe, mae = risk.mfe_mae_pct("NEWCOINUSDT", Decimal("100"))
+    assert mfe is None
+    assert mae is None

@@ -33,6 +33,10 @@ def _hwm_key(symbol: str) -> str:
     return f"hwm:{symbol}"
 
 
+def _lwm_key(symbol: str) -> str:
+    return f"lwm:{symbol}"
+
+
 def _tp1_key(symbol: str) -> str:
     return f"tp1:{symbol}"
 
@@ -53,6 +57,48 @@ def update_hwm(symbol: str, price: Decimal) -> Decimal:
 
 def clear_hwm(symbol: str) -> None:
     storage.kv_set(_hwm_key(symbol), None)
+
+
+def update_lwm(symbol: str, price: Decimal) -> Decimal:
+    """Track per-position low-water mark — the counterpart to `update_hwm`,
+    used to compute MAE (maximum adverse excursion) at close time."""
+    cur = storage.kv_get(_lwm_key(symbol))
+    if cur is None:
+        storage.kv_set(_lwm_key(symbol), str(price))
+        return price
+    cur_d = Decimal(str(cur))
+    new = min(cur_d, price)
+    if new != cur_d:
+        storage.kv_set(_lwm_key(symbol), str(new))
+    return new
+
+
+def clear_lwm(symbol: str) -> None:
+    storage.kv_set(_lwm_key(symbol), None)
+
+
+def get_lwm(symbol: str) -> Optional[Decimal]:
+    cur = storage.kv_get(_lwm_key(symbol))
+    if cur in (None, "None"):
+        return None
+    try:
+        return Decimal(str(cur))
+    except Exception as e:  # noqa: BLE001
+        log.exception("Trade execution failure: %s", e)
+        return None
+
+
+def mfe_mae_pct(symbol: str, entry_price: Decimal) -> tuple[Optional[float], Optional[float]]:
+    """Compute (MFE%, MAE%) for an open position from its tracked HWM/LWM,
+    relative to entry price. Returns (None, None) if nothing was tracked yet
+    (e.g. a position closed before a single risk-loop tick ran)."""
+    if entry_price <= 0:
+        return None, None
+    hwm = get_hwm(symbol)
+    lwm = get_lwm(symbol)
+    mfe = float((hwm - entry_price) / entry_price) if hwm is not None else None
+    mae = float((entry_price - lwm) / entry_price) if lwm is not None else None
+    return mfe, mae
 
 
 def mark_tp1_taken(symbol: str) -> None:
@@ -83,12 +129,21 @@ def infer_exit_reason(agents: Optional[list[str]]) -> str:
     """Derive a closed_trades `exit_reason` from an order's agent tags.
 
     Risk-gate exits tag the order with `risk:<reason>` (see autopilot's
-    `_run_risk_gates`); anything else is an agent/signal-driven SELL.
+    `_run_risk_gates`) and take priority — they're the most authoritative
+    since they come from the hard stop/TP/trailing/max-hold rules. Next,
+    strategy-declared signal exits tag `exit:<reason>` (e.g.
+    "mean_reversion_rsi_price" — see ProfitStreamStrategy) so a generic
+    "signal" bucket doesn't swallow a known, specific reason. Anything else
+    falls back to the generic "signal" bucket.
     """
     for a in agents or []:
         if isinstance(a, str) and a.startswith("risk:"):
             return a.split(":", 1)[1] or "unknown"
+    for a in agents or []:
+        if isinstance(a, str) and a.startswith("exit:"):
+            return a.split(":", 1)[1] or "signal"
     return "signal"
+
 
 
 def get_hwm(symbol: str) -> Optional[Decimal]:
@@ -130,8 +185,10 @@ def evaluate_exits(
         if entry <= 0 or qty <= 0:
             continue
 
-        # Track HWM for this position.
+        # Track HWM/LWM for this position (drives trailing-stop plus the
+        # MFE/MAE forensic metrics recorded at close time).
         hwm = update_hwm(symbol, price)
+        update_lwm(symbol, price)
 
         change = (price - entry) / entry  # positive = gain, negative = loss
 

@@ -13,6 +13,7 @@ from typing import Optional
 from app.config import get_settings
 from app.exchange import BinanceUSClient, Order, OrderSide, OrderStatus, OrderType
 from app.logging_setup import get_logger
+from app.trading import risk
 from app.trading.risk import infer_exit_reason
 from app.storage import storage
 
@@ -82,6 +83,9 @@ class PaperExchange:
         quantity: Decimal,
         agents: Optional[list[str]] = None,
         client_order_id: Optional[str] = None,
+        entry_confidence: Optional[float] = None,
+        entry_strategy: Optional[str] = None,
+        entry_btc_regime: Optional[int] = None,
     ) -> Order:
         """Simulate a market order using the current live ticker price."""
         price = await self._live.ticker_price(symbol)
@@ -102,6 +106,8 @@ class PaperExchange:
             storage.open_position(
                 symbol=symbol, mode="paper", qty=quantity,
                 entry_price=price, agents=agents or [],
+                entry_confidence=entry_confidence, entry_strategy=entry_strategy,
+                entry_btc_regime=entry_btc_regime,
             )
             filled_qty = quantity
         else:  # SELL — close any existing position
@@ -114,9 +120,17 @@ class PaperExchange:
                 raise RuntimeError(f"no {base} to sell in paper account")
             proceeds = qty * price - (qty * price * fee_rate)
             storage.paper_balance_add("USDT", proceeds)
+            pos = next(
+                (p for p in storage.all_positions() if p["symbol"] == symbol and p["mode"] == "paper"),
+                None,
+            )
+            mfe_pct, mae_pct = risk.mfe_mae_pct(
+                symbol, Decimal(str((pos or {}).get("entry_price") or 0))
+            )
             storage.reduce_position(
                 symbol=symbol, mode="paper", qty=qty, exit_price=price,
                 exit_reason=infer_exit_reason(agents),
+                mfe_pct=mfe_pct, mae_pct=mae_pct,
             )
             filled_qty = qty
             fee = qty * price * fee_rate

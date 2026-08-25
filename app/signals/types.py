@@ -42,6 +42,14 @@ class Signal(BaseModel):
     # un-lossy value position sizing keys off. 0 when not produced by the
     # quality-scoring strategy (e.g. legacy per-agent signals).
     quality_score: int = 0
+    # Forensic metadata, set by ProfitStreamStrategy so it survives into
+    # closed_trades: WHY a SELL fired (e.g. "mean_reversion_rsi_momentum",
+    # "stop_loss") and what produced a BUY (e.g. "dip_buy"/"oversold_bounce"),
+    # plus the scored BTC regime (-2..+2) at signal time. Empty/None when not
+    # produced by ProfitStream.
+    exit_reason: str = ""
+    entry_strategy: str = ""
+    entry_btc_regime: int | None = None
 
 
 # Higher timeframes carry more weight in cross-timeframe fusion.

@@ -212,6 +212,19 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _holding_hours(entry_ts: str, exit_ts: str) -> Optional[float]:
+    try:
+        start = datetime.fromisoformat(str(entry_ts))
+        end = datetime.fromisoformat(str(exit_ts))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        return (end - start).total_seconds() / 3600.0
+    except (TypeError, ValueError):
+        return None
+
+
 def _f(x: Any) -> float:
     if isinstance(x, Decimal):
         return float(x)
@@ -293,6 +306,23 @@ class Storage:
             ct_cols = [r["name"] for r in c.execute("PRAGMA table_info(closed_trades)").fetchall()]
             if "exit_reason" not in ct_cols:
                 c.execute("ALTER TABLE closed_trades ADD COLUMN exit_reason TEXT")
+            # Forensic metrics (MUST_FIX audit, 2026-08-25): were we entering
+            # bad trades, or entering good trades and exiting them badly? MFE/
+            # MAE/holding-duration/entry-context answer that; add in place.
+            for col, decl in (
+                ("mfe_pct", "REAL"), ("mae_pct", "REAL"), ("holding_hours", "REAL"),
+                ("entry_confidence", "REAL"), ("entry_strategy", "TEXT"),
+                ("entry_btc_regime", "INTEGER"),
+            ):
+                if col not in ct_cols:
+                    c.execute(f"ALTER TABLE closed_trades ADD COLUMN {col} {decl}")
+            pos_cols = [r["name"] for r in c.execute("PRAGMA table_info(positions)").fetchall()]
+            for col, decl in (
+                ("entry_confidence", "REAL"), ("entry_strategy", "TEXT"),
+                ("entry_btc_regime", "INTEGER"),
+            ):
+                if col not in pos_cols:
+                    c.execute(f"ALTER TABLE positions ADD COLUMN {col} {decl}")
 
     # ── KV (used for autopilot state) ────────────────────────────────
     def kv_set(self, key: str, value: Any) -> None:
@@ -453,16 +483,29 @@ class Storage:
         qty: Decimal | float,
         entry_price: Decimal | float,
         agents: Iterable[str],
+        entry_confidence: Optional[float] = None,
+        entry_strategy: Optional[str] = None,
+        entry_btc_regime: Optional[int] = None,
     ) -> None:
         agents_json = json.dumps(list(agents))
         with self._lock, self._conn() as c:
             c.execute(
-                "INSERT INTO positions(symbol,mode,qty,entry_price,entry_ts,agents) "
-                "VALUES(?,?,?,?,?,?) "
+                "INSERT INTO positions(symbol,mode,qty,entry_price,entry_ts,agents,"
+                "entry_confidence,entry_strategy,entry_btc_regime) "
+                "VALUES(?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(symbol,mode) DO UPDATE SET qty=qty+excluded.qty, "
                 "entry_price=((qty*entry_price + excluded.qty*excluded.entry_price)/"
-                "(qty+excluded.qty)) ",
-                (symbol, mode, _f(qty), _f(entry_price), _now(), agents_json),
+                "(qty+excluded.qty)), "
+                # A pyramid add must not overwrite the ORIGINAL entry's forensic
+                # context (which strategy/confidence/regime actually opened the
+                # position) with the add's own values.
+                "entry_confidence=COALESCE(positions.entry_confidence, excluded.entry_confidence), "
+                "entry_strategy=COALESCE(positions.entry_strategy, excluded.entry_strategy), "
+                "entry_btc_regime=COALESCE(positions.entry_btc_regime, excluded.entry_btc_regime)",
+                (
+                    symbol, mode, _f(qty), _f(entry_price), _now(), agents_json,
+                    entry_confidence, entry_strategy, entry_btc_regime,
+                ),
             )
 
     def get_position(self, symbol: str) -> Optional[dict]:
@@ -485,14 +528,20 @@ class Storage:
         mode: Optional[str] = None,
         exit_price: Decimal | float,
         exit_reason: Optional[str] = None,
+        mfe_pct: Optional[float] = None,
+        mae_pct: Optional[float] = None,
     ) -> Optional[dict]:
         """Close a position fully. Records to closed_trades and updates agent stats.
 
         `exit_reason` should be one of stop_loss/take_profit/trailing_stop/
-        max_hold (risk exits), "signal" (agent-driven sell), or
+        max_hold (risk exits), a specific signal reason (e.g.
+        "mean_reversion_rsi_price" — see ProfitStreamStrategy), or
         "reconcile_stale" (exchange balance gone, book cleanup) — kept distinct
         from `agents` (the entry agents) so a closed trade's WHY is always
-        traceable.
+        traceable. `mfe_pct`/`mae_pct` (maximum favorable/adverse excursion,
+        see app/trading/risk.py `mfe_mae_pct`) answer whether the ENTRY was bad
+        (price never moved favorably) or the EXIT was bad (price moved
+        favorably first, then this trade still lost).
         """
         with self._lock, self._conn() as c:
             if mode is None:
@@ -526,12 +575,19 @@ class Storage:
             mode = row["mode"]
             now = _now()
             reason = exit_reason or "unknown"
+            holding_hours = _holding_hours(entry_ts, now)
+            entry_confidence = row["entry_confidence"] if "entry_confidence" in row.keys() else None
+            entry_strategy = row["entry_strategy"] if "entry_strategy" in row.keys() else None
+            entry_btc_regime = row["entry_btc_regime"] if "entry_btc_regime" in row.keys() else None
             c.execute("DELETE FROM positions WHERE symbol=? AND mode=?", (symbol, mode or row["mode"]))
             c.execute(
                 "INSERT INTO closed_trades(mode,symbol,qty,entry_price,exit_price,pnl,"
-                "pnl_pct,entry_ts,exit_ts,agents,exit_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "pnl_pct,entry_ts,exit_ts,agents,exit_reason,mfe_pct,mae_pct,holding_hours,"
+                "entry_confidence,entry_strategy,entry_btc_regime) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (mode, symbol, qty, entry, exit_p, pnl, pnl_pct,
-                 entry_ts, now, agents_json, reason),
+                 entry_ts, now, agents_json, reason, mfe_pct, mae_pct, holding_hours,
+                 entry_confidence, entry_strategy, entry_btc_regime),
             )
             won = pnl > 0
             for agent in agents_list:
@@ -547,7 +603,8 @@ class Storage:
             "symbol": symbol, "qty": qty, "entry_price": entry,
             "exit_price": exit_p, "pnl": pnl, "pnl_pct": pnl_pct,
             "agents": agents_list, "entry_ts": entry_ts, "exit_ts": now,
-            "mode": mode, "exit_reason": reason,
+            "mode": mode, "exit_reason": reason, "mfe_pct": mfe_pct, "mae_pct": mae_pct,
+            "holding_hours": holding_hours,
         }
 
     def reduce_position(
@@ -558,6 +615,8 @@ class Storage:
         qty: Decimal | float,
         exit_price: Decimal | float,
         exit_reason: Optional[str] = None,
+        mfe_pct: Optional[float] = None,
+        mae_pct: Optional[float] = None,
     ) -> Optional[dict]:
         """Close part or all of an open position and persist a closed-trade row."""
         with self._lock, self._conn() as c:
@@ -585,6 +644,10 @@ class Storage:
             entry_ts = row["entry_ts"]
             now = _now()
             reason = exit_reason or "unknown"
+            holding_hours = _holding_hours(entry_ts, now)
+            entry_confidence = row["entry_confidence"] if "entry_confidence" in row.keys() else None
+            entry_strategy = row["entry_strategy"] if "entry_strategy" in row.keys() else None
+            entry_btc_regime = row["entry_btc_regime"] if "entry_btc_regime" in row.keys() else None
             remaining = pos_qty - reduce_qty
             if remaining <= 1e-12:
                 c.execute("DELETE FROM positions WHERE symbol=? AND mode=?", (symbol, mode))
@@ -595,9 +658,12 @@ class Storage:
                 )
             c.execute(
                 "INSERT INTO closed_trades(mode,symbol,qty,entry_price,exit_price,pnl,"
-                "pnl_pct,entry_ts,exit_ts,agents,exit_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "pnl_pct,entry_ts,exit_ts,agents,exit_reason,mfe_pct,mae_pct,holding_hours,"
+                "entry_confidence,entry_strategy,entry_btc_regime) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (mode, symbol, reduce_qty, entry, exit_p, pnl, pnl_pct,
-                 entry_ts, now, agents_json, reason),
+                 entry_ts, now, agents_json, reason, mfe_pct, mae_pct, holding_hours,
+                 entry_confidence, entry_strategy, entry_btc_regime),
             )
             won = pnl > 0
             for agent in agents_list:
@@ -622,6 +688,9 @@ class Storage:
             "exit_ts": now,
             "mode": mode,
             "exit_reason": reason,
+            "mfe_pct": mfe_pct,
+            "mae_pct": mae_pct,
+            "holding_hours": holding_hours,
         }
 
     # ── Agent stats ──────────────────────────────────────────────────

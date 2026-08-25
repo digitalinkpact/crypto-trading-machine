@@ -255,9 +255,24 @@ class Settings(BaseSettings):
 
     # Exit gates (hard rules, evaluated every risk-tick)
     stop_loss_pct: float = Field(0.015, ge=0.005, le=0.20)       # 1.5% hard stop
-    take_profit_pct: float = Field(0.05, ge=0.005, le=0.50)      # 5% take-profit
+    take_profit_pct: float = Field(0.05, ge=0.005, le=0.50)      # 5% take-profit (unused by the
+    # live TP1/TP2 ladder below; kept only as a display value + the
+    # trailing_activation_pct getattr fallback in risk.py — do not read it
+    # for exit logic, use take_profit_1_pct/take_profit_2_pct instead.
     trailing_stop_pct: float = Field(0.01, ge=0.005, le=0.20)    # 1.0% trail from HWM
     trailing_activation_pct: float = Field(0.02, ge=0.005, le=0.50)  # arm trailing after +2%
+    # TP1/TP2 scale-out ladder actually used by risk.evaluate_exits(). These
+    # fields had been silently dropped from Settings (same class of gap as
+    # `min_trade_usdt`/`blocked_symbols` found in the 2026-08-25 audit) while
+    # risk.py kept reading them via `getattr(s, name, <default>)` — so the
+    # ladder was quietly hardcoded and NOT tunable via .env despite the
+    # extensive comments in risk.py implying otherwise. Restored with the
+    # exact same values risk.py was already falling back to, so this is a
+    # configurability fix with zero behavior change.
+    take_profit_1_pct: float = Field(0.08, ge=0.005, le=0.50)     # scale out at +8%
+    take_profit_1_fraction: float = Field(0.50, ge=0.05, le=1.0)  # sell 50% of the position
+    take_profit_2_pct: float = Field(0.15, ge=0.005, le=1.0)      # scale out at +15%
+    take_profit_2_fraction: float = Field(0.25, ge=0.05, le=1.0)  # sell 25% of the ORIGINAL stake
     max_hold_hours: int = Field(96, ge=1, le=10000)              # force-exit after 4 days
     drawdown_circuit_breaker_pct: float = Field(0.25, ge=0.01, le=0.50)  # halt new BUYs after -25%
 
@@ -296,6 +311,46 @@ class Settings(BaseSettings):
     # exit ladder. Below this PnL, the position is left for the risk ladder to
     # manage instead of being closed at a loss by a technical-only signal.
     mean_reversion_exit_min_pnl_pct: float = Field(0.0, ge=-0.20, le=0.20)
+    # RSI level considered "recovered" for the mean-reversion exit (was a bare
+    # `rsi > 55` constant). Configurable so it can be validated rather than
+    # hardcoded.
+    mean_reversion_exit_rsi: float = Field(55.0, ge=1.0, le=99.0)
+    # RSI recovery + breakeven-or-better PnL is still not sufficient on its own
+    # — real trade history shows that alone produces a near-zero win rate. Also
+    # require at least one independent confirmation that the move is actually
+    # rolling over, using indicators the strategy already computes:
+    #   - momentum confirmation: MACD histogram is declining bar-over-bar
+    #     (momentum losing steam even if RSI/price still look fine).
+    #   - price confirmation: close has dropped back below its own EMA20
+    #     (the short-term trend itself has turned).
+    # The exit requires RSI recovery + min PnL + (momentum OR price) when both
+    # are enabled; if neither is enabled the exit reverts to the plain RSI+PnL
+    # gate (recorded as exit_reason="mean_reversion_rsi").
+    mean_reversion_exit_require_momentum_confirmation: bool = True
+    mean_reversion_exit_require_price_confirmation: bool = True
+    # Once a position has already run up to the trailing-stop's own activation
+    # threshold (`trailing_activation_pct`), prefer letting the risk ladder
+    # (TP1/TP2/trailing) manage it instead of closing early on this signal —
+    # "let profitable trades develop into TP/trailing winners" rather than
+    # taking a small win off the table just because RSI recovered.
+    mean_reversion_exit_defer_to_risk_ladder: bool = True
+    # Entry strategy A/B switch. Both share identical risk/stop/TP/trailing/
+    # execution/fees — only the entry condition differs — so any performance
+    # difference measured between them (paper mode / forward test) can be
+    # attributed to the entry logic itself, not confounded by other changes.
+    #   - "dip_buy" (current live default): RSI<30 AND close<=bb_lower.
+    #   - "oversold_bounce": looser dip-buy that also requires price already
+    #     off its 5-day low (not still in free-fall). Walk-forward evidence
+    #     (scripts/walkforward.py --market-filter) showed a materially higher
+    #     mean return than dip_buy across the folds tested, but on only 2
+    #     non-empty out-of-sample folds — not enough to replace the live
+    #     strategy outright. Use this switch to run it in PAPER mode alongside
+    #     the live dip_buy config for a real forward A/B before considering a
+    #     live swap.
+    entry_strategy: str = Field("dip_buy", pattern="^(dip_buy|oversold_bounce)$")
+    oversold_bounce_rsi_max: float = Field(40.0, ge=1.0, le=99.0)
+    oversold_bounce_bb_multiplier: float = Field(1.02, ge=1.0, le=1.20)
+    oversold_bounce_min_bounce_pct: float = Field(0.05, ge=0.0, le=0.50)
     # Long-term trend filter — only open longs when the latest daily close is
     # above its 200-EMA. Spot is long-only, so buying assets in a downtrend just
     # feeds the stop-loss gate. Backtest-validated: cuts losses ~3x and max

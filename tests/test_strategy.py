@@ -6,25 +6,71 @@ from app.signals import SignalAction
 from app.trading.strategy import ProfitStreamStrategy
 
 
-def _frame(*, close: float, rsi: float, bb_lower: float, bb_mid: float, ema50: float, ema200: float, quote_volume: float = 1000.0, ema20: float | None = None) -> pd.DataFrame:
+def _frame(*, close: float, rsi: float, bb_lower: float, bb_mid: float, ema50: float, ema200: float, quote_volume: float = 1000.0, ema20: float | None = None, macd_hist: list[float] | None = None) -> pd.DataFrame:
     idx = pd.date_range("2026-01-01", periods=80, freq="1D", tz="UTC")
-    return pd.DataFrame(
+    data = {
+        "open": [close] * 80,
+        "high": [close] * 80,
+        "low": [close] * 80,
+        "close": [close] * 80,
+        "volume": [10.0] * 80,
+        "quote_volume": [quote_volume] * 80,
+        "rsi_14": [rsi] * 80,
+        "bb_lower": [bb_lower] * 80,
+        "bb_mid": [bb_mid] * 80,
+        "ema_20": [ema20 if ema20 is not None else close] * 80,
+        "ema_50": [ema50] * 80,
+        "ema_200": [ema200] * 80,
+    }
+    if macd_hist is not None:
+        # Last N values override the flat tail so bar-over-bar comparisons
+        # (e.g. momentum deterioration) have something meaningful to read.
+        series = [0.0] * (80 - len(macd_hist)) + list(macd_hist)
+        data["macd_hist"] = series
+    return pd.DataFrame(data, index=idx)
+
+
+async def test_entry_strategy_switch_dip_buy_vs_oversold_bounce(monkeypatch):
+    """Fix 4/5: dip_buy and oversold_bounce share identical risk/exit config —
+    only the entry condition differs via `entry_strategy`. A setup too shallow
+    for the strict dip_buy rule (RSI 35, not <30) but that qualifies for the
+    looser oversold_bounce rule (RSI<40, close<bb_lower*1.02, bounced >=5% off
+    the 5-day low) must HOLD under dip_buy and BUY under oversold_bounce."""
+    import app.trading.strategy as strategy_module
+    from app.config import get_settings as real_get_settings
+
+    strategy = ProfitStreamStrategy()
+    idx = pd.date_range("2026-01-01", periods=80, freq="1D", tz="UTC")
+    close = 95.0
+    lows = [90.0] * 75 + [85.0, 86.0, 87.0, 88.0, 89.0]  # 5-day low = 85
+    eth_df = pd.DataFrame(
         {
-            "open": [close] * 80,
-            "high": [close] * 80,
-            "low": [close] * 80,
-            "close": [close] * 80,
-            "volume": [10.0] * 80,
-            "quote_volume": [quote_volume] * 80,
-            "rsi_14": [rsi] * 80,
-            "bb_lower": [bb_lower] * 80,
-            "bb_mid": [bb_mid] * 80,
-            "ema_20": [ema20 if ema20 is not None else close] * 80,
-            "ema_50": [ema50] * 80,
-            "ema_200": [ema200] * 80,
+            "open": [close] * 80, "high": [close] * 80, "low": lows, "close": [close] * 80,
+            "volume": [10.0] * 80, "quote_volume": [1000.0] * 80,
+            "rsi_14": [35.0] * 80, "bb_lower": [96.0] * 80, "bb_mid": [105.0] * 80,
+            "ema_20": [close] * 80, "ema_50": [100.0] * 80, "ema_200": [95.0] * 80,
         },
         index=idx,
     )
+    btc_df = _frame(close=100000, rsi=55, bb_lower=95000, bb_mid=98000, ema50=99000, ema200=97000)
+
+    async def _candles(self, symbol, interval, limit):
+        return eth_df if symbol == "ETHUSDT" else btc_df
+
+    monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: False, raising=True)
+
+    real = real_get_settings()
+    monkeypatch.setattr(strategy_module, "get_settings", lambda: real.model_copy(update={"entry_strategy": "dip_buy"}))
+    decision_dip = await strategy.analyze_symbol("ETHUSDT", mode="paper")
+    assert decision_dip.action == SignalAction.HOLD
+
+    monkeypatch.setattr(strategy_module, "get_settings", lambda: real.model_copy(update={"entry_strategy": "oversold_bounce"}))
+    decision_bounce = await strategy.analyze_symbol("ETHUSDT", mode="paper")
+    assert decision_bounce.action == SignalAction.BUY
+    assert decision_bounce.indicators["entry_strategy"] == "oversold_bounce"
 
 
 async def test_profitstream_buys_daily_dip_with_btc_risk_on(monkeypatch):
@@ -72,7 +118,11 @@ async def test_profitstream_holds_when_btc_risk_off(monkeypatch):
 async def test_profitstream_exits_held_position_on_daily_mean_reversion(monkeypatch):
     strategy = ProfitStreamStrategy()
     frames = {
-        ("ETHUSDT", "1d"): _frame(close=110, rsi=60, bb_lower=95, bb_mid=105, ema50=100, ema200=95),
+        # +1% unrealized (below trailing_activation_pct=2%, so not deferred to
+        # the risk ladder) with close(101) below ema_20(105) -> bearish price
+        # confirmation. No macd_hist column -> momentum confirmation is False,
+        # so this specifically exercises the price-confirmation branch.
+        ("ETHUSDT", "1d"): _frame(close=101, rsi=60, bb_lower=95, bb_mid=105, ema50=100, ema200=95, ema20=105),
         ("BTCUSDT", "1d"): _frame(close=100000, rsi=55, bb_lower=95000, bb_mid=98000, ema50=99000, ema200=97000),
     }
 
@@ -89,6 +139,90 @@ async def test_profitstream_exits_held_position_on_daily_mean_reversion(monkeypa
 
     assert decision.action == SignalAction.SELL
     assert decision.indicators["decision"] == "sell_mean_reversion_exit"
+    assert decision.indicators["exit_reason"] == "mean_reversion_rsi_price"
+
+
+async def test_profitstream_rsi_recovery_at_breakeven_without_confirmation_does_not_exit(monkeypatch):
+    """RSI recovery + breakeven PnL alone is still not enough — real trade
+    history shows that combination has a near-zero win rate. Without momentum
+    OR price confirmation, the position must be left open (risk ladder keeps
+    managing it), not closed on RSI alone."""
+    strategy = ProfitStreamStrategy()
+    frames = {
+        # Breakeven (close==entry==100), price at/above its own EMA20 (no
+        # bearish confirmation), no macd_hist column (no momentum signal).
+        ("ETHUSDT", "1d"): _frame(close=100, rsi=60, bb_lower=95, bb_mid=105, ema50=100, ema200=95, ema20=95),
+        ("BTCUSDT", "1d"): _frame(close=100000, rsi=55, bb_lower=95000, bb_mid=98000, ema50=99000, ema200=97000),
+    }
+
+    async def _candles(self, symbol: str, interval: str, limit: int):
+        return frames[(symbol, interval)]
+
+    monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: True, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_held_position", lambda *_a, **_k: {"entry_price": 100.0}, raising=True)
+
+    decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
+
+    assert decision.action == SignalAction.HOLD
+    assert any("mean_reversion_exit_awaiting_confirmation" in r for r in decision.reasons)
+
+
+async def test_profitstream_defers_to_risk_ladder_on_strong_profitable_trend(monkeypatch):
+    """Once a position has run up into trailing-stop territory, TP1/TP2/
+    trailing should stay in control instead of RSI closing it early."""
+    strategy = ProfitStreamStrategy()
+    frames = {
+        # +15% unrealized, well past trailing_activation_pct (2% default).
+        ("ETHUSDT", "1d"): _frame(close=115, rsi=60, bb_lower=95, bb_mid=105, ema50=100, ema200=95, ema20=105),
+        ("BTCUSDT", "1d"): _frame(close=100000, rsi=55, bb_lower=95000, bb_mid=98000, ema50=99000, ema200=97000),
+    }
+
+    async def _candles(self, symbol: str, interval: str, limit: int):
+        return frames[(symbol, interval)]
+
+    monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: True, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_held_position", lambda *_a, **_k: {"entry_price": 100.0}, raising=True)
+
+    decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
+
+    assert decision.action == SignalAction.HOLD
+    assert any("mean_reversion_exit_deferred_to_risk_ladder" in r for r in decision.reasons)
+
+
+async def test_profitstream_exits_on_momentum_confirmation_alone(monkeypatch):
+    """RSI recovery + breakeven + MACD-histogram deterioration (no bearish
+    price confirmation) is also sufficient — the two confirmations are an OR,
+    not an AND."""
+    strategy = ProfitStreamStrategy()
+    frames = {
+        # Price still at/above EMA20 (no price confirmation), but the MACD
+        # histogram's last bar is lower than the prior bar (momentum fading).
+        ("ETHUSDT", "1d"): _frame(
+            close=101, rsi=60, bb_lower=95, bb_mid=105, ema50=100, ema200=95,
+            ema20=95, macd_hist=[0.6, 0.3],
+        ),
+        ("BTCUSDT", "1d"): _frame(close=100000, rsi=55, bb_lower=95000, bb_mid=98000, ema50=99000, ema200=97000),
+    }
+
+    async def _candles(self, symbol: str, interval: str, limit: int):
+        return frames[(symbol, interval)]
+
+    monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: True, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_held_position", lambda *_a, **_k: {"entry_price": 100.0}, raising=True)
+
+    decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
+
+    assert decision.action == SignalAction.SELL
+    assert decision.indicators["exit_reason"] == "mean_reversion_rsi_momentum"
 
 
 async def test_profitstream_suppresses_mean_reversion_exit_while_at_a_loss(monkeypatch):

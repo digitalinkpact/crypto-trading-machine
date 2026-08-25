@@ -158,6 +158,9 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
                         quality_score=decision.score,
                         rationale=reason,
                         contributing_agents=("profitstream_strategy",),
+                        exit_reason=str(decision.indicators.get("exit_reason") or ""),
+                        entry_strategy=str(decision.indicators.get("entry_strategy") or ""),
+                        entry_btc_regime=decision.indicators.get("btc_regime_score"),
                     )
                 )
 
