@@ -30,12 +30,8 @@ def _frame(*, close: float, rsi: float, bb_lower: float, bb_mid: float, ema50: f
     return pd.DataFrame(data, index=idx)
 
 
-async def test_entry_strategy_switch_dip_buy_vs_oversold_bounce(monkeypatch):
-    """Fix 4/5: dip_buy and oversold_bounce share identical risk/exit config —
-    only the entry condition differs via `entry_strategy`. A setup too shallow
-    for the strict dip_buy rule (RSI 35, not <30) but that qualifies for the
-    looser oversold_bounce rule (RSI<40, close<bb_lower*1.02, bounced >=5% off
-    the 5-day low) must HOLD under dip_buy and BUY under oversold_bounce."""
+async def test_entry_strategy_switch_preserves_dip_variant_label(monkeypatch):
+    """Both configured dip variants retain their forensic entry label."""
     import app.trading.strategy as strategy_module
     from app.config import get_settings as real_get_settings
 
@@ -65,7 +61,8 @@ async def test_entry_strategy_switch_dip_buy_vs_oversold_bounce(monkeypatch):
     real = real_get_settings()
     monkeypatch.setattr(strategy_module, "get_settings", lambda: real.model_copy(update={"entry_strategy": "dip_buy"}))
     decision_dip = await strategy.analyze_symbol("ETHUSDT", mode="paper")
-    assert decision_dip.action == SignalAction.HOLD
+    assert decision_dip.action == SignalAction.BUY
+    assert decision_dip.indicators["entry_strategy"] == "dip_buy"
 
     monkeypatch.setattr(strategy_module, "get_settings", lambda: real.model_copy(update={"entry_strategy": "oversold_bounce"}))
     decision_bounce = await strategy.analyze_symbol("ETHUSDT", mode="paper")
@@ -94,7 +91,7 @@ async def test_profitstream_buys_daily_dip_with_btc_risk_on(monkeypatch):
     assert decision.score >= 90
 
 
-async def test_profitstream_holds_when_btc_risk_off(monkeypatch):
+async def test_profitstream_btc_risk_off_is_soft_penalty(monkeypatch):
     strategy = ProfitStreamStrategy()
     frames = {
         ("ETHUSDT", "1d"): _frame(close=90, rsi=25, bb_lower=95, bb_mid=105, ema50=100, ema200=95),
@@ -111,8 +108,77 @@ async def test_profitstream_holds_when_btc_risk_off(monkeypatch):
 
     decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
 
-    assert decision.action == SignalAction.HOLD
-    assert "btc_trend_not_aligned" in decision.reasons
+    assert decision.action == SignalAction.BUY
+    assert "btc_trend_not_aligned_soft" in decision.reasons
+
+
+async def test_profitstream_buys_pullback_and_keeps_spread_filter(monkeypatch):
+    strategy = ProfitStreamStrategy()
+    frames = {
+        ("ETHUSDT", "1d"): _frame(
+            close=107,
+            rsi=70,
+            bb_lower=90,
+            bb_mid=98,
+            ema20=100,
+            ema50=95,
+            ema200=90,
+        ),
+        ("BTCUSDT", "1d"): _frame(
+            close=90000,
+            rsi=55,
+            bb_lower=85000,
+            bb_mid=88000,
+            ema50=87000,
+            ema200=97000,
+        ),
+    }
+
+    async def _candles(self, symbol: str, interval: str, limit: int):
+        return frames[(symbol, interval)]
+
+    async def _tight_spread(*_args, **_kwargs):
+        return 0.01
+
+    monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", _tight_spread, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: False, raising=True)
+
+    decision = await strategy.analyze_symbol("ETHUSDT", mode="live")
+
+    assert decision.action == SignalAction.BUY
+    assert decision.indicators["entry_strategy"] == "pullback"
+    assert decision.indicators["pullback_ready"] is True
+    assert "btc_trend_not_aligned_soft" in decision.reasons
+
+    async def _wide_spread(*_args, **_kwargs):
+        return 0.011
+
+    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", _wide_spread, raising=True)
+    blocked = await strategy.analyze_symbol("ETHUSDT", mode="live")
+
+    assert blocked.action == SignalAction.HOLD
+    assert any(reason.startswith("spread_wide:") for reason in blocked.reasons)
+
+    frames[("ETHUSDT", "1d")] = _frame(
+        close=90,
+        rsi=25,
+        bb_lower=95,
+        bb_mid=105,
+        ema20=100,
+        ema50=95,
+        ema200=90,
+    )
+
+    async def _dip_wide_spread(*_args, **_kwargs):
+        return 0.003
+
+    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", _dip_wide_spread, raising=True)
+    dip_blocked = await strategy.analyze_symbol("ETHUSDT", mode="live")
+
+    assert dip_blocked.action == SignalAction.HOLD
+    assert "spread_wide:0.3000%>0.2500%" in dip_blocked.reasons
 
 
 async def test_profitstream_exits_held_position_on_daily_mean_reversion(monkeypatch):

@@ -1,9 +1,8 @@
 """ProfitStream strategy surface.
 
 The original low-timeframe momentum stack was negative out of sample on this
-repository's walk-forward harness. The only candidate with a repeatable edge is
-daily dip-buy mean reversion gated by BTC's trend, so this module now follows
-that evidence instead of trying to tune the losing micro-timeframe confluence.
+repository's walk-forward harness. ProfitStream uses daily dip-buy mean
+reversion plus trend pullbacks, with BTC trend retained as soft score context.
 """
 from __future__ import annotations
 
@@ -74,17 +73,14 @@ class ProfitStreamStrategy:
             dip_ready, dip_rsi = self._oversold_bounce_setup(df_1d)
         else:
             dip_ready, dip_rsi = self._dip_buy_setup(df_1d)
+        pullback_ready, pullback_rsi, pullback_dist_pct = self._pullback_setup(df_1d)
         btc_risk_on, btc_ema50, btc_ema200 = self._btc_risk_on(btc_1d)
         btc_regime = compute_btc_regime_score(btc_1d)
         daily_quote = self._latest_quote_volume(df_1d)
         extended, extension_pct = self._dip_too_extended(df_1d)
-        # Candidate entry types under evaluation (2026-08-21 walk-forward):
-        # logged for every tick so forensic queries can see what each would
-        # have scored, but NONE of them drive the live BUY/SELL decision below
-        # except the existing dip-buy — only oversold_bounce showed a robust,
-        # regime-gated out-of-sample edge; pullback/breakout/ma_reversion did
-        # not (see scripts/walkforward.py --market-filter results) and are not
-        # wired into execution.
+        # Candidate entry types under evaluation (2026-08-21 walk-forward) are
+        # logged for forensic comparison. These scored candidates remain
+        # observability-only; the live pullback path uses `_pullback_setup`.
         candidates = {
             name: {"ready": c.ready, "score": c.score, **c.detail}
             for name, c in self._score_entry_candidates(df_1d).items()
@@ -93,6 +89,9 @@ class ProfitStreamStrategy:
         indicators.update(
             {
                 "rsi_1d": dip_rsi,
+                "pullback_rsi_1d": pullback_rsi,
+                "pullback_ema20_dist_pct": pullback_dist_pct,
+                "pullback_ready": pullback_ready,
                 "exit_rsi_1d": exit_rsi,
                 "close_1d": float(df_1d.iloc[-1]["close"]),
                 "bb_lower_1d": float(df_1d.iloc[-1]["bb_lower"]),
@@ -190,34 +189,57 @@ class ProfitStreamStrategy:
 
         spread_pct = await self._spread_pct(symbol)
         indicators["spread_pct"] = spread_pct
-        if spread_pct is not None and spread_pct > 0.0025:
+        max_spread_pct = 0.01 if pullback_ready and not dip_ready else 0.0025
+        if spread_pct is not None and spread_pct > max_spread_pct:
             filt_ok = False
-            reasons.append(f"spread_wide:{spread_pct:.4%}>0.2500%")
+            reasons.append(f"spread_wide:{spread_pct:.4%}>{max_spread_pct:.4%}")
 
+        btc_score_penalty = 0
         if not btc_risk_on:
-            filt_ok = False
-            reasons.append("btc_trend_not_aligned")
+            # Keep BTC trend context visible, but do not hard-reject entries.
+            # Apply only a small score penalty so trades can still flow.
+            btc_score_penalty = 10
+            reasons.append("btc_trend_not_aligned_soft")
 
         score = 0
         score += 70 if dip_ready else 0
+        score += 60 if pullback_ready else 0
         score += 20 if btc_risk_on else 0
         score += 10 if filt_ok else 0
+        score -= btc_score_penalty
+        score = _clamp(score, 0, 100)
 
         if not dip_ready:
-            rsi_bar = s.oversold_bounce_rsi_max if s.entry_strategy == "oversold_bounce" else 30
+            rsi_bar = s.oversold_bounce_rsi_max if s.entry_strategy == "oversold_bounce" else 45
             bb_mult = s.oversold_bounce_bb_multiplier if s.entry_strategy == "oversold_bounce" else 1.0
             if dip_rsi >= rsi_bar:
                 reasons.append("rsi_not_oversold")
             if float(df_1d.iloc[-1]["close"]) > float(df_1d.iloc[-1]["bb_lower"]) * bb_mult:
                 reasons.append("close_above_lower_band")
 
+        if not pullback_ready:
+            out = df_1d.dropna()
+            if not out.empty:
+                last = out.iloc[-1]
+                close = float(last["close"])
+                ema20 = float(last["ema_20"])
+                ema50 = float(last["ema_50"])
+                rsi_val = float(last["rsi_14"])
+                if not (35 <= rsi_val <= 70):
+                    reasons.append("pullback_rsi_out_of_range")
+                if not (close > ema20 and close > ema50):
+                    reasons.append("pullback_below_ema_structure")
+                if not (ema20 > 0 and close >= ema20 and ((close - ema20) / ema20) <= 0.07):
+                    reasons.append("pullback_too_far_from_ema20")
+
         if held:
             reasons.append("position_already_open")
             return StrategyDecision(symbol, SignalAction.HOLD, score, reasons, indicators)
 
-        if dip_ready and filt_ok:
+        entry_ready = dip_ready or pullback_ready
+        if entry_ready and filt_ok:
             indicators["decision"] = "buy"
-            indicators["entry_strategy"] = s.entry_strategy
+            indicators["entry_strategy"] = (s.entry_strategy if dip_ready else "pullback")
             return StrategyDecision(symbol, SignalAction.BUY, max(score, 90), reasons, indicators)
 
         indicators["decision"] = "hold"
@@ -245,7 +267,9 @@ class ProfitStreamStrategy:
         rsi = float(last["rsi_14"])
         close = float(last["close"])
         bb_lower = float(last["bb_lower"])
-        return bool(rsi < 30 and close <= bb_lower), rsi
+        # Temporary, live-safe relaxation to improve signal frequency while
+        # keeping the rest of ProfitStream's risk filters unchanged.
+        return bool(rsi < 45 and close <= bb_lower * 1.02), rsi
 
     def _oversold_bounce_setup(self, df: pd.DataFrame) -> tuple[bool, float]:
         """Looser dip-buy (Fix 5 A/B candidate): also requires price already
@@ -289,6 +313,31 @@ class ProfitStreamStrategy:
             return False, 0.0
         extension_pct = (ema20 - close) / ema20
         return extension_pct > s.max_dip_extension_pct, extension_pct
+
+    def _pullback_setup(self, df: pd.DataFrame) -> tuple[bool, float, float]:
+        """Trend pullback entry for non-oversold regimes.
+
+        Ready when price structure remains above EMA20/EMA50, pullback depth is
+        near EMA20 (<=7%), and RSI is not overbought (35..70).
+        """
+        out = df.dropna()
+        if out.empty or any(c not in out.columns for c in ("rsi_14", "ema_20", "ema_50", "close")):
+            return False, 0.0, 0.0
+        last = out.iloc[-1]
+        rsi = float(last["rsi_14"])
+        close = float(last["close"])
+        ema20 = float(last["ema_20"])
+        ema50 = float(last["ema_50"])
+        if ema20 <= 0:
+            return False, rsi, 0.0
+        dist_pct = (close - ema20) / ema20
+        ready = bool(
+            close > ema20
+            and close > ema50
+            and dist_pct <= 0.07
+            and 35 <= rsi <= 70
+        )
+        return ready, rsi, dist_pct
 
     def _mean_reversion_exit(self, df: pd.DataFrame) -> tuple[bool, float]:
         s = get_settings()

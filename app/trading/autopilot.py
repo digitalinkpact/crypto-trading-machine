@@ -1174,6 +1174,17 @@ class Autopilot:
                     # 200-EMA. Spot is long-only, so a downtrend long just feeds
                     # the stop-loss gate. Backtest-validated structural guard.
                     trend_ok, trend_why = await self._trend_gate(symbol)
+                    trend_ok, trend_why, adjusted_quality_score = self._profitstream_trend_adjustment(
+                        sig, trend_ok, trend_why
+                    )
+                    if adjusted_quality_score is not None:
+                        trend_entry = _entry(symbol, sig)
+                        trend_entry["trend_original_quality_score"] = int(
+                            getattr(sig, "quality_score", 0) or 0
+                        )
+                        trend_entry["trend_adjusted_quality_score"] = adjusted_quality_score
+                        if hasattr(sig, "model_copy"):
+                            sig = sig.model_copy(update={"quality_score": adjusted_quality_score})
                     if not trend_ok and self._trend_gate_bypass_allowed(sig.confidence, ml_proba, aggressive_mode):
                         trend_ok = True
                         trend_why = f"bypassed conf={sig.confidence:.3f} ml_proba={ml_proba:.3f}"
@@ -1532,8 +1543,8 @@ class Autopilot:
         if action_value == SignalAction.BUY.value:
             return 0.40
         if action_value == SignalAction.SELL.value:
-            return 0.497
-        return 0.497
+            return 0.40
+        return 0.40
 
     def _aggressive_exit_reason(
         self,
@@ -1560,6 +1571,25 @@ class Autopilot:
         return (
             confidence > float(getattr(s, "trend_gate_bypass_confidence", 0.85))
             and ml_proba > float(getattr(s, "trend_gate_bypass_ml_proba", 0.55))
+        )
+
+    def _profitstream_trend_adjustment(
+        self,
+        sig,
+        trend_ok: bool,
+        trend_why: str,
+    ) -> tuple[bool, str, Optional[int]]:
+        if trend_ok:
+            return True, trend_why, None
+        agents = set(getattr(sig, "contributing_agents", ()) or ())
+        if getattr(sig, "agent", "") != "profitstream_strategy" and "profitstream_strategy" not in agents:
+            return False, trend_why, None
+        quality_score = int(getattr(sig, "quality_score", 0) or 0)
+        adjusted_score = max(0, quality_score - 10)
+        return (
+            True,
+            f"soft_penalty quality_score={quality_score}->{adjusted_score}; {trend_why}",
+            adjusted_score,
         )
 
     async def _retry_orderbook_recheck(

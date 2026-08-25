@@ -231,9 +231,6 @@ async def test_run_risk_gates_executes_stop_loss_even_when_entry_gates_blocked(m
     assert any(a == "risk:stop_loss" for a in agents)
 
 
-    await ap.tick()
-
-
 async def test_count_non_dust_positions_excludes_dust(monkeypatch):
     """Dust balances must not consume one of max_open_positions slots."""
     ap = Autopilot()
@@ -350,7 +347,7 @@ def test_signal_min_confidence_follows_action(monkeypatch):
     ap = Autopilot()
 
     assert ap._signal_min_confidence(autopilot_module.SignalAction.BUY) == 0.40
-    assert ap._signal_min_confidence(autopilot_module.SignalAction.SELL) == 0.497
+    assert ap._signal_min_confidence(autopilot_module.SignalAction.SELL) == 0.40
 
 
 def test_trend_gate_bypass_requires_both_confidence_and_ml(monkeypatch):
@@ -744,7 +741,7 @@ async def test_execute_buy_pyramids_when_position_exists_and_confidence_is_high(
     monkeypatch.setattr(autopilot_module.filters, "is_listed", lambda _s: True, raising=True)
     monkeypatch.setattr(autopilot_module, "liquidity_gate", _ok)
     monkeypatch.setattr(Autopilot, "_market_gate", lambda *_a, **_k: asyncio.sleep(0, result=(True, "ok")), raising=True)
-    monkeypatch.setattr(Autopilot, "_trend_gate", lambda *_a, **_k: asyncio.sleep(0, result=(True, "ok")), raising=True)
+    monkeypatch.setattr(Autopilot, "_trend_gate", lambda *_a, **_k: asyncio.sleep(0, result=(False, "downtrend")), raising=True)
     monkeypatch.setattr(Autopilot, "_funding_gate", lambda *_a, **_k: asyncio.sleep(0, result=(True, "ok")), raising=True)
     monkeypatch.setattr(Autopilot, "_onchain_gate", lambda *_a, **_k: asyncio.sleep(0, result=(True, "ok")), raising=True)
     monkeypatch.setattr(Autopilot, "_buy_order_plan", _buy_plan, raising=True)
@@ -754,13 +751,43 @@ async def test_execute_buy_pyramids_when_position_exists_and_confidence_is_high(
     class _Sig:
         action = autopilot_module.SignalAction.BUY
         confidence = 0.80
-        contributing_agents = ["test"]
+        agent = "profitstream_strategy"
+        contributing_agents = ["profitstream_strategy"]
+        quality_score = 90
         timeframe = autopilot_module.Timeframe.D1
 
     await ap._execute({"BTCUSDT": _Sig()}, allow_buys=True)
 
     assert placed == [("BTCUSDT", Decimal("50"))]
     assert kv_state["pyramid_adds:live:BTCUSDT"] == 2
+
+
+def test_profitstream_trend_adjustment_is_soft_and_legacy_stays_blocked():
+    ap = Autopilot()
+
+    class _ProfitStreamSignal:
+        agent = "profitstream_strategy"
+        contributing_agents = ("profitstream_strategy",)
+        quality_score = 90
+
+    allowed, why, adjusted = ap._profitstream_trend_adjustment(
+        _ProfitStreamSignal(), False, "downtrend"
+    )
+    assert allowed is True
+    assert adjusted == 80
+    assert "soft_penalty" in why
+
+    class _LegacySignal:
+        agent = "trend_follower"
+        contributing_agents = ("trend_follower",)
+        quality_score = 90
+
+    allowed, why, adjusted = ap._profitstream_trend_adjustment(
+        _LegacySignal(), False, "downtrend"
+    )
+    assert allowed is False
+    assert why == "downtrend"
+    assert adjusted is None
 
 
 async def test_execute_buy_rejects_when_pyramid_limit_is_reached(monkeypatch):
@@ -901,6 +928,7 @@ async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
         dynamic_threshold_enabled = False
         ml_gate_enabled = False
         buy_cooldown_minutes = 30
+        aggressive_mode_enabled = False
         max_position_pct = 0.05
 
     captured = {}
@@ -933,6 +961,7 @@ async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
     monkeypatch.setattr(autopilot_module, "get_settings", lambda: _Settings())
     monkeypatch.setattr(autopilot_module, "portfolio_snapshot", _fake_snapshot)
     monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [])
+    monkeypatch.setattr(autopilot_module.storage, "closed_trades", lambda limit=100: [])
     monkeypatch.setattr(Autopilot, "_count_non_dust_positions", _fake_count, raising=True)
     monkeypatch.setattr(Autopilot, "_atr_pct", _fake_atr, raising=True)
     monkeypatch.setattr(Autopilot, "_market_gate", _fake_market_gate, raising=True)
