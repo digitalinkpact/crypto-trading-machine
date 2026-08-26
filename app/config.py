@@ -311,7 +311,7 @@ class Settings(BaseSettings):
     # ProfitStream strategy controls.
     profitstream_enabled: bool = True
     profitstream_use_legacy_agents: bool = False
-    profitstream_score_threshold: int = Field(80, ge=0, le=100)
+    profitstream_score_threshold: int = Field(60, ge=0, le=100)
     profitstream_rsi_min: int = Field(40, ge=1, le=99)
     profitstream_rsi_max: int = Field(65, ge=1, le=99)
     profitstream_volume_spike_multiple: float = Field(1.5, ge=1.0, le=10.0)
