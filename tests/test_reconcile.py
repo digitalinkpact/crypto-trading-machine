@@ -8,8 +8,17 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 import app.trading.reconcile as reconcile_module
 from app.trading.reconcile import reconcile_positions
+
+
+@pytest.fixture(autouse=True)
+def _disable_persistent_watchdog_halt(monkeypatch):
+    import app.trading.watchdog as watchdog_module
+
+    monkeypatch.setattr(watchdog_module, "trigger_emergency_halt", lambda *args, **kwargs: None)
 
 
 async def _fake_snapshot(**_kwargs):
@@ -36,9 +45,10 @@ async def test_reconcile_closes_stale_db_position_with_no_real_balance(monkeypat
 
     result = await reconcile_positions(mode="live")
 
-    assert result["closed"] == 1
-    assert result["adopted"] == 1  # the untracked ZEC holding from the fake snapshot
-    assert closed_calls[0]["symbol"] == "SOLUSDT"
+    assert result["closed"] == 0
+    assert result["adopted"] == 0
+    assert result["mismatched"] == 2
+    assert closed_calls == []
 
 
 async def test_reconcile_adopts_untracked_exchange_holding(monkeypatch):
@@ -54,11 +64,9 @@ async def test_reconcile_adopts_untracked_exchange_holding(monkeypatch):
 
     result = await reconcile_positions(mode="live")
 
-    assert result["adopted"] == 1
-    assert opened_calls[0]["symbol"] == "ZECUSDT"
-    assert opened_calls[0]["mode"] == "live"
-    assert opened_calls[0]["qty"] == Decimal("0.5")
-    assert opened_calls[0]["entry_price"] == Decimal("40")
+    assert result["adopted"] == 0
+    assert result["mismatched"] == 1
+    assert opened_calls == []
 
 
 async def test_reconcile_ignores_dust_below_threshold(monkeypatch):
@@ -107,14 +115,11 @@ async def test_reconcile_ignores_stablecoin_holdings(monkeypatch):
     assert opened_calls == []
 
 
-async def test_reconcile_adoption_failure_triggers_emergency_halt(monkeypatch):
+async def test_reconcile_untracked_position_triggers_emergency_halt(monkeypatch):
     monkeypatch.setattr(reconcile_module, "portfolio_snapshot", _fake_snapshot)
     monkeypatch.setattr(reconcile_module.storage, "all_positions", lambda: [])
 
-    def _raise(**_kw):
-        raise RuntimeError("db locked")
-
-    monkeypatch.setattr(reconcile_module.storage, "open_position", _raise)
+    monkeypatch.setattr(reconcile_module.storage, "open_position", lambda **_kw: None)
 
     import app.trading.watchdog as watchdog_module
     halt_calls = []
@@ -126,5 +131,6 @@ async def test_reconcile_adoption_failure_triggers_emergency_halt(monkeypatch):
     result = await reconcile_positions(mode="live")
 
     assert result["adopted"] == 0
+    assert result["mismatched"] == 1
     assert len(halt_calls) == 1
     assert halt_calls[0][1] == "new_entries_blocked"

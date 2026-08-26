@@ -979,6 +979,7 @@ async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
     monkeypatch.setattr(Autopilot, "_count_non_dust_positions", _fake_count, raising=True)
     monkeypatch.setattr(Autopilot, "_atr_pct", _fake_atr, raising=True)
     monkeypatch.setattr(Autopilot, "_market_gate", _fake_market_gate, raising=True)
+    monkeypatch.setattr(Autopilot, "_entry_block_reason", lambda _self: None, raising=True)
     monkeypatch.setattr(Autopilot, "_price", _fake_price, raising=True)
     monkeypatch.setattr(Autopilot, "_trend_gate", lambda *_a, **_k: __import__("asyncio").sleep(0, result=(True, "ok")), raising=True)
     monkeypatch.setattr(Autopilot, "_funding_gate", lambda *_a, **_k: __import__("asyncio").sleep(0, result=(True, "ok")), raising=True)
