@@ -558,21 +558,39 @@ class Autopilot:
         if sig.action == SignalAction.SELL:
             base = symbol.removesuffix("USDT")
             free = balances.get(base, Decimal("0"))
-            if free <= 0:
-                reason = "SELL rejected: no holdings"
+            tracked_qty = next(
+                (
+                    Decimal(str(p.get("qty") or 0))
+                    for p in open_positions
+                    if p["symbol"] == symbol and p["mode"] == self.state.mode
+                ),
+                Decimal("0"),
+            )
+            sell_qty = min(tracked_qty, free)
+            if tracked_qty <= 0:
+                reason = "SELL rejected: no tracked position"
+                trade_audit_logger.log_event(
+                    mode=self.state.mode, symbol=symbol, signal=sig.action.value,
+                    confidence=float(sig.confidence), risk_passed=False,
+                    position_exists=False, available_balance=free,
+                    execution_attempted=False, final_outcome=f"rejected: {reason}",
+                )
+                return False, reason
+            if sell_qty <= 0:
+                reason = "SELL rejected: no exchange balance"
                 trade_audit_logger.log_event(
                     mode=self.state.mode,
                     symbol=symbol,
                     signal=sig.action.value,
                     confidence=float(sig.confidence),
                     risk_passed=True,
-                    position_exists=position_exists,
+                    position_exists=True,
                     available_balance=free,
                     execution_attempted=False,
                     final_outcome=f"rejected: {reason}",
                 )
                 return False, reason
-            order = await self._submit(symbol, OrderSide.SELL, free, list(getattr(sig, "contributing_agents", []) or []))
+            order = await self._submit(symbol, OrderSide.SELL, sell_qty, list(getattr(sig, "contributing_agents", []) or []))
             ok = self._order_filled(order)
             trade_audit_logger.log_event(
                 mode=self.state.mode,
@@ -581,7 +599,7 @@ class Autopilot:
                 confidence=float(sig.confidence),
                 risk_passed=True,
                 position_exists=position_exists,
-                available_balance=free,
+                available_balance=sell_qty,
                 execution_attempted=True,
                 min_notional_passed=True,
                 binance_response=(getattr(order, "status", "NONE") if order else "NONE"),
@@ -932,8 +950,10 @@ class Autopilot:
                     if aggressive_exit_reason is not None:
                         _set_filter(symbol, "aggressive_sell", True, aggressive_exit_reason, sig)
                         free = balances.get(symbol.removesuffix("USDT"), Decimal("0"))
-                        if free > 0:
-                            placed = await self._place_sell(symbol, sig, free)
+                        tracked_qty = Decimal(str(open_pos.get("qty") or 0))
+                        sell_qty = min(tracked_qty, free)
+                        if tracked_qty > 0 and sell_qty > 0:
+                            placed = await self._place_sell(symbol, sig, sell_qty)
                             if placed:
                                 skip_counter["executed_sell"] += 1
                                 risk.clear_hwm(symbol)
@@ -1290,9 +1310,11 @@ class Autopilot:
                 elif sig.action == SignalAction.SELL:
                     base = symbol.removesuffix("USDT")
                     free = balances.get(base, Decimal("0"))
-                    # SAFETY: Check if an open position actually exists
-                    if free > 0:
-                        placed = await self._place_sell(symbol, sig, free)
+                    tracked_qty = Decimal(str(open_pos.get("qty") or 0)) if open_pos else Decimal("0")
+                    sell_qty = min(tracked_qty, free)
+                    # SAFETY: normal strategy SELLs may only reduce a tracked position.
+                    if tracked_qty > 0 and sell_qty > 0:
+                        placed = await self._place_sell(symbol, sig, sell_qty)
                         if placed:
                             skip_counter["executed_sell"] += 1
                             risk.clear_hwm(symbol)
@@ -1302,11 +1324,11 @@ class Autopilot:
                         else:
                             _bump("filter_reject_sell", symbol)
                     else:
-                        if not open_pos:
-                            _bump("sell_no_position", symbol,
-                                  f"no open position in {self.state.mode} mode")
-                        else:
-                            _bump("sell_no_balance", symbol)
+                        _bump(
+                            "sell_no_position" if tracked_qty <= 0 else "sell_no_balance",
+                            symbol,
+                            f"tracked={tracked_qty} free={free}",
+                        )
             except Exception as exc:  # noqa: BLE001
                 self.state.last_error = f"{symbol}: {exc}"
                 log.warning("execute failed %s: %s", symbol, exc)
@@ -2134,19 +2156,15 @@ class Autopilot:
                     # `fee_source` — storage.reduce_position falls back to a
                     # fully modeled estimate for the whole trade rather than
                     # fabricate a partial number.
-                    actual_fee_usdt = None
+                    actual_exit_fee_usdt = None
                     entry_fee = (pos or {}).get("entry_fee_usdt")
-                    if (
-                        entry_fee is not None
-                        and order.commission is not None
-                        and order.commission_asset == "USDT"
-                    ):
-                        actual_fee_usdt = float(entry_fee) + float(order.commission)
+                    if order.commission is not None and order.commission_asset == "USDT":
+                        actual_exit_fee_usdt = float(order.commission)
                     storage.reduce_position(
                         symbol=symbol, mode="live", qty=filled, exit_price=price,
                         exit_reason=risk.infer_exit_reason(agents),
                         mfe_pct=mfe_pct, mae_pct=mae_pct,
-                        actual_fee_usdt=actual_fee_usdt,
+                        actual_exit_fee_usdt=actual_exit_fee_usdt,
                     )
             except Exception as exc:  # noqa: BLE001
                 log.warning("storage write failed for live order %s: %s", symbol, exc)

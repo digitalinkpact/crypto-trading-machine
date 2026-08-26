@@ -5,6 +5,8 @@ the fixes for the historical duplicate-order / negative-balance corruption.
 """
 from __future__ import annotations
 
+import pytest
+
 from app.storage.db import Storage
 
 
@@ -101,3 +103,12 @@ def test_component_heartbeat_upsert_and_readback(tmp_path):
     assert by_name["scheduler"]["healthy"] is False
     assert by_name["scheduler"]["detail"]["a"] == 2
     assert by_name["websocket"]["healthy"] is True
+
+
+def test_sqlite_connection_closes_after_context_exit(tmp_path):
+    s = _fresh_storage(tmp_path)
+    with s._conn() as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    with pytest.raises(Exception):
+        connection.execute("SELECT 1")

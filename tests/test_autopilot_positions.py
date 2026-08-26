@@ -469,8 +469,8 @@ async def test_place_sell_returns_true_when_order_filled(monkeypatch):
     assert placed is True
 
 
-async def test_execute_sell_uses_live_balance_without_local_position(monkeypatch):
-    """Live SELLs must liquidate real holdings even if the local book drifted."""
+async def test_execute_sell_rejects_live_balance_without_local_position(monkeypatch):
+    """Normal strategy SELLs must not liquidate untracked exchange holdings."""
     ap = Autopilot()
     ap.state.mode = "live"
 
@@ -479,6 +479,8 @@ async def test_execute_sell_uses_live_balance_without_local_position(monkeypatch
         dynamic_threshold_enabled = False
         ml_gate_enabled = False
         buy_cooldown_minutes = 30
+        live_price_enabled = False
+        live_price_enabled = False
 
     class _Snap(dict):
         pass
@@ -515,11 +517,11 @@ async def test_execute_sell_uses_live_balance_without_local_position(monkeypatch
 
     await ap._execute({"BTCUSDT": _SellSig()}, allow_buys=True)
 
-    assert placed == [("BTCUSDT", Decimal("0.25"))]
+    assert placed == []
 
 
-async def test_execute_sell_prefers_free_balance_over_total_balance(monkeypatch):
-    """SELL sizing must use free balance, not free+locked total balance."""
+async def test_execute_sell_clamps_to_free_and_tracked_balance(monkeypatch):
+    """SELL sizing must be bounded by both the tracked and free quantities."""
     ap = Autopilot()
     ap.state.mode = "live"
 
@@ -528,6 +530,7 @@ async def test_execute_sell_prefers_free_balance_over_total_balance(monkeypatch)
         dynamic_threshold_enabled = False
         ml_gate_enabled = False
         buy_cooldown_minutes = 30
+        live_price_enabled = False
 
     async def _fake_snapshot(*, mode):
         assert mode == "live"
@@ -546,7 +549,10 @@ async def test_execute_sell_prefers_free_balance_over_total_balance(monkeypatch)
 
     monkeypatch.setattr(autopilot_module, "get_settings", lambda: _Settings())
     monkeypatch.setattr(autopilot_module, "portfolio_snapshot", _fake_snapshot)
-    monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [])
+    monkeypatch.setattr(
+        autopilot_module.storage, "all_positions",
+        lambda: [{"symbol": "BTCUSDT", "mode": "live", "qty": 0.25}],
+    )
     monkeypatch.setattr(
         Autopilot,
         "_count_non_dust_positions",

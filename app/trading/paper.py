@@ -107,7 +107,7 @@ class PaperExchange:
                 symbol=symbol, mode="paper", qty=quantity,
                 entry_price=price, agents=agents or [],
                 entry_confidence=entry_confidence, entry_strategy=entry_strategy,
-                entry_btc_regime=entry_btc_regime,
+                entry_btc_regime=entry_btc_regime, entry_fee_usdt=float(fee),
             )
             filled_qty = quantity
         else:  # SELL — close any existing position
@@ -131,6 +131,7 @@ class PaperExchange:
                 symbol=symbol, mode="paper", qty=qty, exit_price=price,
                 exit_reason=infer_exit_reason(agents),
                 mfe_pct=mfe_pct, mae_pct=mae_pct,
+                actual_exit_fee_usdt=float(qty * price * fee_rate),
             )
             filled_qty = qty
             fee = qty * price * fee_rate

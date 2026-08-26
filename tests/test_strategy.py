@@ -43,7 +43,7 @@ async def test_entry_strategy_switch_preserves_dip_variant_label(monkeypatch):
         {
             "open": [close] * 80, "high": [close] * 80, "low": lows, "close": [close] * 80,
             "volume": [10.0] * 80, "quote_volume": [1000.0] * 80,
-            "rsi_14": [35.0] * 80, "bb_lower": [96.0] * 80, "bb_mid": [105.0] * 80,
+                "rsi_14": [25.0] * 80, "bb_lower": [96.0] * 80, "bb_mid": [105.0] * 80,
             "ema_20": [close] * 80, "ema_50": [100.0] * 80, "ema_200": [95.0] * 80,
         },
         index=idx,

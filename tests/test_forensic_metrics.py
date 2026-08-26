@@ -148,6 +148,25 @@ def test_reduce_position_uses_actual_fee_when_provided(tmp_path):
     assert result["pnl"] == 8.0 - 0.02
 
 
+def test_partial_exits_allocate_entry_fee_once_across_ladder(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(
+        symbol="ETHUSDT", mode="live", qty=1.0, entry_price=100.0, agents=[],
+        entry_fee_usdt=0.10,
+    )
+    first = s.reduce_position(
+        symbol="ETHUSDT", mode="live", qty=0.5, exit_price=110.0,
+        actual_exit_fee_usdt=0.02,
+    )
+    second = s.reduce_position(
+        symbol="ETHUSDT", mode="live", qty=0.5, exit_price=120.0,
+        actual_exit_fee_usdt=0.03,
+    )
+    assert first["fee_amount"] == pytest.approx(0.07)
+    assert second["fee_amount"] == pytest.approx(0.08)
+    assert first["fee_amount"] + second["fee_amount"] == pytest.approx(0.15)
+
+
 def test_open_position_accumulates_entry_fee_across_pyramid_adds(tmp_path):
     s = _fresh_storage(tmp_path)
     s.open_position(

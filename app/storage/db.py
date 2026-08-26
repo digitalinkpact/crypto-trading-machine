@@ -258,6 +258,16 @@ def _owner_is_alive(owner: str | None) -> bool:
     return True
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """SQLite connection whose context manager also closes the connection."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 class Storage:
     """Thread-safe SQLite helper. Synchronous; call from async via to_thread."""
 
@@ -265,12 +275,19 @@ class Storage:
         self._path = path or (get_settings().data_cache_dir / "trading.db")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._wal_initialized = False
         self._init()
 
     def _conn(self) -> sqlite3.Connection:
-        c = sqlite3.connect(self._path, isolation_level=None)  # autocommit
+        c = sqlite3.connect(
+            self._path,
+            isolation_level=None,
+            factory=_ClosingConnection,
+        )  # autocommit
         c.row_factory = sqlite3.Row
-        c.execute("PRAGMA journal_mode=WAL;")
+        if not self._wal_initialized:
+            c.execute("PRAGMA journal_mode=WAL;")
+            self._wal_initialized = True
         c.execute("PRAGMA foreign_keys=ON;")
         return c
 
@@ -595,9 +612,13 @@ class Storage:
             s = get_settings()
             taker_fee = float(s.binance_taker_fee)
             gross_pnl = (exit_p - entry) * qty
+            entry_fee = row["entry_fee_usdt"] if "entry_fee_usdt" in row.keys() else None
             if actual_fee_usdt is not None:
                 fee_amount = float(actual_fee_usdt)
                 fee_source = "actual"
+            elif entry_fee is not None:
+                fee_amount = float(entry_fee) + (exit_p * qty * taker_fee)
+                fee_source = "mixed"
             else:
                 fee_amount = (entry * qty * taker_fee) + (exit_p * qty * taker_fee)
                 fee_source = "modeled"
@@ -656,6 +677,7 @@ class Storage:
         mfe_pct: Optional[float] = None,
         mae_pct: Optional[float] = None,
         actual_fee_usdt: Optional[float] = None,
+        actual_exit_fee_usdt: Optional[float] = None,
     ) -> Optional[dict]:
         """Close part or all of an open position and persist a closed-trade row."""
         with self._lock, self._conn() as c:
@@ -674,7 +696,21 @@ class Storage:
             s = get_settings()
             taker_fee = float(s.binance_taker_fee)
             gross_pnl = (exit_p - entry) * reduce_qty
-            if actual_fee_usdt is not None:
+            entry_fee = row["entry_fee_usdt"] if "entry_fee_usdt" in row.keys() else None
+            allocated_entry_fee = (
+                float(entry_fee or 0) * (reduce_qty / pos_qty)
+                if entry_fee is not None and pos_qty > 0
+                else 0.0
+            )
+            if actual_exit_fee_usdt is not None or entry_fee is not None:
+                exit_fee = (
+                    float(actual_exit_fee_usdt)
+                    if actual_exit_fee_usdt is not None
+                    else exit_p * reduce_qty * taker_fee
+                )
+                fee_amount = allocated_entry_fee + exit_fee
+                fee_source = "actual" if actual_exit_fee_usdt is not None else "mixed"
+            elif actual_fee_usdt is not None:
                 fee_amount = float(actual_fee_usdt)
                 fee_source = "actual"
             else:
@@ -697,8 +733,8 @@ class Storage:
                 c.execute("DELETE FROM positions WHERE symbol=? AND mode=?", (symbol, mode))
             else:
                 c.execute(
-                    "UPDATE positions SET qty=? WHERE symbol=? AND mode=?",
-                    (remaining, symbol, mode),
+                    "UPDATE positions SET qty=?, entry_fee_usdt=? WHERE symbol=? AND mode=?",
+                    (remaining, max(0.0, float(entry_fee or 0) - allocated_entry_fee), symbol, mode),
                 )
             c.execute(
                 "INSERT INTO closed_trades(mode,symbol,qty,entry_price,exit_price,pnl,"

@@ -240,7 +240,7 @@ class ProfitStreamStrategy:
         if entry_ready and filt_ok:
             indicators["decision"] = "buy"
             indicators["entry_strategy"] = (s.entry_strategy if dip_ready else "pullback")
-            return StrategyDecision(symbol, SignalAction.BUY, max(score, 90), reasons, indicators)
+            return StrategyDecision(symbol, SignalAction.BUY, score, reasons, indicators)
 
         indicators["decision"] = "hold"
         return StrategyDecision(symbol, SignalAction.HOLD, score, reasons, indicators)
@@ -267,9 +267,7 @@ class ProfitStreamStrategy:
         rsi = float(last["rsi_14"])
         close = float(last["close"])
         bb_lower = float(last["bb_lower"])
-        # Temporary, live-safe relaxation to improve signal frequency while
-        # keeping the rest of ProfitStream's risk filters unchanged.
-        return bool(rsi < 45 and close <= bb_lower * 1.02), rsi
+        return bool(rsi < 30 and close <= bb_lower), rsi
 
     def _oversold_bounce_setup(self, df: pd.DataFrame) -> tuple[bool, float]:
         """Looser dip-buy (Fix 5 A/B candidate): also requires price already
