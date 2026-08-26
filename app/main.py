@@ -18,6 +18,7 @@ from app.trading.paper import paper_exchange
 from app.trading.health import startup_report
 from app.trading import risk_loop
 from app.trading.watchdog import start_health_monitor, stop_health_monitor
+from app.trading.startup import verify_before_trading
 
 log = get_logger(__name__)
 
@@ -51,6 +52,11 @@ async def lifespan(app: FastAPI):
         await filters.load()
     except Exception as exc:  # noqa: BLE001
         log.warning("filter preload failed: %s", exc)
+
+    try:
+        await verify_before_trading()
+    except Exception as exc:  # noqa: BLE001
+        log.critical("startup safety verification failed: %s", exc)
     # Seed paper account on first run.
     try:
         paper_exchange.ensure_seeded()

@@ -348,6 +348,16 @@ class Autopilot:
             balances_known = True
         except Exception as exc:  # noqa: BLE001
             log.warning("risk-gate balance fetch failed: %s", exc)
+            try:
+                from app.trading import watchdog
+
+                watchdog.trigger_emergency_halt(
+                    "risk exits could not verify exchange balances",
+                    level="new_entries_blocked",
+                )
+            except Exception as halt_exc:  # noqa: BLE001
+                log.error("failed to engage halt after balance verification failure: %s", halt_exc)
+            return
         prices: dict[str, Decimal] = {}
         for pos in positions:
             try:
@@ -363,8 +373,8 @@ class Autopilot:
                 # exchange holds zero of it — a zombie book position. Use 0 so
                 # the cleanup branch below closes it instead of submitting a
                 # doomed full-qty SELL that Binance rejects with -2010 forever.
-                # Only when the fetch FAILED (balances unknown) do we fall back
-                # to the book qty.
+                # A failed balance fetch returns above; no unverified SELL is
+                # ever submitted from the risk loop.
                 if balances_known:
                     avail = free_balances.get(base, Decimal("0"))
                 else:
@@ -2068,6 +2078,31 @@ class Autopilot:
         entry_strategy: Optional[str] = None,
         entry_btc_regime: Optional[int] = None,
     ) -> Optional[Order]:
+        order_lock = f"order:{self.state.mode}:{symbol}:{side.value}"
+        if not storage.try_acquire_lock(order_lock, ttl_seconds=300.0, owner=self._owner):
+            log.warning("order skipped: another submission is active for %s %s", symbol, side.value)
+            return None
+        try:
+            return await self._submit_locked(
+                symbol, side, qty, agents,
+                entry_confidence=entry_confidence,
+                entry_strategy=entry_strategy,
+                entry_btc_regime=entry_btc_regime,
+            )
+        finally:
+            storage.release_lock(order_lock, owner=self._owner)
+
+    async def _submit_locked(
+        self,
+        symbol: str,
+        side: OrderSide,
+        qty: Decimal,
+        agents: list[str],
+        *,
+        entry_confidence: Optional[float] = None,
+        entry_strategy: Optional[str] = None,
+        entry_btc_regime: Optional[int] = None,
+    ) -> Optional[Order]:
         if self.state.mode == "paper":
             order = await paper_exchange.place_order(
                 symbol=symbol, side=side, quantity=qty, agents=agents,
@@ -2173,7 +2208,20 @@ class Autopilot:
                         actual_exit_fee_usdt=actual_exit_fee_usdt,
                     )
             except Exception as exc:  # noqa: BLE001
-                log.warning("storage write failed for live order %s: %s", symbol, exc)
+                log.critical(
+                    "LIVE order filled but local persistence failed for %s %s coid=%s: %s; "
+                    "blocking new entries until reconciliation",
+                    symbol, side.value, order.client_order_id, exc,
+                )
+                try:
+                    from app.trading import watchdog
+
+                    watchdog.trigger_emergency_halt(
+                        f"filled {side.value} {symbol} could not be persisted",
+                        level="new_entries_blocked",
+                    )
+                except Exception as halt_exc:  # noqa: BLE001
+                    log.error("failed to engage halt after persistence failure: %s", halt_exc)
         self.state.trades_executed += 1
         return order
 

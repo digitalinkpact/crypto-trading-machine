@@ -177,8 +177,9 @@ class BinanceUSClient:
         - `"inconclusive"`: lookup failed or could not be trusted.
         """
         try:
-            raw = await asyncio.to_thread(
-                self._spot.get_order, symbol=symbol, origClientOrderId=client_order_id
+            raw = await self._api_call(
+                "order_confirmation", self._spot.get_order,
+                symbol=symbol, origClientOrderId=client_order_id,
             )
             if isinstance(raw, dict) and raw:
                 return "found", raw
@@ -238,7 +239,7 @@ class BinanceUSClient:
         expressed in units of 1/10000 (15 -> 0.0015). Signed endpoint — requires
         API credentials. Raises if neither form is present.
         """
-        acct = await asyncio.to_thread(self._spot.account)
+        acct = await self._api_call("trade_fees", self._spot.account)
         rates = acct.get("commissionRates") or {}
 
         def _rate(decimal_key: str, int_key: str) -> Optional[Decimal]:

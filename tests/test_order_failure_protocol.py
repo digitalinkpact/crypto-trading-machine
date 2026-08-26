@@ -12,7 +12,7 @@ from decimal import Decimal
 
 import app.trading.autopilot as autopilot_module
 import app.trading.watchdog as watchdog_module
-from app.exchange import OrderSide, OrderStatus, OrderType
+from app.exchange import Order, OrderSide, OrderStatus, OrderType
 from app.exchange.client import BinanceUSClient
 from app.trading.autopilot import Autopilot
 
@@ -179,3 +179,49 @@ async def test_submit_live_order_exception_inconclusive_returns_none_and_no_book
 
     assert order is None
     assert record_calls == []  # never recorded — outcome unproven, no phantom position
+
+
+async def test_submit_filled_order_persistence_failure_halts_new_entries(monkeypatch):
+    ap = Autopilot()
+    ap.state.mode = "live"
+
+    class _FakeLiveClient:
+        def generate_client_order_id(self) -> str:
+            return "persistence-failure-coid"
+
+        async def place_order(self, **kwargs):
+            return Order(
+                symbol="BTCUSDT", side=OrderSide.BUY, type=OrderType.MARKET,
+                quantity=Decimal("1"), client_order_id=kwargs["client_order_id"],
+                status=OrderStatus.FILLED, filled_quantity=Decimal("1"),
+                avg_fill_price=Decimal("100"),
+            )
+
+    halt_calls = []
+    monkeypatch.setattr(autopilot_module, "BinanceUSClient", lambda: _FakeLiveClient())
+    monkeypatch.setattr(
+        autopilot_module.storage, "record_order",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+        raising=True,
+    )
+    monkeypatch.setattr(
+        watchdog_module, "trigger_emergency_halt",
+        lambda reason, *, level="new_entries_blocked": halt_calls.append((reason, level)),
+        raising=True,
+    )
+
+    order = await ap._submit("BTCUSDT", OrderSide.BUY, Decimal("1"), ["test"])
+
+    assert order is not None
+    assert halt_calls and halt_calls[0][1] == "new_entries_blocked"
+
+
+async def test_submit_skips_when_same_symbol_side_is_locked(monkeypatch):
+    ap = Autopilot()
+    ap.state.mode = "live"
+    monkeypatch.setattr(
+        autopilot_module.storage, "try_acquire_lock", lambda *args, **kwargs: False,
+        raising=True,
+    )
+    order = await ap._submit("BTCUSDT", OrderSide.SELL, Decimal("1"), ["test"])
+    assert order is None
