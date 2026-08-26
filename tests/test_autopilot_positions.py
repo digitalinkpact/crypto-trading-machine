@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pandas as pd
+import pytest
 
 import app.data as data_module
 import app.ta as ta_module
@@ -229,6 +230,13 @@ async def test_run_risk_gates_executes_stop_loss_even_when_entry_gates_blocked(m
     assert symbol == "ETHUSDT"
     assert side == OrderSide.SELL
     assert any(a == "risk:stop_loss" for a in agents)
+
+
+async def test_start_rejects_restart_while_running(monkeypatch):
+    ap = Autopilot()
+    ap.state.running = True
+    with pytest.raises(RuntimeError, match="already running"):
+        await ap.start()
 
 
 async def test_count_non_dust_positions_excludes_dust(monkeypatch):

@@ -172,6 +172,8 @@ class Autopilot:
 
     # ── lifecycle ──────────────────────────────────────────────────────
     async def start(self) -> AutopilotState:
+        if self.state.running:
+            raise RuntimeError("Autopilot is already running; stop it before restarting")
         s = get_settings()
         self.state.mode = "paper" if s.paper_trading else "live"
 

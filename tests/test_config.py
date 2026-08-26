@@ -105,3 +105,14 @@ def test_live_mode_does_not_relax_risk_caps(monkeypatch):
     assert s.aggressive_max_open_positions == 10
     assert s.rollback_max_open_positions == 10
     assert s.max_long_exposure_pct == 0.60
+
+
+def test_live_mode_does_not_change_regime_or_loss_controls(monkeypatch):
+    monkeypatch.setenv("LIVE_MODE", "true")
+    monkeypatch.setenv("MARKET_REGIME_GATE_ENABLED", "false")
+    monkeypatch.setenv("DRAWDOWN_CIRCUIT_BREAKER_PCT", "0.15")
+    monkeypatch.setenv("DAILY_LOSS_LIMIT_ENABLED", "true")
+    s = Settings(_env_file=None)
+    assert s.market_regime_gate_enabled is False
+    assert s.drawdown_circuit_breaker_pct == 0.15
+    assert s.daily_loss_limit_enabled is True

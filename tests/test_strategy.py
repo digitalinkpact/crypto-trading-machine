@@ -204,6 +204,8 @@ async def test_profitstream_exits_held_position_on_daily_mean_reversion(monkeypa
     decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
 
     assert decision.action == SignalAction.SELL
+    assert decision.score == 60
+    assert decision.score / 100 == 0.60
     assert decision.indicators["decision"] == "sell_mean_reversion_exit"
     assert decision.indicators["exit_reason"] == "mean_reversion_rsi_price"
 

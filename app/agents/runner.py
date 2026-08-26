@@ -130,11 +130,15 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
         strategy = ProfitStreamStrategy()
         configured_threshold = int(getattr(settings, "profitstream_score_threshold", 80))
         score_threshold = configured_threshold
+        btc_1d = await strategy._candles("BTCUSDT", "1d", 320)
         for symbol in symbols:
-            decision = await strategy.analyze_symbol(symbol, mode=mode)
+            decision = await strategy.analyze_symbol(symbol, mode=mode, btc_1d=btc_1d)
             executed = (
-                decision.action.value in ("BUY", "SELL")
-                and decision.score >= score_threshold
+                decision.action.value == "SELL"
+                or (
+                    decision.action.value == "BUY"
+                    and decision.score >= score_threshold
+                )
             )
             reason = "; ".join(decision.reasons) if decision.reasons else "score_pass"
             storage.record_tick_audit(

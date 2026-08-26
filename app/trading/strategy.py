@@ -51,14 +51,21 @@ class ProfitStreamStrategy:
     def __init__(self, client: Optional[BinanceUSClient] = None) -> None:
         self._client = client or BinanceUSClient()
 
-    async def analyze_symbol(self, symbol: str, *, mode: str) -> StrategyDecision:
+    async def analyze_symbol(
+        self,
+        symbol: str,
+        *,
+        mode: str,
+        btc_1d: Optional[pd.DataFrame] = None,
+    ) -> StrategyDecision:
         reasons: list[str] = []
         indicators: dict[str, Any] = {"symbol": symbol}
         s = get_settings()
 
         try:
             df_1d = await self._candles(symbol, "1d", 320)
-            btc_1d = await self._candles("BTCUSDT", "1d", 320)
+            if btc_1d is None:
+                btc_1d = await self._candles("BTCUSDT", "1d", 320)
         except Exception as exc:  # noqa: BLE001
             reasons.append(f"data_unavailable:{exc}")
             return StrategyDecision(symbol, SignalAction.HOLD, 0, reasons, indicators)
@@ -164,7 +171,13 @@ class ProfitStreamStrategy:
                         exit_reason = "mean_reversion_rsi"
                     indicators["decision"] = "sell_mean_reversion_exit"
                     indicators["exit_reason"] = exit_reason
-                    return StrategyDecision(symbol, SignalAction.SELL, 90, reasons, indicators)
+                    return StrategyDecision(
+                        symbol,
+                        SignalAction.SELL,
+                        _clamp(round(exit_rsi), 0, 100),
+                        reasons,
+                        indicators,
+                    )
                 reasons.append("mean_reversion_exit_awaiting_confirmation")
 
         filt_ok = True

@@ -582,6 +582,11 @@ async def save_credentials(
 async def save_mode(mode: str = Form(...)):
     if mode not in ("paper", "live"):
         raise HTTPException(status_code=400, detail="mode must be 'paper' or 'live'")
+    if autopilot.state.running and mode != autopilot.state.mode:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop autopilot before changing trading mode",
+        )
     save_trading_mode(paper=(mode == "paper"))
     autopilot.state.mode = mode
     return RedirectResponse(url="/settings?mode_saved=1", status_code=303)

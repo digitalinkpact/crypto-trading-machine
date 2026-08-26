@@ -16,7 +16,10 @@ def _build_profitstream_fallback_fixture(monkeypatch, *, use_legacy_agents: bool
         return ["BTCUSDT"]
 
     class _EmptyProfitStream:
-        async def analyze_symbol(self, symbol: str, *, mode: str):
+        async def _candles(self, symbol, interval, limit):
+            return pd.DataFrame()
+
+        async def analyze_symbol(self, symbol: str, *, mode: str, btc_1d=None):
             return SimpleNamespace(
                 action=SignalAction.HOLD,
                 score=0,
