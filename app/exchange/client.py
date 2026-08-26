@@ -19,6 +19,7 @@ from app.config import Settings, Timeframe, get_settings
 from app.logging_setup import get_logger
 
 from .models import Order, OrderSide, OrderStatus, OrderType
+from .telemetry import exchange_telemetry
 
 log = get_logger(__name__)
 
@@ -120,6 +121,16 @@ class BinanceUSClient:
         """Create a Binance-safe client order id used for idempotency."""
         return _new_client_order_id(prefix)
 
+    async def _api_call(self, operation: str, func, *args, **kwargs):
+        started = asyncio.get_running_loop().time()
+        try:
+            result = await asyncio.to_thread(func, *args, **kwargs)
+        except Exception as exc:
+            exchange_telemetry.record(operation, asyncio.get_running_loop().time() - started, exc)
+            raise
+        exchange_telemetry.record(operation, asyncio.get_running_loop().time() - started)
+        return result
+
     @staticmethod
     def order_from_raw(
         *,
@@ -188,9 +199,7 @@ class BinanceUSClient:
     ) -> pd.DataFrame:
         """Fetch OHLCV candles. Returns a DataFrame indexed by close_time (UTC)."""
         interval = timeframe.value if hasattr(timeframe, "value") else str(timeframe)
-        raw = await asyncio.to_thread(
-            self._spot.klines, symbol, interval, limit=limit
-        )
+        raw = await self._api_call("klines", self._spot.klines, symbol, interval, limit=limit)
         cols = [
             "open_time", "open", "high", "low", "close", "volume",
             "close_time", "quote_volume", "trades",
@@ -206,7 +215,7 @@ class BinanceUSClient:
         ]
 
     async def ticker_price(self, symbol: str) -> Decimal:
-        data = await asyncio.to_thread(self._spot.ticker_price, symbol)
+        data = await self._api_call("ticker_price", self._spot.ticker_price, symbol)
         return Decimal(str(data["price"]))
 
     async def order_book(self, symbol: str, limit: int = 10) -> dict[str, Any]:
@@ -215,10 +224,10 @@ class BinanceUSClient:
         Public endpoint — no auth required. Returns the raw Binance.US payload
         with `bids` and `asks` as lists of [price, qty] string pairs.
         """
-        return await asyncio.to_thread(self._spot.depth, symbol, limit=limit)
+        return await self._api_call("order_book", self._spot.depth, symbol, limit=limit)
 
     async def account(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self._spot.account)
+        return await self._api_call("account", self._spot.account)
 
     async def trade_fees(self) -> dict[str, Decimal]:
         """Read this account's REAL spot maker/taker fee rates from Binance.US.
@@ -293,7 +302,7 @@ class BinanceUSClient:
             params["timeInForce"] = "GTC"
 
         log.info("Submitting order coid=%s symbol=%s side=%s", coid, symbol, side.value)
-        raw = await asyncio.to_thread(self._spot.new_order, **params)
+        raw = await self._api_call("place_order", self._spot.new_order, **params)
         commission, commission_asset = _extract_commission(raw)
         return order.model_copy(
             update={
@@ -311,13 +320,14 @@ class BinanceUSClient:
         if self._settings.dry_run or self._settings.paper_trading:
             log.warning("[DRY-RUN] cancel coid=%s symbol=%s", client_order_id, symbol)
             return {"status": "DRY_RUN", "origClientOrderId": client_order_id}
-        return await asyncio.to_thread(
-            self._spot.cancel_order, symbol=symbol, origClientOrderId=client_order_id
+        return await self._api_call(
+            "cancel_order", self._spot.cancel_order,
+            symbol=symbol, origClientOrderId=client_order_id,
         )
 
     async def open_orders(self, symbol: Optional[str] = None) -> list[dict[str, Any]]:
         kwargs = {"symbol": symbol} if symbol else {}
-        return await asyncio.to_thread(self._spot.get_open_orders, **kwargs)
+        return await self._api_call("open_orders", self._spot.get_open_orders, **kwargs)
 
     # ── Liquidation ──────────────────────────────────────────────────────
     async def liquidate_all(self, quote: str = "USDT") -> list[Order]:

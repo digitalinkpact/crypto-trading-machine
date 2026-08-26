@@ -109,6 +109,43 @@ async def test_run_all_agents_falls_back_when_legacy_explicitly_enabled(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_profitstream_respects_configured_score_threshold(monkeypatch):
+    from app.agents import runner
+
+    class _ScoredProfitStream:
+        async def _candles(self, symbol, interval, limit):
+            return pd.DataFrame()
+
+        async def analyze_symbol(self, symbol, *, mode, btc_1d=None):
+            return SimpleNamespace(
+                action=SignalAction.BUY, score=79, reasons=["below_threshold"],
+                indicators={},
+            )
+
+    monkeypatch.setattr(runner, "get_symbols", _async_symbols(["BTCUSDT"]))
+    monkeypatch.setattr(runner, "ProfitStreamStrategy", _ScoredProfitStream)
+    monkeypatch.setattr(
+        runner,
+        "storage",
+        SimpleNamespace(
+            record_tick_audit=lambda **kwargs: None,
+            load_model_artifact=lambda name: None,
+        ),
+    )
+    monkeypatch.setattr(runner, "get_settings", lambda: SimpleNamespace(
+        profitstream_enabled=True, profitstream_use_legacy_agents=False,
+        profitstream_score_threshold=80, ml_gate_threshold=0.5, paper_trading=True,
+    ))
+    assert await runner.run_all_agents(use_llm=False) == {}
+
+
+def _async_symbols(symbols):
+    async def load():
+        return symbols
+    return load
+
+
+@pytest.mark.asyncio
 async def test_run_all_agents_allows_llm_buy_at_lower_threshold(monkeypatch):
     from app.agents import runner
 

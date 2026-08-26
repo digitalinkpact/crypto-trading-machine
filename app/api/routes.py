@@ -18,6 +18,7 @@ from app.storage import storage
 from app.trading.autopilot import autopilot
 from app.trading.portfolio import portfolio_snapshot
 from app.exchange.ws_stream import live_prices
+from app.exchange.telemetry import exchange_telemetry
 
 router = APIRouter()
 
@@ -733,6 +734,7 @@ async def metrics() -> dict:
     evaluated = int(cum.get("evaluated", 0))
     proba_sum = float(cum.get("proba_sum", 0.0))
     return {
+        "exchange_api": exchange_telemetry.snapshot(),
         "gate": {
             "enabled": s.ml_gate_enabled,
             "threshold": s.ml_gate_threshold,

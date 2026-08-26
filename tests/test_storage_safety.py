@@ -112,3 +112,10 @@ def test_sqlite_connection_closes_after_context_exit(tmp_path):
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     with pytest.raises(Exception):
         connection.execute("SELECT 1")
+
+
+def test_test_storage_is_explicitly_separate_from_runtime_database(tmp_path):
+    from app.storage import storage
+
+    isolated = _fresh_storage(tmp_path)
+    assert isolated._path != storage._path
