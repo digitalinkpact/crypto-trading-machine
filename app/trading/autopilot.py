@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ from app.exchange.derivatives import derivatives
 from app.exchange.filters import filters
 from app.exchange.orderbook import liquidity_gate
 from app.exchange.ws_stream import live_prices
+from app.exchange.telemetry import exchange_telemetry
 from app.logging_setup import get_logger
 from app.regime import online_regime
 from app.signals import SignalAction
@@ -234,6 +236,7 @@ class Autopilot:
     # ── scheduled tick ─────────────────────────────────────────────────
     async def tick(self) -> None:
         """Called by the scheduler. No-op when stopped."""
+        tick_started = time.perf_counter()
         if not self.state.running:
             return
         if self._lock.locked():
@@ -318,6 +321,7 @@ class Autopilot:
                     except Exception as exc:  # noqa: BLE001
                         log.debug("entry_status persist failed: %s", exc)
             finally:
+                exchange_telemetry.record_stage("tick", time.perf_counter() - tick_started)
                 storage.release_lock("autopilot_tick", owner=self._owner)
 
     # ── risk gates ─────────────────────────────────────────────────────

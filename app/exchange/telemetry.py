@@ -26,6 +26,7 @@ class ExchangeTelemetry:
             "exchange_errors": 0,
         }
         self._by_operation: dict[str, dict[str, int]] = {}
+        self._stage_latencies: dict[str, deque[float]] = {}
 
     def record(self, operation: str, elapsed: float, error: BaseException | None = None) -> None:
         with self._lock:
@@ -52,6 +53,10 @@ class ExchangeTelemetry:
         with self._lock:
             self._counts["retries"] += 1
 
+    def record_stage(self, stage: str, elapsed: float) -> None:
+        with self._lock:
+            self._stage_latencies.setdefault(stage, deque(maxlen=self._max_samples)).append(max(0.0, elapsed))
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             values = sorted(self._latencies)
@@ -69,7 +74,24 @@ class ExchangeTelemetry:
                     "mean": round(mean(values), 6) if values else None,
                 },
                 "by_operation": {key: dict(value) for key, value in self._by_operation.items()},
+                "stages": {
+                    stage: {
+                        "p50": percentile_from(values),
+                        "p95": percentile_from(values, 0.95),
+                        "p99": percentile_from(values, 0.99),
+                        "samples": len(values),
+                    }
+                    for stage, samples in self._stage_latencies.items()
+                    for values in [sorted(samples)]
+                },
             }
+
+
+def percentile_from(values: list[float], fraction: float = 0.50) -> float | None:
+    if not values:
+        return None
+    index = min(len(values) - 1, int((len(values) - 1) * fraction))
+    return round(values[index], 6)
 
 exchange_telemetry = ExchangeTelemetry()
 

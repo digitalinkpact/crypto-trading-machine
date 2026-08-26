@@ -36,6 +36,7 @@ import uuid
 from app.config import get_settings
 from app.logging_setup import get_logger
 from app.storage import storage
+from app.exchange.telemetry import exchange_telemetry
 from app.trading.autopilot import autopilot
 
 log = get_logger(__name__)
@@ -49,6 +50,7 @@ _stop_event: "asyncio.Event | None" = None
 
 
 async def _run_once() -> None:
+    started = time.perf_counter()
     ttl = max(10.0, float(get_settings().risk_manager_loop_seconds) * 3)
     if not storage.try_acquire_lock(_LOCK_NAME, ttl_seconds=ttl, owner=_OWNER):
         # Another risk-loop instance (in-process or standalone) already ran
@@ -62,6 +64,7 @@ async def _run_once() -> None:
         log.exception("independent risk loop iteration failed: %s", exc)
     finally:
         storage.release_lock(_LOCK_NAME, owner=_OWNER)
+        exchange_telemetry.record_stage("risk_loop", time.perf_counter() - started)
 
 
 async def _loop() -> None:

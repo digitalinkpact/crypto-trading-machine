@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from app.config import TIMEFRAMES, Timeframe, get_settings
 from app.data import OHLCVRepository
@@ -10,6 +11,7 @@ from app.logging_setup import get_logger
 from app.regime import RegimeClassifier
 from app.signals import Signal, SignalAggregator
 from app.storage import storage
+from app.exchange.telemetry import exchange_telemetry
 from app.ta import add_indicators
 from app.trading.strategy import ProfitStreamStrategy
 
@@ -127,6 +129,7 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
     symbols = await get_symbols()
 
     if settings.profitstream_enabled:
+        strategy_started = time.perf_counter()
         strategy = ProfitStreamStrategy()
         configured_threshold = int(getattr(settings, "profitstream_score_threshold", 80))
         score_threshold = configured_threshold
@@ -134,6 +137,7 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
             btc_1d = await strategy._candles("BTCUSDT", "1d", 320)
         except Exception as exc:  # noqa: BLE001
             log.warning("ProfitStream BTC context unavailable; skipping strategy pass: %s", exc)
+            exchange_telemetry.record_stage("strategy", time.perf_counter() - strategy_started)
             return {}
         for symbol in symbols:
             decision = await strategy.analyze_symbol(symbol, mode=mode, btc_1d=btc_1d)
@@ -186,6 +190,7 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
             # symbol, its weighted-vote renormalization collapses confidence
             # to 1.0 and would destroy the real 0-110 quality_score-derived
             # confidence computed above.
+            exchange_telemetry.record_stage("strategy", time.perf_counter() - strategy_started)
             return {sig.symbol: sig for sig in raw_signals}
 
         if raw_signals:
@@ -195,6 +200,7 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
             "ProfitStream produced no BUY/SELL signals; falling back to legacy agents "
             "(profitstream_use_legacy_agents=true)"
         )
+        exchange_telemetry.record_stage("strategy", time.perf_counter() - strategy_started)
 
     for symbol in symbols:
         for tf in TIMEFRAMES:

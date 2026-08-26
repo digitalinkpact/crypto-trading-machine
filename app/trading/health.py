@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import get_settings
 from app.exchange import BinanceUSClient
+from app.exchange.telemetry import exchange_telemetry
 from app.exchange.ws_stream import live_prices
 from app.logging_setup import get_logger
 from app.storage import storage
@@ -50,6 +51,7 @@ async def _retry_async(coro_fn, *, attempts: int = 3, base_delay: float = 1.0, l
             last_exc = e
             log.warning("health check: %s attempt %d/%d failed: %s", label, attempt, attempts, e)
             if attempt < attempts:
+                exchange_telemetry.record_retry()
                 await asyncio.sleep(base_delay * attempt)
     log.error("health check: %s failed after %d attempts: %s", label, attempts, last_exc)
     return False, None

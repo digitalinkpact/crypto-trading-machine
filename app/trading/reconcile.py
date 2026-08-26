@@ -1,11 +1,13 @@
 """Portfolio reconciliation helpers to keep local positions aligned with exchange balances."""
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 
 from app.exchange.symbols import _is_stable_pair
 from app.logging_setup import get_logger
 from app.storage import storage
+from app.exchange.telemetry import exchange_telemetry
 from app.trading.portfolio import portfolio_snapshot
 
 log = get_logger(__name__)
@@ -32,6 +34,7 @@ async def reconcile_positions(mode: str) -> dict[str, int]:
     entry price. The watchdog halt blocks new entries until an operator
     authorizes recovery.
     """
+    started = time.perf_counter()
     snap = await portfolio_snapshot(mode=mode)
     balances = {k: Decimal(str(v)) for k, v in snap["all_balances"].items()}
     open_positions = [p for p in storage.all_positions() if p["mode"] == mode]
@@ -85,4 +88,5 @@ async def reconcile_positions(mode: str) -> dict[str, int]:
         except Exception as halt_exc:  # noqa: BLE001
             log.error("failed to trigger emergency halt for reconcile mismatch: %s", halt_exc)
 
+    exchange_telemetry.record_stage("reconciliation", time.perf_counter() - started)
     return {"closed": closed, "kept": kept, "adopted": adopted, "mismatched": mismatched}

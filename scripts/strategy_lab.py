@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 import numpy as np
@@ -116,6 +116,7 @@ class Trade:
     exit_reason: str
     mfe_pct: float
     mae_pct: float
+    regime_risk_on: Optional[bool] = None
 
 
 def _momentum_deteriorating(df: pd.DataFrame, i: int) -> bool:
@@ -257,6 +258,10 @@ class Metrics:
     max_drawdown_pct: float = 0.0
     max_losing_streak: int = 0
     mfe_captured_pct: float = 0.0  # avg(realized pnl% / mfe%) for winners, 0-1
+    net_pnl: float = 0.0
+    return_pct: float = 0.0
+    time_in_market_pct: float = 0.0
+    return_per_drawdown: float = 0.0
 
 
 def aggregate(trades: list[Trade], *, risk_per_trade_pct: float = 0.01) -> Metrics:
@@ -297,11 +302,15 @@ def aggregate(trades: list[Trade], *, risk_per_trade_pct: float = 0.01) -> Metri
     ]
     mfe_captured = float(np.mean(mfe_ratios)) if mfe_ratios else 0.0
 
+    net_return = equity - 1.0
     return Metrics(
         n=n, win_rate=win_rate, avg_win_pct=avg_win, avg_loss_pct=avg_loss,
         profit_factor=profit_factor, expectancy_pct=expectancy,
         total_pnl_pct=sum(pcts), max_drawdown_pct=max_dd,
         max_losing_streak=max_streak, mfe_captured_pct=mfe_captured,
+        net_pnl=10000.0 * net_return,
+        return_pct=net_return,
+        return_per_drawdown=(net_return / max_dd) if max_dd > 0 else 0.0,
     )
 
 
@@ -310,7 +319,9 @@ def print_metrics(label: str, m: Metrics) -> None:
     print(
         f"{label:<28} n={m.n:<5} win%={m.win_rate:>6.1%} pf={pf:>5} "
         f"expectancy={m.expectancy_pct:>+7.2%} avg_win={m.avg_win_pct:>+7.2%} "
-        f"avg_loss={m.avg_loss_pct:>+7.2%} max_dd={m.max_drawdown_pct:>6.1%} "
+        f"avg_loss={m.avg_loss_pct:>+7.2%} net_pnl=${m.net_pnl:>+8.2f} "
+        f"return={m.return_pct:>+7.2%} max_dd={m.max_drawdown_pct:>6.1%} "
+        f"time_in_market={m.time_in_market_pct:>6.1%} "
         f"max_lose_streak={m.max_losing_streak:<3} mfe_captured={m.mfe_captured_pct:>5.1%}"
     )
 
@@ -340,25 +351,77 @@ def run_sweep(
     mean_reversion_priority: bool = False,
 ) -> tuple[Metrics, list[Metrics]]:
     """Runs the simulator per-symbol per-fold; returns (pooled, per-fold)."""
+    all_trades, fold_trades = _collect_sweep_trades(
+        frames, entry_fn, params, folds=folds, market_filter=market_filter,
+        mean_reversion_priority=mean_reversion_priority,
+    )
+    pooled = aggregate(all_trades)
+    observation_bars = sum(len(df) for df in frames.values())
+    if observation_bars:
+        pooled = replace(
+            pooled,
+            time_in_market_pct=min(
+                1.0,
+                sum(t.exit_idx - t.entry_idx for t in all_trades) / observation_bars,
+            ),
+        )
+    per_fold = []
+    for fold_trade_set in fold_trades:
+        metrics = aggregate(fold_trade_set)
+        fold_bars = sum(len(df) // folds for df in frames.values())
+        if fold_bars:
+            metrics = replace(
+                metrics,
+                time_in_market_pct=min(
+                    1.0,
+                    sum(t.exit_idx - t.entry_idx for t in fold_trade_set) / fold_bars,
+                ),
+            )
+        per_fold.append(metrics)
+    return pooled, per_fold
+
+
+def _collect_sweep_trades(
+    frames: dict[str, pd.DataFrame], entry_fn: EntryFn, params: LadderParams,
+    *, folds: int, market_filter: bool, mean_reversion_priority: bool = False,
+) -> tuple[list[Trade], list[list[Trade]]]:
     all_trades: list[Trade] = []
     fold_trades: list[list[Trade]] = [[] for _ in range(folds)]
     for sym, df in frames.items():
-        risk_on = _risk_on_series(frames, sym) if market_filter else None
+        risk_on = _risk_on_series(frames, sym)
         bounds = _fold_bounds(len(df), folds)
         for f, (lo, hi) in enumerate(bounds):
             sub = df.iloc[lo:hi]
             if len(sub) < 40:
                 continue
-            sub_risk_on = risk_on.iloc[lo:hi] if risk_on is not None else None
+            sub_risk_on = risk_on.iloc[lo:hi] if market_filter and risk_on is not None else None
             trades = simulate_symbol(
                 sym, sub, entry_fn, params, risk_on=sub_risk_on,
                 mean_reversion_priority=mean_reversion_priority,
             )
+            if not market_filter and risk_on is not None:
+                for trade in trades:
+                    trade.regime_risk_on = bool(risk_on.iloc[lo + trade.entry_idx])
             all_trades.extend(trades)
             fold_trades[f].extend(trades)
-    pooled = aggregate(all_trades)
-    per_fold = [aggregate(t) for t in fold_trades]
-    return pooled, per_fold
+    return all_trades, fold_trades
+
+
+def compare_market_filters(
+    frames: dict[str, pd.DataFrame], entry_fn: EntryFn, params: LadderParams, *, folds: int,
+) -> dict[str, float | int]:
+    """Paired OFF/ON comparison and counterfactual P&L for filtered entries."""
+    off_trades, _ = _collect_sweep_trades(frames, entry_fn, params, folds=folds, market_filter=False)
+    on_trades, _ = _collect_sweep_trades(frames, entry_fn, params, folds=folds, market_filter=True)
+    blocked = []
+    blocked = [trade for trade in off_trades if trade.regime_risk_on is False]
+    blocked_metrics = aggregate(blocked)
+    return {
+        "off_trades": len(off_trades),
+        "on_trades": len(on_trades),
+        "blocked_entries": len(blocked),
+        "blocked_pnl": blocked_metrics.net_pnl,
+    }
 
 
 # ── Sweep entrypoints ────────────────────────────────────────────────────
@@ -373,6 +436,13 @@ async def sweep_entry(frames: dict[str, pd.DataFrame], folds: int, market_filter
             if m.n:
                 print(f"    fold {i}: " + " " * 0, end="")
                 print_metrics(f"  fold {i}", m)
+    if "BTCUSDT" in frames:
+        comparison = compare_market_filters(frames, entry_dip_buy, params, folds=folds)
+        print(
+            "\nPaired dip_buy gate comparison: "
+            f"blocked_entries={comparison['blocked_entries']} "
+            f"counterfactual_blocked_pnl=${comparison['blocked_pnl']:+.2f}"
+        )
 
 
 async def sweep_rsi_exit(frames: dict[str, pd.DataFrame], folds: int, market_filter: bool) -> None:
