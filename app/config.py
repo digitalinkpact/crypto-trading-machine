@@ -311,7 +311,7 @@ class Settings(BaseSettings):
     # ProfitStream strategy controls.
     profitstream_enabled: bool = True
     profitstream_use_legacy_agents: bool = False
-    profitstream_score_threshold: int = Field(60, ge=0, le=100)
+    profitstream_score_threshold: int = Field(80, ge=0, le=100)
     profitstream_rsi_min: int = Field(40, ge=1, le=99)
     profitstream_rsi_max: int = Field(65, ge=1, le=99)
     profitstream_volume_spike_multiple: float = Field(1.5, ge=1.0, le=10.0)
@@ -331,7 +331,7 @@ class Settings(BaseSettings):
     # pre-empts the empirically much healthier stop-loss/trailing-stop/stale-
     # exit ladder. Below this PnL, the position is left for the risk ladder to
     # manage instead of being closed at a loss by a technical-only signal.
-    mean_reversion_exit_min_pnl_pct: float = Field(0.0, ge=-0.20, le=0.20)
+    mean_reversion_exit_min_pnl_pct: float = Field(0.003, ge=-0.20, le=0.20)
     # RSI level considered "recovered" for the mean-reversion exit (was a bare
     # `rsi > 55` constant). Configurable so it can be validated rather than
     # hardcoded.
@@ -386,7 +386,7 @@ class Settings(BaseSettings):
     # net-negative to net-positive and caps the bear-market drawdown. Spot is
     # long-only, so there is no edge to capture while the market bleeds — sit
     # in cash instead. FAIL-OPEN: missing BTC data always allows trading.
-    market_regime_gate_enabled: bool = False
+    market_regime_gate_enabled: bool = True
     # The gate now scores BTC's regime -2..+2 (app/regime/btc_regime.py) instead
     # of a single binary EMA cross: BULL/STRONG_BULL (score>=1) allows normal
     # entries, BEAR/STRONG_BEAR (score<=-1) blocks all new longs (no bypass —

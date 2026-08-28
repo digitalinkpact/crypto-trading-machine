@@ -129,13 +129,28 @@ class ProfitStreamStrategy:
             # and (when enabled) an independent momentum or price
             # confirmation that the move is actually rolling over — not RSI
             # alone.
-            close_now = float(df_1d.iloc[-1]["close"])
             held_pos = self._held_position(symbol, mode)
             entry_price = float((held_pos or {}).get("entry_price") or 0.0)
-            held_pnl_pct = ((close_now - entry_price) / entry_price) if entry_price > 0 else 0.0
+            signal_close = float(df_1d.iloc[-1]["close"])
+            signal_pnl_pct = (
+                (signal_close - entry_price) / entry_price if entry_price > 0 else 0.0
+            )
+            try:
+                executable_price = float(await self._client.ticker_price(symbol))
+            except Exception as exc:  # noqa: BLE001
+                reasons.append(f"mean_reversion_exit_price_unavailable:{exc}")
+                executable_price = 0.0
+            held_pnl_pct = (
+                (executable_price - entry_price) / entry_price
+                if entry_price > 0 and executable_price > 0
+                else None
+            )
+            indicators["held_signal_pnl_pct"] = signal_pnl_pct
             indicators["held_pnl_pct"] = held_pnl_pct
 
-            if held_pnl_pct < s.mean_reversion_exit_min_pnl_pct:
+            if held_pnl_pct is None:
+                reasons.append("mean_reversion_exit_suppressed_without_live_price")
+            elif held_pnl_pct < s.mean_reversion_exit_min_pnl_pct:
                 reasons.append(
                     f"mean_reversion_exit_suppressed_at_loss:pnl={held_pnl_pct:.2%}"
                     f"<{s.mean_reversion_exit_min_pnl_pct:.2%}"

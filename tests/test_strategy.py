@@ -54,6 +54,7 @@ async def test_entry_strategy_switch_preserves_dip_variant_label(monkeypatch):
         return eth_df if symbol == "ETHUSDT" else btc_df
 
     monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(strategy._client, "ticker_price", lambda *_a: __import__("asyncio").sleep(0, result=101.0), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: False, raising=True)
@@ -81,6 +82,7 @@ async def test_profitstream_buys_daily_dip_with_btc_risk_on(monkeypatch):
         return frames[(symbol, interval)]
 
     monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(strategy._client, "ticker_price", lambda *_a: __import__("asyncio").sleep(0, result=101.0), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: False, raising=True)
@@ -196,6 +198,7 @@ async def test_profitstream_exits_held_position_on_daily_mean_reversion(monkeypa
         return frames[(symbol, interval)]
 
     monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(strategy._client, "ticker_price", lambda *_a: __import__("asyncio").sleep(0, result=101.0), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: True, raising=True)
@@ -217,7 +220,7 @@ async def test_profitstream_rsi_recovery_at_breakeven_without_confirmation_does_
     managing it), not closed on RSI alone."""
     strategy = ProfitStreamStrategy()
     frames = {
-        # Breakeven (close==entry==100), price at/above its own EMA20 (no
+        # Price clears the live exit cushion, but is at/above its own EMA20 (no
         # bearish confirmation), no macd_hist column (no momentum signal).
         ("ETHUSDT", "1d"): _frame(close=100, rsi=60, bb_lower=95, bb_mid=105, ema50=100, ema200=95, ema20=95),
         ("BTCUSDT", "1d"): _frame(close=100000, rsi=55, bb_lower=95000, bb_mid=98000, ema50=99000, ema200=97000),
@@ -227,6 +230,7 @@ async def test_profitstream_rsi_recovery_at_breakeven_without_confirmation_does_
         return frames[(symbol, interval)]
 
     monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(strategy._client, "ticker_price", lambda *_a: __import__("asyncio").sleep(0, result=101.0), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: True, raising=True)
@@ -252,6 +256,7 @@ async def test_profitstream_defers_to_risk_ladder_on_strong_profitable_trend(mon
         return frames[(symbol, interval)]
 
     monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(strategy._client, "ticker_price", lambda *_a: __import__("asyncio").sleep(0, result=115.0), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: True, raising=True)
@@ -282,6 +287,7 @@ async def test_profitstream_exits_on_momentum_confirmation_alone(monkeypatch):
         return frames[(symbol, interval)]
 
     monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(strategy._client, "ticker_price", lambda *_a: __import__("asyncio").sleep(0, result=101.0), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: True, raising=True)
@@ -309,6 +315,7 @@ async def test_profitstream_suppresses_mean_reversion_exit_while_at_a_loss(monke
         return frames[(symbol, interval)]
 
     monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(strategy._client, "ticker_price", lambda *_a: __import__("asyncio").sleep(0, result=90.0), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: True, raising=True)
@@ -319,6 +326,42 @@ async def test_profitstream_suppresses_mean_reversion_exit_while_at_a_loss(monke
 
     assert decision.action == SignalAction.HOLD
     assert any("mean_reversion_exit_suppressed_at_loss" in r for r in decision.reasons)
+
+
+async def test_profitstream_suppresses_signal_exit_when_live_price_is_below_entry(monkeypatch):
+    """A stale daily close must not authorize an immediately loss-making SELL."""
+    strategy = ProfitStreamStrategy()
+    frames = {
+        # The completed daily candle is profitable, but the executable price
+        # has already fallen below the entry.
+        ("ETHUSDT", "1d"): _frame(
+            close=101, rsi=60, bb_lower=95, bb_mid=105, ema50=100, ema200=95,
+            ema20=95, macd_hist=[0.6, 0.3],
+        ),
+        ("BTCUSDT", "1d"): _frame(
+            close=100000, rsi=55, bb_lower=95000, bb_mid=98000, ema50=99000, ema200=97000,
+        ),
+    }
+
+    async def _candles(self, symbol: str, interval: str, limit: int):
+        return frames[(symbol, interval)]
+
+    async def _ticker_price(symbol: str):
+        return 99.0
+
+    monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(strategy._client, "ticker_price", _ticker_price, raising=True)
+    monkeypatch.setattr(strategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
+    monkeypatch.setattr(strategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
+    monkeypatch.setattr(strategy, "_is_held", lambda *_a, **_k: True, raising=True)
+    monkeypatch.setattr(strategy, "_held_position", lambda *_a, **_k: {"entry_price": 100.0}, raising=True)
+
+    decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
+
+    assert decision.action == SignalAction.HOLD
+    assert decision.indicators["held_signal_pnl_pct"] == 0.01
+    assert decision.indicators["held_pnl_pct"] == -0.01
+    assert any("mean_reversion_exit_suppressed_at_loss" in reason for reason in decision.reasons)
 
 
 async def test_profitstream_rejects_falling_knife_extension(monkeypatch):
