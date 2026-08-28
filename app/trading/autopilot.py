@@ -14,8 +14,10 @@ Each tick:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import subprocess
 import time
 import uuid
 from collections import Counter
@@ -48,6 +50,7 @@ _STATE_KEY = "autopilot_state"
 _SKIP_STATS_KEY = "autopilot_skip_stats"
 _LAST_TICK_DEBUG_KEY = "autopilot_last_tick_debug"
 _ML_GATE_STATS_KEY = "ml_gate_stats"
+_DRAWDOWN_HALT_KEY = "drawdown_halt"
 
 
 @dataclass
@@ -124,6 +127,23 @@ def _jsonable(value):
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     return value
+
+
+def _active_revision() -> str:
+    configured = os.getenv("GIT_REVISION")
+    if configured:
+        return configured
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 class Autopilot:
@@ -469,18 +489,43 @@ class Autopilot:
                 log.exception("risk-exit failed for %s: %s", ex.symbol, exc)
 
     async def _check_circuit_breaker(self) -> bool:
+        drawdown_halt = storage.kv_get(_DRAWDOWN_HALT_KEY) or {}
+        if isinstance(drawdown_halt, dict) and drawdown_halt.get("active"):
+            self.state.last_error = (
+                "DRAWDOWN BREAKER HALTED — explicit operator recovery required "
+                "before new BUYs can resume"
+            )
+            log.warning(self.state.last_error)
+            return True
         try:
             snap = await portfolio_snapshot(mode=self.state.mode)
         except Exception as exc:  # noqa: BLE001
-            log.warning("breaker portfolio fetch failed: %s", exc)
-            return False
+            self.state.last_error = f"breaker portfolio fetch failed: {exc}; new BUYs halted"
+            log.critical(self.state.last_error)
+            return True
         tripped, dd = risk.is_circuit_breaker_tripped(
             starting_balance=self.state.starting_balance_usdt,
             current_balance=Decimal(str(snap["total_usdt"])),
         )
+        legacy_halt = "DRAWDOWN BREAKER TRIPPED" in self.state.last_error
         if tripped:
             self.state.last_error = (
                 f"DRAWDOWN BREAKER TRIPPED at {dd:.1%} — new BUYs halted"
+            )
+            storage.kv_set(
+                _DRAWDOWN_HALT_KEY,
+                self._drawdown_halt_record(dd, Decimal(str(snap["total_usdt"]))),
+            )
+            log.warning(self.state.last_error)
+            return True
+        if legacy_halt:
+            storage.kv_set(
+                _DRAWDOWN_HALT_KEY,
+                self._drawdown_halt_record(dd, Decimal(str(snap["total_usdt"])), legacy=True),
+            )
+            self.state.last_error = (
+                "DRAWDOWN BREAKER legacy halt preserved — explicit operator recovery "
+                "required before new BUYs can resume"
             )
             log.warning(self.state.last_error)
             return True
@@ -499,6 +544,71 @@ class Autopilot:
             log.warning(self.state.last_error)
             return True
         return False
+
+    def _drawdown_halt_record(
+        self, drawdown_pct: float, current_equity: Decimal, *, legacy: bool = False
+    ) -> dict:
+        s = get_settings()
+        risk_limits = {
+            "max_position_pct": s.max_position_pct,
+            "max_open_positions": s.max_open_positions,
+            "max_long_exposure_pct": s.max_long_exposure_pct,
+            "drawdown_circuit_breaker_pct": s.drawdown_circuit_breaker_pct,
+            "daily_loss_limit_pct": s.daily_loss_limit_pct,
+            "profitstream_score_threshold": s.profitstream_score_threshold,
+        }
+        config_hash = hashlib.sha256(
+            json.dumps(risk_limits, sort_keys=True).encode("ascii")
+        ).hexdigest()
+        return {
+            "active": True,
+            "triggered_at": datetime.now(timezone.utc).isoformat(),
+            "legacy": legacy,
+            "drawdown_pct": drawdown_pct,
+            "drawdown_limit_pct": s.drawdown_circuit_breaker_pct,
+            "baseline_equity_usdt": str(self.state.starting_balance_usdt),
+            "current_equity_usdt": str(current_equity),
+            "bot_revision": _active_revision(),
+            "risk_limits": risk_limits,
+            "config_hash": config_hash,
+        }
+
+    async def resume_after_drawdown_halt(self, *, reason: str) -> None:
+        """Explicitly rebaseline after an operator-approved drawdown recovery.
+
+        This never runs from startup, watchdog recovery, or configuration reload.
+        It only records the decision and permits subsequent eligible entries.
+        """
+        if not reason.strip():
+            raise ValueError("drawdown recovery requires an operator reason")
+        halt = storage.kv_get(_DRAWDOWN_HALT_KEY) or {}
+        if not isinstance(halt, dict) or not halt.get("active"):
+            raise RuntimeError("drawdown breaker is not persistently halted")
+        snap = await portfolio_snapshot(mode=self.state.mode)
+        current_equity = Decimal(str(snap["total_usdt"]))
+        previous_drawdown = halt.get("drawdown_pct")
+        halt.update({
+            "active": False,
+            "operator_action": "explicit_rebaseline",
+            "operator_reason": reason.strip(),
+            "recovered_at": datetime.now(timezone.utc).isoformat(),
+            "previous_drawdown_pct": previous_drawdown,
+            "new_baseline_equity_usdt": str(current_equity),
+        })
+        self.state.starting_balance_usdt = current_equity
+        self.state.last_error = ""
+        self.state.last_action = "drawdown recovery approved; baseline re-established"
+        storage.kv_set(_DRAWDOWN_HALT_KEY, halt)
+        trade_audit_logger.log_event(
+            mode=self.state.mode,
+            symbol="PORTFOLIO",
+            signal="DRAWDOWN_RECOVERY",
+            risk_passed=True,
+            final_outcome="operator_recovery",
+            detail=halt,
+        )
+        self._save()
+        log.warning("drawdown recovery recorded; new entries remain subject to all other gates")
 
     # ── execution ──────────────────────────────────────────────────────
     async def _execute_signal(self, symbol: str, sig, *, allow_buys: bool) -> tuple[bool, str]:

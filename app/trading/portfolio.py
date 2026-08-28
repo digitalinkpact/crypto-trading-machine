@@ -42,6 +42,7 @@ async def portfolio_snapshot(
     ]
 
     usdt_cash = Decimal("0")
+    quote_cash_total = Decimal("0")
     holdings: list[dict] = []
     all_balances: dict[str, Decimal] = {}
     free_balances: dict[str, Decimal] = {}
@@ -54,6 +55,13 @@ async def portfolio_snapshot(
             free_balances[asset] = free_qty
         if asset == "USDT":
             usdt_cash = free_qty
+            quote_cash_total += qty
+            continue
+        if asset == "USD":
+            # Binance.US account balances can include fiat USD even though no
+            # USDUSDT market exists. USD is already the account's quote cash,
+            # so value it at par rather than silently omit it from equity.
+            quote_cash_total += qty
             continue
         symbol = f"{asset}USDT"
         try:
@@ -67,7 +75,7 @@ async def portfolio_snapshot(
             "price_usdt": price, "value_usdt": value,
         })
 
-    total = usdt_cash + sum((h["value_usdt"] for h in holdings), Decimal("0"))
+    total = quote_cash_total + sum((h["value_usdt"] for h in holdings), Decimal("0"))
     return {
         "total_usdt": total,
         "usdt_cash": usdt_cash,

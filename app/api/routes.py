@@ -635,6 +635,20 @@ async def autopilot_stop():
     return RedirectResponse(url="/", status_code=303)
 
 
+@router.post("/autopilot/drawdown-recovery", include_in_schema=False)
+async def autopilot_drawdown_recovery(
+    confirmation: str = Form(...),
+    reason: str = Form(...),
+):
+    if confirmation != "RESUME_LIVE_ENTRIES":
+        raise HTTPException(status_code=400, detail="explicit confirmation is required")
+    try:
+        await autopilot.resume_after_drawdown_halt(reason=reason)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse(url="/", status_code=303)
+
+
 @router.get("/health")
 async def health(response: Response) -> dict:
     """Liveness+readiness probe for external supervisors (systemd timer,
