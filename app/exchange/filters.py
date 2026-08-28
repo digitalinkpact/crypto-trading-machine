@@ -33,6 +33,11 @@ class SymbolFilters:
         self._info: dict[str, dict[str, Any]] = {}
         self._loaded = False
 
+    @property
+    def loaded(self) -> bool:
+        """Whether a complete Binance.US filter snapshot is available."""
+        return self._loaded
+
     async def load(self) -> None:
         if self._loaded:
             return
@@ -60,7 +65,7 @@ class SymbolFilters:
 
     def is_listed(self, symbol: str) -> bool:
         if not self._loaded:
-            return True  # don't block when filters unavailable
+            return False
         info = self._info.get(symbol)
         return bool(info and info.get("status") == "TRADING")
 
@@ -76,6 +81,8 @@ class SymbolFilters:
         return _plain(qty)
 
     def meets_min(self, symbol: str, qty: Decimal, price: Decimal) -> bool:
+        if not self._loaded:
+            return False
         info = self._info.get(symbol) or {}
         min_qty: Optional[Decimal] = info.get("min_qty")
         min_notional: Optional[Decimal] = info.get("min_notional")

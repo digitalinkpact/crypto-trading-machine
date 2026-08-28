@@ -131,6 +131,10 @@ async def test_submit_live_order_exception_never_places_second_order(monkeypatch
         order_from_raw = staticmethod(BinanceUSClient.order_from_raw)
 
     monkeypatch.setattr(autopilot_module, "BinanceUSClient", lambda: _FakeLiveClient())
+    monkeypatch.setattr(
+        Autopilot, "_final_live_buy_safety_check",
+        lambda *_a, **_k: _async_result((True, "ok", {})),
+    )
     monkeypatch.setattr(autopilot_module.storage, "record_order", lambda **kwargs: None, raising=True)
     monkeypatch.setattr(autopilot_module.storage, "open_position", lambda **kwargs: None, raising=True)
 
@@ -162,6 +166,10 @@ async def test_submit_live_order_exception_inconclusive_returns_none_and_no_book
             return "inconclusive", None
 
     monkeypatch.setattr(autopilot_module, "BinanceUSClient", lambda: _FakeLiveClient())
+    monkeypatch.setattr(
+        Autopilot, "_final_live_buy_safety_check",
+        lambda *_a, **_k: _async_result((True, "ok", {})),
+    )
 
     record_calls: list = []
     monkeypatch.setattr(
@@ -200,6 +208,10 @@ async def test_submit_filled_order_persistence_failure_halts_new_entries(monkeyp
     halt_calls = []
     monkeypatch.setattr(autopilot_module, "BinanceUSClient", lambda: _FakeLiveClient())
     monkeypatch.setattr(
+        Autopilot, "_final_live_buy_safety_check",
+        lambda *_a, **_k: _async_result((True, "ok", {})),
+    )
+    monkeypatch.setattr(
         autopilot_module.storage, "record_order",
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
         raising=True,
@@ -214,6 +226,64 @@ async def test_submit_filled_order_persistence_failure_halts_new_entries(monkeyp
 
     assert order is not None
     assert halt_calls and halt_calls[0][1] == "new_entries_blocked"
+
+
+async def test_final_live_buy_gate_blocks_drawdown_halt(monkeypatch):
+    ap = Autopilot()
+    ap.state.mode = "live"
+    ap.state.running = True
+    ap.state.starting_balance_usdt = Decimal("100")
+    kv = {
+        "drawdown_halt": {"active": True},
+        "emergency_halt": {"active": False},
+        "tick_protection": {"active": False},
+        "entry_status": {"entry_halted": True},
+    }
+
+    class _Settings:
+        live_buys_enabled = True
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _Settings())
+    monkeypatch.setattr(autopilot_module.filters, "_loaded", True)
+    monkeypatch.setattr(autopilot_module.storage, "kv_get", lambda key: kv.get(key))
+
+    allowed, reason, _detail = await ap._final_live_buy_safety_check(
+        symbol="BTCUSDT", qty=Decimal("1")
+    )
+
+    assert allowed is False
+    assert reason == "drawdown_halt"
+
+
+async def test_final_live_buy_gate_exception_rejects(monkeypatch):
+    ap = Autopilot()
+    ap.state.mode = "live"
+    ap.state.running = True
+    ap.state.starting_balance_usdt = Decimal("100")
+
+    class _Settings:
+        live_buys_enabled = True
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _Settings())
+    monkeypatch.setattr(autopilot_module.filters, "_loaded", True)
+    monkeypatch.setattr(
+        autopilot_module.storage, "kv_get",
+        lambda _key: (_ for _ in ()).throw(RuntimeError("storage unavailable")),
+    )
+
+    allowed, reason, detail = await ap._final_live_buy_safety_check(
+        symbol="BTCUSDT", qty=Decimal("1")
+    )
+
+    assert allowed is False
+    assert reason == "final_safety_check_failed"
+    assert "storage unavailable" in detail["exception"]
+
+
+def _async_result(value):
+    async def result():
+        return value
+    return result()
 
 
 async def test_submit_skips_when_same_symbol_side_is_locked(monkeypatch):

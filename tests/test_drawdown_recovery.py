@@ -68,3 +68,39 @@ async def test_drawdown_recovery_requires_verified_accounting(monkeypatch):
         assert "verified authoritative accounting" in str(exc)
     else:
         raise AssertionError("unverified accounting must block drawdown recovery")
+
+
+async def test_circuit_breaker_exception_persistently_blocks_new_entries(monkeypatch):
+    autopilot = Autopilot()
+    autopilot.state.running = True
+    autopilot.state.mode = "live"
+    autopilot.state.starting_balance_usdt = Decimal("100")
+    kv_state: dict = {}
+
+    class _Settings:
+        paper_trading = False
+        llm_in_trading_loop = False
+        emergency_halt_enabled = True
+
+    async def _broken_breaker(self):
+        raise RuntimeError("portfolio unavailable")
+
+    async def _execute(self, _signals, *, allow_buys):
+        assert allow_buys is False
+        assert "circuit_breaker_check_failed" in self._entry_block_reason()
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _Settings())
+    monkeypatch.setattr(autopilot_module.storage, "kv_get", lambda key: kv_state.get(key))
+    monkeypatch.setattr(autopilot_module.storage, "kv_set", lambda key, value: kv_state.__setitem__(key, value))
+    monkeypatch.setattr(autopilot_module.storage, "try_acquire_lock", lambda *_a, **_k: True)
+    monkeypatch.setattr(autopilot_module.storage, "release_lock", lambda *_a, **_k: None)
+    monkeypatch.setattr(autopilot_module.filters, "load", lambda: __import__("asyncio").sleep(0))
+    monkeypatch.setattr(autopilot_module.filters, "_loaded", True)
+    monkeypatch.setattr(Autopilot, "_check_circuit_breaker", _broken_breaker)
+    monkeypatch.setattr(autopilot_module, "run_all_agents", lambda **_k: __import__("asyncio").sleep(0, result={}))
+    monkeypatch.setattr(Autopilot, "_execute", _execute)
+
+    await autopilot.tick()
+
+    assert kv_state["circuit_breaker_check_failed"]["active"] is True
+    assert "portfolio unavailable" in autopilot.state.last_error

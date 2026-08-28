@@ -65,6 +65,32 @@ async def test_trend_gate_disabled_fail_open(monkeypatch):
     assert why == "trend_disabled"
 
 
+async def test_trend_gate_blocks_when_enabled_data_is_unavailable(monkeypatch):
+    """An enabled trend gate must not approve a BUY without daily data."""
+    ap = Autopilot()
+    _patch_trend_data(monkeypatch, pd.DataFrame(), enabled=True)
+    ok, why = await ap._trend_gate("BTCUSDT")
+    assert ok is False
+    assert why == "trend_no_data"
+
+
+async def test_profitstream_cannot_soft_bypass_unavailable_trend_data():
+    ap = Autopilot()
+    signal = type("Signal", (), {
+        "agent": "profitstream_strategy",
+        "contributing_agents": ("profitstream_strategy",),
+        "quality_score": 90,
+    })()
+
+    allowed, why, adjusted = ap._profitstream_trend_adjustment(
+        signal, False, "trend_no_data"
+    )
+
+    assert allowed is False
+    assert why == "trend_no_data"
+    assert adjusted is None
+
+
 def _market_settings(enabled: bool = True):
     class _S:
         market_regime_gate_enabled = enabled
@@ -691,6 +717,7 @@ async def test_execute_forces_exit_on_high_confidence_sell_signal(monkeypatch):
 async def test_execute_buy_pyramids_when_position_exists_and_confidence_is_high(monkeypatch):
     ap = Autopilot()
     ap.state.mode = "live"
+    ap.state.starting_balance_usdt = Decimal("1000")
 
     kv_state = {"pyramid_adds:live:BTCUSDT": 1}
     placed: list[tuple[str, Decimal]] = []

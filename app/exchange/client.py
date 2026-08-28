@@ -289,6 +289,16 @@ class BinanceUSClient:
             )
             return order.model_copy(update={"status": OrderStatus.DRY_RUN})
 
+        # This is the last exchange-boundary protection for all callers,
+        # including one-off scripts and any future API path that bypasses the
+        # autopilot. SELLs remain available for risk exits and liquidation.
+        if side is OrderSide.BUY and not self._settings.live_buys_enabled:
+            log.critical(
+                "LIVE BUY REJECTED by global kill switch coid=%s symbol=%s",
+                coid, symbol,
+            )
+            return order.model_copy(update={"status": OrderStatus.REJECTED})
+
         params: dict[str, Any] = {
             "symbol": symbol,
             "side": side.value,

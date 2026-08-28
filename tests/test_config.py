@@ -60,7 +60,8 @@ def test_emergency_halt_can_be_disabled(monkeypatch):
 
 def test_execution_defaults_are_more_permissive():
     s = Settings(_env_file=None)
-    assert s.ml_gate_enabled is False
+    assert s.ml_gate_enabled is True
+    assert s.live_buys_enabled is False
     assert s.max_open_positions == 10
     assert s.rollback_max_open_positions == 10
     assert s.aggressive_max_open_positions == 10

@@ -90,6 +90,24 @@ async def test_startup_preserves_legacy_drawdown_halt(monkeypatch):
     assert kv_state["drawdown_halt"]["legacy"] is True
 
 
+@pytest.mark.asyncio
+async def test_startup_blocks_entries_when_running_state_has_no_baseline(monkeypatch):
+    from app.trading import startup as main
+
+    kv_state = {
+        "autopilot_state": {"running": True, "started_at": "2026-08-28T00:00:00+00:00"},
+    }
+    monkeypatch.setattr(main, "get_settings", lambda: type("S", (), {"paper_trading": False})())
+    monkeypatch.setattr(main.storage, "kv_get", lambda key: kv_state.get(key))
+    monkeypatch.setattr(main.storage, "kv_set", lambda key, value: kv_state.__setitem__(key, value))
+    monkeypatch.setattr(main, "reconcile_positions", lambda **kwargs: _async_result({"mismatched": 0}))
+    monkeypatch.setattr("app.exchange.BinanceUSClient.open_orders", lambda self: _async_result([]))
+
+    await main.verify_before_trading()
+
+    assert kv_state["baseline_unavailable"]["active"] is True
+
+
 def _async_result(value):
     async def result():
         return value

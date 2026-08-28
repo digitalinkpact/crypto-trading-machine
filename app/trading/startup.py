@@ -15,6 +15,18 @@ async def verify_before_trading() -> None:
     """Verify local/exchange state and halt new entries on any discrepancy."""
     mode = "paper" if get_settings().paper_trading else "live"
     prior_state = storage.kv_get("autopilot_state") or {}
+    if prior_state.get("running") and not prior_state.get("starting_balance_usdt"):
+        storage.kv_set(
+            "baseline_unavailable",
+            {
+                "active": True,
+                "reason": "startup restored a running autopilot without a valid baseline",
+                "since": prior_state.get("started_at"),
+            },
+        )
+        log.critical(
+            "startup found no persisted portfolio baseline; new BUY entries remain blocked"
+        )
     prior_entry_status = storage.kv_get("entry_status") or {}
     prior_reasons = prior_entry_status.get("reasons", []) if isinstance(prior_entry_status, dict) else []
     legacy_drawdown_halt = (

@@ -33,7 +33,7 @@ async def test_dry_run_does_not_call_exchange(client):
 
 @pytest.mark.asyncio
 async def test_live_order_uses_client_order_id(monkeypatch):
-    settings = Settings(dry_run=False, paper_trading=False)
+    settings = Settings(dry_run=False, paper_trading=False, live_buys_enabled=True)
     c = BinanceUSClient(settings=settings)
     c._spot = MagicMock()
     c._spot.new_order.return_value = {
@@ -52,8 +52,20 @@ async def test_live_order_uses_client_order_id(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_live_buy_kill_switch_rejects_direct_client_call():
+    settings = Settings(dry_run=False, paper_trading=False, live_buys_enabled=False)
+    c = BinanceUSClient(settings=settings)
+    c._spot = MagicMock()
+
+    order = await c.place_order("BTCUSDT", OrderSide.BUY, OrderType.MARKET, Decimal("0.001"))
+
+    assert order.status is OrderStatus.REJECTED
+    c._spot.new_order.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_live_order_sets_avg_fill_price_from_fills():
-    settings = Settings(dry_run=False, paper_trading=False)
+    settings = Settings(dry_run=False, paper_trading=False, live_buys_enabled=True)
     c = BinanceUSClient(settings=settings)
     c._spot = MagicMock()
     c._spot.new_order.return_value = {
@@ -74,7 +86,7 @@ async def test_live_order_sets_avg_fill_price_from_fills():
 
 @pytest.mark.asyncio
 async def test_live_order_sets_avg_fill_price_from_cum_quote():
-    settings = Settings(dry_run=False, paper_trading=False)
+    settings = Settings(dry_run=False, paper_trading=False, live_buys_enabled=True)
     c = BinanceUSClient(settings=settings)
     c._spot = MagicMock()
     c._spot.new_order.return_value = {
@@ -92,7 +104,7 @@ async def test_live_order_sets_avg_fill_price_from_cum_quote():
 
 @pytest.mark.asyncio
 async def test_live_order_extracts_actual_commission_single_asset():
-    settings = Settings(dry_run=False, paper_trading=False)
+    settings = Settings(dry_run=False, paper_trading=False, live_buys_enabled=True)
     c = BinanceUSClient(settings=settings)
     c._spot = MagicMock()
     c._spot.new_order.return_value = {
@@ -116,7 +128,7 @@ async def test_live_order_extracts_actual_commission_single_asset():
 async def test_live_order_commission_none_when_assets_mixed():
     """A commission paid in more than one asset (e.g. partial BNB discount)
     can't be summed into one honest USDT number — must not fabricate one."""
-    settings = Settings(dry_run=False, paper_trading=False)
+    settings = Settings(dry_run=False, paper_trading=False, live_buys_enabled=True)
     c = BinanceUSClient(settings=settings)
     c._spot = MagicMock()
     c._spot.new_order.return_value = {
@@ -138,7 +150,7 @@ async def test_live_order_commission_none_when_assets_mixed():
 
 @pytest.mark.asyncio
 async def test_live_order_commission_none_when_no_fills():
-    settings = Settings(dry_run=False, paper_trading=False)
+    settings = Settings(dry_run=False, paper_trading=False, live_buys_enabled=True)
     c = BinanceUSClient(settings=settings)
     c._spot = MagicMock()
     c._spot.new_order.return_value = {
@@ -220,6 +232,16 @@ def _filters_with(step: str, min_qty: str = "0"):
         "X": {"status": "TRADING", "step_size": Decimal(step), "min_qty": Decimal(min_qty)}
     }
     return f
+
+
+def test_unloaded_filters_fail_closed_for_listing_and_minimums():
+    """An empty filter cache must never authorize an entry order."""
+    from app.exchange.filters import SymbolFilters
+
+    f = SymbolFilters()
+    assert f.loaded is False
+    assert f.is_listed("BTCUSDT") is False
+    assert f.meets_min("BTCUSDT", Decimal("1"), Decimal("100000")) is False
 
 
 @pytest.mark.parametrize(

@@ -209,6 +209,10 @@ class Settings(BaseSettings):
     live_mode: bool = False  # SAFE DEFAULT: off
     dry_run: bool = True     # SAFE DEFAULT: on
     paper_trading: bool = True  # SAFE DEFAULT: on
+    # Global production kill switch for NEW live entries. This stays false
+    # unless an operator explicitly enables it after a documented safety
+    # review. It never prevents protective SELLs.
+    live_buys_enabled: bool = False
 
     @model_validator(mode="after")
     def _apply_live_mode_override(self) -> "Settings":
@@ -466,9 +470,9 @@ class Settings(BaseSettings):
 
     # ML quality gate — drop trades the learned model rates below this win-prob.
     # Closes the learning loop: realized win/loss outcomes train the model,
-    # which then filters live BUY/SELL signals. Disable for now so the bot can
-    # reach live execution while the model and strategy are being tuned.
-    ml_gate_enabled: bool = False
+    # which then filters live entry signals. When enabled, uncertainty blocks
+    # a new BUY rather than granting it permission.
+    ml_gate_enabled: bool = True
     ml_gate_threshold: float = Field(0.50, ge=0.0, le=1.0)
     ml_gate_threshold_conf_70: float = Field(0.45, ge=0.0, le=1.0)
     ml_gate_threshold_conf_80: float = Field(0.40, ge=0.0, le=1.0)
