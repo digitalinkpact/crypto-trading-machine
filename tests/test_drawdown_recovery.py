@@ -33,6 +33,7 @@ async def test_drawdown_recovery_requires_reason_and_rebaselines(monkeypatch):
     autopilot.state.mode = "live"
     autopilot.state.starting_balance_usdt = Decimal("100")
     kv_state = {
+        "accounting_status": {"verified": True, "source": "authoritative_history"},
         "drawdown_halt": {
             "active": True,
             "drawdown_pct": -0.2,
@@ -53,3 +54,17 @@ async def test_drawdown_recovery_requires_reason_and_rebaselines(monkeypatch):
     assert kv_state["drawdown_halt"]["active"] is False
     assert kv_state["drawdown_halt"]["operator_action"] == "explicit_rebaseline"
     assert audits[0]["final_outcome"] == "operator_recovery"
+
+
+async def test_drawdown_recovery_requires_verified_accounting(monkeypatch):
+    autopilot = Autopilot()
+    kv_state = {"drawdown_halt": {"active": True}}
+
+    monkeypatch.setattr(autopilot_module.storage, "kv_get", lambda key: kv_state.get(key))
+
+    try:
+        await autopilot.resume_after_drawdown_halt(reason="operator review")
+    except RuntimeError as exc:
+        assert "verified authoritative accounting" in str(exc)
+    else:
+        raise AssertionError("unverified accounting must block drawdown recovery")

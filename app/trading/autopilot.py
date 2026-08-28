@@ -581,6 +581,12 @@ class Autopilot:
         """
         if not reason.strip():
             raise ValueError("drawdown recovery requires an operator reason")
+        accounting_status = storage.kv_get("accounting_status") or {}
+        if not isinstance(accounting_status, dict) or not accounting_status.get("verified"):
+            raise RuntimeError(
+                "drawdown recovery requires verified authoritative accounting; "
+                "deposits, withdrawals, and transfers must be reconciled first"
+            )
         halt = storage.kv_get(_DRAWDOWN_HALT_KEY) or {}
         if not isinstance(halt, dict) or not halt.get("active"):
             raise RuntimeError("drawdown breaker is not persistently halted")
@@ -594,6 +600,7 @@ class Autopilot:
             "recovered_at": datetime.now(timezone.utc).isoformat(),
             "previous_drawdown_pct": previous_drawdown,
             "new_baseline_equity_usdt": str(current_equity),
+            "accounting_verification": accounting_status,
         })
         self.state.starting_balance_usdt = current_equity
         self.state.last_error = ""
