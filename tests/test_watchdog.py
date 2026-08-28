@@ -47,6 +47,9 @@ def test_emergency_halt_trigger_with_order_outcome_unknown_level(monkeypatch):
     )
     assert kv_state["emergency_halt"]["level"] == "order_outcome_unknown"
 
+    watchdog._maybe_clear_emergency_halt()
+    assert kv_state["emergency_halt"]["active"] is True
+
 
 def test_maybe_clear_emergency_halt_noop_when_not_active(monkeypatch):
     kv_state: dict = {"emergency_halt": {"active": False}}

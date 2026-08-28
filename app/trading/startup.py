@@ -4,6 +4,7 @@ from __future__ import annotations
 from app.config import get_settings
 from app.exchange import BinanceUSClient
 from app.logging_setup import get_logger
+from app.storage import storage
 from app.trading import watchdog
 from app.trading.reconcile import reconcile_positions
 
@@ -13,6 +14,14 @@ log = get_logger(__name__)
 async def verify_before_trading() -> None:
     """Verify local/exchange state and halt new entries on any discrepancy."""
     mode = "paper" if get_settings().paper_trading else "live"
+    unresolved_order = storage.kv_get("order_outcome_unknown")
+    if unresolved_order:
+        watchdog.trigger_emergency_halt(
+            "startup found unresolved order_outcome_unknown; verify the exchange order "
+            "by client ID before allowing new entries",
+            level="order_outcome_unknown",
+        )
+        return
     try:
         result = await reconcile_positions(mode=mode)
         if result.get("mismatched", 0) or result.get("unknown_orders", 0):

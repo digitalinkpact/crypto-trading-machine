@@ -138,6 +138,12 @@ def _maybe_clear_emergency_halt() -> None:
     existing = storage.kv_get("emergency_halt") or {}
     if not existing.get("active"):
         return
+    if existing.get("level") == "order_outcome_unknown":
+        log.critical(
+            "EMERGENCY HALT remains active: unresolved order outcome requires "
+            "authoritative exchange reconciliation before new BUY entries can resume"
+        )
+        return
     existing["active"] = False
     existing["cleared_at"] = _now_iso()
     storage.kv_set("emergency_halt", existing)

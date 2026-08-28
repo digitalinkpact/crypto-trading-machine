@@ -89,10 +89,24 @@ async def _attempt_recovery(*, recover_fn, verify_fn, label: str, verify_delay: 
 
 async def startup_report() -> dict:
     mode = "paper" if autopilot.state.mode == "paper" else "live"
+    settings = get_settings()
     env = {
-        "PAPER_TRADING": bool(getattr(__import__("app.config", fromlist=["get_settings"]).get_settings(), "paper_trading")),
-        "LIVE_MODE": bool(getattr(__import__("app.config", fromlist=["get_settings"]).get_settings(), "live_mode")),
-        "DRY_RUN": bool(getattr(__import__("app.config", fromlist=["get_settings"]).get_settings(), "dry_run")),
+        "PAPER_TRADING": settings.paper_trading,
+        "LIVE_MODE": settings.live_mode,
+        "DRY_RUN": settings.dry_run,
+    }
+    execution_config = {
+        "profitstream_score_threshold": settings.profitstream_score_threshold,
+        "market_regime_gate_enabled": settings.market_regime_gate_enabled,
+        "ml_gate_enabled": settings.ml_gate_enabled,
+        "max_position_pct": settings.max_position_pct,
+        "max_open_positions": settings.max_open_positions,
+        "max_long_exposure_pct": settings.max_long_exposure_pct,
+        "stop_loss_pct": settings.stop_loss_pct,
+        "daily_loss_limit_pct": settings.daily_loss_limit_pct,
+        "drawdown_circuit_breaker_pct": settings.drawdown_circuit_breaker_pct,
+        "max_spread_pct": settings.max_spread_pct,
+        "min_depth_trade_multiple": settings.min_depth_trade_multiple,
     }
 
     exchange_connected = False
@@ -126,6 +140,7 @@ async def startup_report() -> dict:
         "timestamp": _now_iso(),
         "trading_mode": mode,
         "env": env,
+        "execution_config": execution_config,
         "exchange_connected": exchange_connected,
         "api_permissions": api_permissions,
         "account_balances": balances,
