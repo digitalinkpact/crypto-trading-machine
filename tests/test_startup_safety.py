@@ -70,6 +70,26 @@ async def test_startup_blocks_entries_when_prior_order_outcome_is_unknown(monkey
     assert halts and halts[0][1] == "order_outcome_unknown"
 
 
+@pytest.mark.asyncio
+async def test_startup_preserves_legacy_drawdown_halt(monkeypatch):
+    from app.trading import startup as main
+
+    kv_state = {
+        "autopilot_state": {"last_error": "DRAWDOWN BREAKER TRIPPED at -20%"},
+        "entry_status": {"reasons": ["drawdown_circuit_breaker"]},
+    }
+    monkeypatch.setattr(main, "get_settings", lambda: type("S", (), {"paper_trading": False})())
+    monkeypatch.setattr(main.storage, "kv_get", lambda key: kv_state.get(key))
+    monkeypatch.setattr(main.storage, "kv_set", lambda key, value: kv_state.__setitem__(key, value))
+    monkeypatch.setattr(main, "reconcile_positions", lambda **kwargs: _async_result({"mismatched": 0}))
+    monkeypatch.setattr("app.exchange.BinanceUSClient.open_orders", lambda self: _async_result([]))
+
+    await main.verify_before_trading()
+
+    assert kv_state["drawdown_halt"]["active"] is True
+    assert kv_state["drawdown_halt"]["legacy"] is True
+
+
 def _async_result(value):
     async def result():
         return value

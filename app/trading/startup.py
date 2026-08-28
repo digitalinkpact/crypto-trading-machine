@@ -14,6 +14,29 @@ log = get_logger(__name__)
 async def verify_before_trading() -> None:
     """Verify local/exchange state and halt new entries on any discrepancy."""
     mode = "paper" if get_settings().paper_trading else "live"
+    prior_state = storage.kv_get("autopilot_state") or {}
+    prior_entry_status = storage.kv_get("entry_status") or {}
+    prior_reasons = prior_entry_status.get("reasons", []) if isinstance(prior_entry_status, dict) else []
+    legacy_drawdown_halt = (
+        "DRAWDOWN BREAKER" in str(prior_state.get("last_error", ""))
+        or "drawdown_circuit_breaker" in prior_reasons
+    )
+    persisted_drawdown_halt = storage.kv_get("drawdown_halt") or {}
+    if legacy_drawdown_halt and not persisted_drawdown_halt.get("active"):
+        storage.kv_set(
+            "drawdown_halt",
+            {
+                "active": True,
+                "legacy": True,
+                "triggered_at": prior_entry_status.get("checked_at"),
+                "reason": "legacy drawdown breaker state preserved during migration",
+                "requires_operator_recovery": True,
+            },
+        )
+        log.critical(
+            "startup preserved legacy drawdown halt; explicit operator recovery "
+            "is required before new BUY entries can resume"
+        )
     unresolved_order = storage.kv_get("order_outcome_unknown")
     if unresolved_order:
         watchdog.trigger_emergency_halt(
