@@ -25,6 +25,21 @@ _MODEL_NAME = "signal_quality_v1"
 _LAST_TRAINED_RESOLVED_KEY = "ml_last_trained_resolved_count"
 
 
+def _current_model_age_hours() -> float | None:
+    """Age in hours of the persisted quality model, or None if absent/unparseable."""
+    artifact = storage.load_model_artifact(_MODEL_NAME)
+    trained_at = artifact.get("trained_at") if artifact else None
+    if not trained_at:
+        return None
+    try:
+        dt = datetime.fromisoformat(trained_at)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+
+
 def _event_return_pct(action: str, entry: float, current: float) -> float:
     if entry <= 0:
         return 0.0
@@ -232,15 +247,27 @@ async def run_learning_cycle() -> dict[str, float | int | str]:
             result["since_last_train"] = since_last_train
             return result
     elif since_last_train < s.ml_min_new_labels:
-        result["total_resolved"] = total_resolved
-        result["since_last_train"] = since_last_train
-        return result
+        # Time-based safety retrain: refresh before the model ages past the ML
+        # gate's staleness limit, even without enough NEW labels. Without this a
+        # bot that legitimately sits out (bear regime / drawdown halt) longer
+        # than the staleness window can never refresh its model, and the stale-
+        # model guard then blocks every new entry forever (a deadlock the bot
+        # cannot exit on its own).
+        age_h = _current_model_age_hours()
+        refresh_age_h = float(s.ml_gate_max_model_age_hours) * 0.75
+        if age_h is None or age_h < refresh_age_h:
+            result["total_resolved"] = total_resolved
+            result["since_last_train"] = since_last_train
+            return result
+        result["retrain_trigger"] = "staleness"
 
     train_result = train_signal_quality_model()
     train_result["labeled"] = int(labeled)
     train_result["new_labels"] = int(new_labels)
     train_result["total_resolved"] = total_resolved
     train_result["since_last_train"] = since_last_train
+    if result.get("retrain_trigger"):
+        train_result["retrain_trigger"] = result["retrain_trigger"]
     if train_result.get("status") == "ok":
         storage.kv_set(_LAST_TRAINED_RESOLVED_KEY, total_resolved)
     return train_result

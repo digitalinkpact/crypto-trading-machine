@@ -16,6 +16,7 @@ def learning_enabled(monkeypatch):
             ml_learning_enabled=True,
             ml_min_new_labels=50,
             ml_min_training_samples=200,
+            ml_gate_max_model_age_hours=72,
         ),
     )
 
@@ -77,12 +78,51 @@ async def test_run_learning_cycle_skips_when_cumulative_labels_below_threshold(
         return {"status": "ok"}
 
     monkeypatch.setattr(trainer, "train_signal_quality_model", _fake_train)
+    # Fresh model -> no staleness retrain, so the label-threshold skip holds.
+    monkeypatch.setattr(trainer, "_current_model_age_hours", lambda: 1.0)
 
     result = await trainer.run_learning_cycle()
 
     assert result["status"] == "labeled_only"
     assert result["since_last_train"] == 25
     assert called["train"] is False
+
+
+async def test_run_learning_cycle_retrains_when_model_stale_despite_few_labels(
+    monkeypatch, learning_enabled
+):
+    """A model older than 0.75x the gate staleness window must retrain even with
+    too few new labels, else an idle bot deadlocks on the stale-model gate."""
+    async def _fake_label_matured_signal_events(limit=1000):
+        return 1
+
+    monkeypatch.setattr(trainer, "label_matured_signal_events", _fake_label_matured_signal_events)
+
+    counts = iter([100, 105])  # since_last_train = 25 < ml_min_new_labels (50)
+    monkeypatch.setattr(trainer.storage, "count_resolved_signal_events", lambda: next(counts))
+    monkeypatch.setattr(trainer.storage, "latest_model_version", lambda _name: 9)
+    monkeypatch.setattr(
+        trainer.storage,
+        "kv_get",
+        lambda key, default=0: 80 if key == "ml_last_trained_resolved_count" else default,
+    )
+    monkeypatch.setattr(trainer.storage, "kv_set", lambda key, value: None)
+    # Model is well past 0.75 * 72h = 54h -> staleness retrain fires.
+    monkeypatch.setattr(trainer, "_current_model_age_hours", lambda: 480.0)
+
+    called = {"train": False}
+
+    def _fake_train():
+        called["train"] = True
+        return {"status": "ok", "version": 10}
+
+    monkeypatch.setattr(trainer, "train_signal_quality_model", _fake_train)
+
+    result = await trainer.run_learning_cycle()
+
+    assert called["train"] is True
+    assert result["status"] == "ok"
+    assert result.get("retrain_trigger") == "staleness"
 
 
 def test_min_win_edge_clears_round_trip_fees_plus_slippage():
