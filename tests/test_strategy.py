@@ -126,6 +126,54 @@ async def test_profitstream_btc_risk_off_is_soft_penalty(monkeypatch):
     assert "btc_trend_not_aligned_soft" in decision.reasons
 
 
+async def test_profitstream_bull_regime_pending_golden_cross_scores_high(monkeypatch):
+    """A confirmed-bull BTC regime whose EMA50/200 golden cross is still
+    forming must NOT hard-block entries. A strong oversold dip should still
+    clear the score threshold via the multi-factor regime (btc_aligned), even
+    though the lagging golden cross has not printed yet."""
+    strategy = ProfitStreamStrategy()
+    idx = pd.date_range("2026-01-01", periods=80, freq="1D", tz="UTC")
+    # ETH: oversold_bounce ready (rsi<40, close below lower band, off 5-day low).
+    lows = [90.0] * 75 + [85.0, 86.0, 87.0, 88.0, 89.0]  # 5-day low = 85
+    eth_df = pd.DataFrame(
+        {
+            "open": [95.0] * 80, "high": [95.0] * 80, "low": lows, "close": [95.0] * 80,
+            "volume": [10.0] * 80, "quote_volume": [1000.0] * 80,
+            "rsi_14": [25.0] * 80, "bb_lower": [96.0] * 80, "bb_mid": [105.0] * 80,
+            "ema_20": [95.0] * 80, "ema_50": [100.0] * 80, "ema_200": [95.0] * 80,
+        },
+        index=idx,
+    )
+    # BTC: price>EMA50 and EMA50 rising -> bull score, but EMA50<EMA200 (golden
+    # cross still forming, within the regime's 1% trend buffer -> trend vote 0).
+    ema50_series = [99000.0] * 75 + [99100.0, 99200.0, 99300.0, 99400.0, 99500.0]
+    btc_df = pd.DataFrame(
+        {
+            "open": [100500.0] * 80, "high": [100500.0] * 80, "low": [100500.0] * 80,
+            "close": [100500.0] * 80, "volume": [10.0] * 80, "quote_volume": [1e9] * 80,
+            "rsi_14": [55.0] * 80, "bb_lower": [95000.0] * 80, "bb_mid": [98000.0] * 80,
+            "ema_20": [100200.0] * 80, "ema_50": ema50_series, "ema_200": [100000.0] * 80,
+        },
+        index=idx,
+    )
+
+    async def _candles(self, symbol, interval, limit):
+        return eth_df if symbol == "ETHUSDT" else btc_df
+
+    monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: False, raising=True)
+
+    decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
+
+    assert decision.action == SignalAction.BUY
+    assert decision.indicators["btc_aligned"] is True
+    assert decision.indicators["btc_risk_on_1d"] is False  # golden cross not yet printed
+    assert decision.score >= 80
+    assert "btc_trend_not_aligned_soft" not in decision.reasons
+
+
 async def test_profitstream_buys_pullback_and_keeps_spread_filter(monkeypatch):
     strategy = ProfitStreamStrategy()
     frames = {

@@ -222,17 +222,24 @@ class ProfitStreamStrategy:
             filt_ok = False
             reasons.append(f"spread_wide:{spread_pct:.4%}>{max_spread_pct:.4%}")
 
+        # BTC trend alignment for scoring. Use the SAME multi-factor regime the
+        # market gate trusts, not only the lagging EMA50/200 golden cross: in a
+        # confirmed-bullish regime (score>=1) whose golden cross is still
+        # forming after a downturn, a strong local dip should still clear the
+        # score threshold. The market gate independently hard-blocks bear/weak-
+        # sideways regimes, so downside protection is unchanged.
+        btc_aligned = btc_risk_on or btc_regime.score >= 1
+        indicators["btc_aligned"] = btc_aligned
         btc_score_penalty = 0
-        if not btc_risk_on:
-            # Keep BTC trend context visible, but do not hard-reject entries.
-            # Apply only a small score penalty so trades can still flow.
+        if not btc_aligned:
+            # Soft penalty only — do not hard-reject entries.
             btc_score_penalty = 10
             reasons.append("btc_trend_not_aligned_soft")
 
         score = 0
         score += 70 if dip_ready else 0
         score += 60 if pullback_ready else 0
-        score += 20 if btc_risk_on else 0
+        score += 20 if btc_aligned else 0
         score += 10 if filt_ok else 0
         score -= btc_score_penalty
         score = _clamp(score, 0, 100)
