@@ -363,16 +363,17 @@ class Settings(BaseSettings):
     # execution/fees — only the entry condition differs — so any performance
     # difference measured between them (paper mode / forward test) can be
     # attributed to the entry logic itself, not confounded by other changes.
-    #   - "dip_buy" (current live default): RSI<30 AND close<=bb_lower.
-    #   - "oversold_bounce": looser dip-buy that also requires price already
-    #     off its 5-day low (not still in free-fall). Walk-forward evidence
-    #     (scripts/walkforward.py --market-filter) showed a materially higher
-    #     mean return than dip_buy across the folds tested, but on only 2
-    #     non-empty out-of-sample folds — not enough to replace the live
-    #     strategy outright. Use this switch to run it in PAPER mode alongside
-    #     the live dip_buy config for a real forward A/B before considering a
-    #     live swap.
-    entry_strategy: str = Field("dip_buy", pattern="^(dip_buy|oversold_bounce)$")
+    #   - "dip_buy" (legacy default): RSI<30 AND close<=bb_lower.
+    #   - "oversold_bounce" (current default): looser dip-buy that also
+    #     requires price already off its 5-day low (not still in free-fall).
+    #     Walk-forward evidence (scripts/walkforward.py --timeframe 1d --folds 3
+    #     --market-filter) has now confirmed it as the best entry across three
+    #     independent runs (2026-08-21, 2026-08-25, 2026-09-10): +18.1% mean /
+    #     +15.7% worst fold / 2-of-2 non-empty folds positive, versus dip_buy's
+    #     +11.6% / +9.6%, and it takes ~2x as many trades so more of the
+    #     universe becomes actionable. Set ENTRY_STRATEGY=dip_buy in .env to
+    #     revert to the tighter legacy entry.
+    entry_strategy: str = Field("oversold_bounce", pattern="^(dip_buy|oversold_bounce)$")
     oversold_bounce_rsi_max: float = Field(40.0, ge=1.0, le=99.0)
     oversold_bounce_bb_multiplier: float = Field(1.02, ge=1.0, le=1.20)
     oversold_bounce_min_bounce_pct: float = Field(0.05, ge=0.0, le=0.50)

@@ -29,6 +29,14 @@ def test_runtime_settings_loadable():
     assert 0.0 < s.kelly_fraction_cap <= 1.0
 
 
+def test_default_entry_strategy_is_oversold_bounce():
+    # Walk-forward evidence (2026-08-21/08-25/09-10) picked oversold_bounce as
+    # the best entry (+18.1% mean vs dip_buy +11.6%). Lock the code default so
+    # a regression can't silently revert to the weaker dip_buy entry.
+    s = Settings(_env_file=None)
+    assert s.entry_strategy == "oversold_bounce"
+
+
 def test_drawdown_breaker_default_tightened_by_real_data(monkeypatch):
     # Tightened 0.25->0.15 (2026-08-25): a replay of 250 real live closed
     # trades never realized more than 14.34% drawdown, so 0.15 gives a real

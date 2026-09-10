@@ -72,6 +72,9 @@ async def test_entry_strategy_switch_preserves_dip_variant_label(monkeypatch):
 
 
 async def test_profitstream_buys_daily_dip_with_btc_risk_on(monkeypatch):
+    import app.trading.strategy as strategy_module
+    from app.config import get_settings as real_get_settings
+
     strategy = ProfitStreamStrategy()
     frames = {
         ("ETHUSDT", "1d"): _frame(close=90, rsi=25, bb_lower=95, bb_mid=105, ema50=100, ema200=95),
@@ -86,6 +89,10 @@ async def test_profitstream_buys_daily_dip_with_btc_risk_on(monkeypatch):
     monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: False, raising=True)
+    # This test exercises the tighter dip_buy entry on a flat synthetic frame
+    # (no 5-day-low bounce), so pin the variant regardless of the live default.
+    real = real_get_settings()
+    monkeypatch.setattr(strategy_module, "get_settings", lambda: real.model_copy(update={"entry_strategy": "dip_buy"}))
 
     decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
 
@@ -94,6 +101,9 @@ async def test_profitstream_buys_daily_dip_with_btc_risk_on(monkeypatch):
 
 
 async def test_profitstream_btc_risk_off_is_soft_penalty(monkeypatch):
+    import app.trading.strategy as strategy_module
+    from app.config import get_settings as real_get_settings
+
     strategy = ProfitStreamStrategy()
     frames = {
         ("ETHUSDT", "1d"): _frame(close=90, rsi=25, bb_lower=95, bb_mid=105, ema50=100, ema200=95),
@@ -107,6 +117,8 @@ async def test_profitstream_btc_risk_off_is_soft_penalty(monkeypatch):
     monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: False, raising=True)
+    real = real_get_settings()
+    monkeypatch.setattr(strategy_module, "get_settings", lambda: real.model_copy(update={"entry_strategy": "dip_buy"}))
 
     decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
 
@@ -390,6 +402,9 @@ async def test_profitstream_rejects_falling_knife_extension(monkeypatch):
 
 async def test_profitstream_allows_modest_dip_within_extension_band(monkeypatch):
     """A modest pullback (within max_dip_extension_pct) must still buy."""
+    import app.trading.strategy as strategy_module
+    from app.config import get_settings as real_get_settings
+
     strategy = ProfitStreamStrategy()
     frames = {
         # close=90 is 10% below ema20=100 — inside the default 15% band.
@@ -404,6 +419,8 @@ async def test_profitstream_allows_modest_dip_within_extension_band(monkeypatch)
     monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: False, raising=True)
+    real = real_get_settings()
+    monkeypatch.setattr(strategy_module, "get_settings", lambda: real.model_copy(update={"entry_strategy": "dip_buy"}))
 
     decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
 
