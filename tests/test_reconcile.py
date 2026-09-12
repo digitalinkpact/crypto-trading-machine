@@ -134,3 +134,53 @@ async def test_reconcile_untracked_position_triggers_emergency_halt(monkeypatch)
     assert result["mismatched"] == 1
     assert len(halt_calls) == 1
     assert halt_calls[0][1] == "new_entries_blocked"
+
+
+async def test_reconcile_tolerates_exchange_surplus_dust(monkeypatch):
+    """Exchange holds slightly MORE than the book (pre-existing dust / fee
+    rounding) — the position is fully coverable, so this must NOT count as a
+    mismatch and must never halt trading on startup."""
+    async def _surplus_snapshot(**_kwargs):
+        return {
+            "all_balances": {"TRX": Decimal("30.0249"), "USDT": Decimal("10")},
+            "holdings": [
+                {"asset": "TRX", "qty": Decimal("30.0249"),
+                 "price_usdt": Decimal("0.34"), "value_usdt": Decimal("10.2")},
+            ],
+        }
+
+    monkeypatch.setattr(reconcile_module, "portfolio_snapshot", _surplus_snapshot)
+    monkeypatch.setattr(
+        reconcile_module.storage, "all_positions",
+        lambda: [{"symbol": "TRXUSDT", "mode": "live", "qty": 30.0, "entry_price": 0.34}],
+    )
+
+    result = await reconcile_positions(mode="live")
+
+    assert result["mismatched"] == 0
+    assert result["kept"] == 1
+
+
+async def test_reconcile_flags_material_shortfall(monkeypatch):
+    """Exchange holds materially LESS than the book (can't fully exit) — a real
+    problem that must still be flagged."""
+    async def _shortfall_snapshot(**_kwargs):
+        return {
+            "all_balances": {"TRX": Decimal("20.0"), "USDT": Decimal("10")},
+            "holdings": [
+                {"asset": "TRX", "qty": Decimal("20.0"),
+                 "price_usdt": Decimal("0.34"), "value_usdt": Decimal("6.8")},
+            ],
+        }
+
+    monkeypatch.setattr(reconcile_module, "portfolio_snapshot", _shortfall_snapshot)
+    monkeypatch.setattr(
+        reconcile_module.storage, "all_positions",
+        lambda: [{"symbol": "TRXUSDT", "mode": "live", "qty": 30.0, "entry_price": 0.34}],
+    )
+
+    result = await reconcile_positions(mode="live")
+
+    assert result["mismatched"] == 1
+    assert result["kept"] == 0
+

@@ -42,6 +42,9 @@ async def reconcile_positions(mode: str) -> dict[str, int]:
     kept = 0
     mismatched = 0
 
+    from app.config import get_settings
+
+    tol_pct = Decimal(str(getattr(get_settings(), "reconcile_qty_shortfall_tolerance_pct", 0.01)))
     for pos in open_positions:
         symbol = str(pos["symbol"])
         base = symbol.removesuffix("USDT")
@@ -51,14 +54,25 @@ async def reconcile_positions(mode: str) -> dict[str, int]:
             log.critical("reconcile found stale local position: %s mode=%s", symbol, mode)
         else:
             book_qty = Decimal(str(pos.get("qty") or 0))
-            if book_qty != have:
+            # Only a genuine SHORTFALL (exchange holds materially less than the
+            # book, so the position can't be fully exited) is a real problem.
+            # A surplus (exchange >= book, from pre-existing dust or fee-rounding)
+            # is safe — risk exits sell the full free balance — and must not halt
+            # trading. Tolerate tiny shortfalls (taker fee skims the base asset).
+            shortfall = book_qty - have
+            if book_qty > 0 and shortfall > book_qty * tol_pct:
                 mismatched += 1
                 log.critical(
-                    "reconcile quantity mismatch: %s mode=%s local=%s exchange=%s",
+                    "reconcile quantity mismatch: %s mode=%s local=%s exchange=%s (shortfall)",
                     symbol, mode, book_qty, have,
                 )
             else:
                 kept += 1
+                if book_qty != have:
+                    log.info(
+                        "reconcile benign qty delta: %s mode=%s local=%s exchange=%s",
+                        symbol, mode, book_qty, have,
+                    )
 
     adopted = 0
     tracked_bases = {str(p["symbol"]).removesuffix("USDT") for p in open_positions}

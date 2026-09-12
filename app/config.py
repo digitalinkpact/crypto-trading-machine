@@ -556,6 +556,10 @@ class Settings(BaseSettings):
     # Count exchange-order failures over this lookback and alert/escalate at max.
     health_order_failure_lookback_minutes: int = Field(30, ge=1, le=1_440)
     health_order_failure_max: int = Field(3, ge=1, le=1_000)
+    # Reconciliation flags a position only when the exchange holds materially
+    # LESS than the book (can't fully exit) by more than this fraction; surplus
+    # dust / fee-rounding on the safe side never trips the startup halt.
+    reconcile_qty_shortfall_tolerance_pct: float = Field(0.01, ge=0.0, le=0.10)
     # Resource pressure warnings surfaced by watchdog.
     health_memory_rss_warn_mb: float = Field(1_024.0, ge=128.0, le=65_536.0)
     health_cpu_warn_pct: float = Field(90.0, ge=1.0, le=4_000.0)
