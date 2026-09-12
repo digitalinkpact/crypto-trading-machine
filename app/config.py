@@ -549,6 +549,10 @@ class Settings(BaseSettings):
     health_latency_warn_seconds: float = Field(3.0, ge=0.1, le=120.0)
     # Detect near-simultaneous duplicate order candidates (same symbol/side/mode).
     health_duplicate_order_window_seconds: int = Field(45, ge=1, le=600)
+    # Only inspect orders newer than this for the duplicate check — a duplicate
+    # from hours ago is stale history, not an active fault, and must never keep
+    # the emergency halt pinned on.
+    health_duplicate_order_lookback_minutes: int = Field(15, ge=1, le=1_440)
     # Count exchange-order failures over this lookback and alert/escalate at max.
     health_order_failure_lookback_minutes: int = Field(30, ge=1, le=1_440)
     health_order_failure_max: int = Field(3, ge=1, le=1_000)

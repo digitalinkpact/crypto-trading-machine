@@ -172,6 +172,8 @@ def _check_duplicate_orders() -> tuple[bool, str]:
     canary for that class of bug."""
     s = get_settings()
     window = timedelta(seconds=s.health_duplicate_order_window_seconds)
+    lookback_minutes = getattr(s, "health_duplicate_order_lookback_minutes", 15)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
     try:
         orders = storage.recent_orders(limit=50)
     except Exception as e:  # noqa: BLE001
@@ -184,6 +186,8 @@ def _check_duplicate_orders() -> tuple[bool, str]:
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
         except (KeyError, ValueError):
+            continue
+        if ts < cutoff:
             continue
         key = (o.get("mode", ""), o.get("symbol", ""), o.get("side", ""))
         prev = seen.get(key)

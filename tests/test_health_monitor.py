@@ -36,6 +36,21 @@ def test_check_duplicate_orders_ignores_different_symbols(monkeypatch):
     assert dup is False
 
 
+def test_check_duplicate_orders_ignores_stale_pair_outside_lookback(monkeypatch):
+    # Two near-simultaneous orders but from hours ago: stale history, not an
+    # active fault. Must not report a duplicate (else it pins the emergency halt).
+    from datetime import datetime, timedelta, timezone
+    old = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+    orders = [
+        {"ts": old, "mode": "live", "symbol": "DASHUSDT", "side": "BUY"},
+        {"ts": old, "mode": "live", "symbol": "DASHUSDT", "side": "BUY"},
+    ]
+    monkeypatch.setattr(health.storage, "recent_orders", lambda limit=50: orders)
+
+    dup, _detail = health._check_duplicate_orders()
+    assert dup is False
+
+
 def test_check_failed_orders_counts_exchange_rejections_only(monkeypatch):
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
