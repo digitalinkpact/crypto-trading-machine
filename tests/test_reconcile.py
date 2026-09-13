@@ -39,16 +39,25 @@ async def test_reconcile_closes_stale_db_position_with_no_real_balance(monkeypat
     closed_calls = []
     monkeypatch.setattr(
         reconcile_module.storage, "close_position",
-        lambda **kw: closed_calls.append(kw),
+        lambda **kw: (closed_calls.append(kw) or {"symbol": kw["symbol"]}),
     )
     monkeypatch.setattr(reconcile_module.storage, "open_position", lambda **kw: None)
+    import app.trading.risk as risk_module
+    for name in ("clear_hwm", "clear_tp1", "clear_tp2"):
+        monkeypatch.setattr(risk_module, name, lambda *_a, **_k: None)
 
     result = await reconcile_positions(mode="live")
 
-    assert result["closed"] == 0
+    # Phantom row (exchange holds 0) is now auto-closed at its entry price so it
+    # can never reach a risk-exit and fabricate PnL. ZEC below is the separate
+    # untracked-holding mismatch, so mismatched counts both.
+    assert result["closed"] == 1
     assert result["adopted"] == 0
     assert result["mismatched"] == 2
-    assert closed_calls == []
+    assert len(closed_calls) == 1
+    assert closed_calls[0]["symbol"] == "SOLUSDT"
+    assert closed_calls[0]["exit_reason"] == "reconcile_stale"
+    assert Decimal(str(closed_calls[0]["exit_price"])) == Decimal("100.0")
 
 
 async def test_reconcile_adopts_untracked_exchange_holding(monkeypatch):

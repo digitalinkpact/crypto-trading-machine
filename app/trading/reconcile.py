@@ -52,6 +52,31 @@ async def reconcile_positions(mode: str) -> dict[str, int]:
         if have <= 0:
             mismatched += 1
             log.critical("reconcile found stale local position: %s mode=%s", symbol, mode)
+            # The exchange holds none of this — the book row is phantom. Left
+            # alone it eventually reaches a risk-exit that closes it at the
+            # CURRENT price on the book qty, fabricating PnL on coins we don't
+            # hold (root cause of the `*_stale_dust` phantom-PnL leak). Close it
+            # here at its entry price so realized PnL is ~0 and the slot frees.
+            if getattr(get_settings(), "reconcile_auto_close_stale", True):
+                try:
+                    from app.trading import risk  # local import: avoid cycle
+
+                    entry_price = Decimal(str(pos.get("entry_price") or 0))
+                    closed_row = storage.close_position(
+                        symbol=symbol, mode=mode, exit_price=entry_price,
+                        exit_reason="reconcile_stale",
+                    )
+                    if closed_row is not None:
+                        closed += 1
+                        risk.clear_hwm(symbol)
+                        risk.clear_tp1(symbol)
+                        risk.clear_tp2(symbol)
+                        log.warning(
+                            "reconcile auto-closed phantom position %s mode=%s at entry=%s (~0 PnL)",
+                            symbol, mode, entry_price,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("reconcile auto-close failed for %s: %s", symbol, exc)
         else:
             book_qty = Decimal(str(pos.get("qty") or 0))
             # Only a genuine SHORTFALL (exchange holds materially less than the

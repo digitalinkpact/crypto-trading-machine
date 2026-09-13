@@ -164,15 +164,35 @@ class ExitDecision:
     reason: str  # "stop_loss" | "take_profit" | "trailing_stop" | "max_hold"
 
 
+def dynamic_stop_pct(atr_pct: Optional[float]) -> Decimal:
+    """Hard-stop distance for a position, as a positive fraction.
+
+    Returns an ATR-scaled stop (atr_stop_multiple x atr_pct) clamped to
+    [atr_stop_min_pct, atr_stop_max_pct] when ATR stops are enabled and the
+    coin's ATR% is known. Falls back to the fixed `stop_loss_pct` otherwise, so
+    a missing ATR never widens or removes the stop unexpectedly.
+    """
+    s = get_settings()
+    fixed = Decimal(str(s.stop_loss_pct))
+    if not getattr(s, "atr_stop_enabled", False) or not atr_pct or atr_pct <= 0:
+        return fixed
+    raw = Decimal(str(getattr(s, "atr_stop_multiple", 2.0))) * Decimal(str(atr_pct))
+    lo = Decimal(str(getattr(s, "atr_stop_min_pct", 0.02)))
+    hi = Decimal(str(getattr(s, "atr_stop_max_pct", 0.08)))
+    return max(lo, min(hi, raw))
+
+
 def evaluate_exits(
     *,
     positions: list[dict],
     prices: dict[str, Decimal],
+    atr_pct: Optional[dict[str, float]] = None,
     now: Optional[datetime] = None,
 ) -> list[ExitDecision]:
     """Inspect every open position; return ones that hit a hard exit rule."""
     s = get_settings()
     now = now or datetime.now(timezone.utc)
+    atr_pct = atr_pct or {}
     out: list[ExitDecision] = []
 
     for pos in positions:
@@ -192,8 +212,9 @@ def evaluate_exits(
 
         change = (price - entry) / entry  # positive = gain, negative = loss
 
-        # 1. Hard stop-loss
-        if change <= Decimal(str(-s.stop_loss_pct)):
+        # 1. Hard stop-loss — ATR-scaled distance (falls back to fixed stop).
+        stop_frac = dynamic_stop_pct(atr_pct.get(symbol))
+        if change <= -stop_frac:
             out.append(ExitDecision(symbol, qty, "stop_loss"))
             continue
 
@@ -215,7 +236,10 @@ def evaluate_exits(
 
         # 3. Trailing stop (arm only after position gains the configured threshold)
         trail_activation = Decimal(str(getattr(s, "trailing_activation_pct", s.take_profit_pct / 2)))
-        if hwm > entry * (Decimal("1") + trail_activation):
+        # Delayed trailing: don't arm until TP1 has banked partial profit, so a
+        # +2% wiggle can't exit a would-be winner near breakeven.
+        trail_armed = (not getattr(s, "trailing_requires_tp1", False)) or tp1_taken(symbol)
+        if trail_armed and hwm > entry * (Decimal("1") + trail_activation):
             trail_floor = hwm * (Decimal("1") - Decimal(str(s.trailing_stop_pct)))
             if price <= trail_floor:
                 out.append(ExitDecision(symbol, qty, "trailing_stop"))

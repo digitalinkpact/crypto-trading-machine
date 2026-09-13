@@ -56,6 +56,10 @@ _CIRCUIT_BREAKER_FAILURE_KEY = "circuit_breaker_check_failed"
 _FILTERS_HALT_KEY = "exchange_filters_unavailable"
 _ML_GATE_HALT_KEY = "ml_gate_unavailable"
 
+# Exit reasons that sell only a fraction of the position (the TP scale-out
+# ladder). Every other reason is a full exit that flattens the free balance.
+_PARTIAL_EXIT_REASONS = frozenset({"take_profit_1", "take_profit_2"})
+
 
 @dataclass
 class AutopilotState:
@@ -436,12 +440,18 @@ class Autopilot:
                 log.error("failed to engage halt after balance verification failure: %s", halt_exc)
             return
         prices: dict[str, Decimal] = {}
+        atr_by_symbol: dict[str, float] = {}
         for pos in positions:
             try:
                 prices[pos["symbol"]] = await self._price(pos["symbol"])
             except Exception as exc:  # noqa: BLE001
                 log.warning("price fetch failed for %s: %s", pos["symbol"], exc)
-        exits = risk.evaluate_exits(positions=positions, prices=prices)
+            # Best-effort ATR% drives the ATR-scaled hard stop; a None here just
+            # falls back to the fixed stop_loss_pct inside evaluate_exits.
+            atr = await self._atr_pct(pos["symbol"])
+            if atr is not None:
+                atr_by_symbol[pos["symbol"]] = atr
+        exits = risk.evaluate_exits(positions=positions, prices=prices, atr_pct=atr_by_symbol)
         for ex in exits:
             try:
                 price = prices.get(ex.symbol) or await self._price(ex.symbol)
@@ -462,13 +472,20 @@ class Autopilot:
                 # a stale entry, etc.) the exit must still flatten the WHOLE
                 # real holding — otherwise the surplus is silently stranded
                 # with no further stop-loss/take-profit coverage forever.
-                if avail is not None and avail > ex.qty:
-                    log.warning(
-                        "risk-exit %s: free=%s exceeds tracked book=%s — "
-                        "selling the full free balance so nothing is left "
-                        "stranded untracked", ex.symbol, avail, ex.qty,
-                    )
-                sell_qty = ex.qty if avail is None else avail
+                # EXCEPT partial take-profit slices (TP1/TP2): those must sell
+                # only their slice so the remainder rides to the next rung.
+                # Overriding them with the full free balance flattens the whole
+                # position at TP1 and the ladder never reaches TP2/trailing.
+                if avail is not None and ex.reason in _PARTIAL_EXIT_REASONS:
+                    sell_qty = min(ex.qty, avail)
+                else:
+                    if avail is not None and avail > ex.qty:
+                        log.warning(
+                            "risk-exit %s: free=%s exceeds tracked book=%s — "
+                            "selling the full free balance so nothing is left "
+                            "stranded untracked", ex.symbol, avail, ex.qty,
+                        )
+                    sell_qty = ex.qty if avail is None else avail
                 qty = filters.round_qty(ex.symbol, sell_qty)
                 if qty <= 0 or not filters.meets_min(ex.symbol, qty, price):
                     # Nothing sellable (dust below min-notional, or the balance
@@ -480,8 +497,18 @@ class Autopilot:
                             "below min — closing stale position", ex.symbol, ex.qty, avail,
                         )
                         try:
+                            # The exchange holds ~none of this — the book row is
+                            # phantom. Booking at the current price fabricates a
+                            # win/loss on a position we don't actually hold, which
+                            # corrupts realized PnL, win-rate and agent stats.
+                            # Close at the entry price so realized PnL is ~0
+                            # (bookkeeping cleanup, not a real trade).
+                            stale_pos = storage.get_position(ex.symbol)
+                            book_exit_price = Decimal(
+                                str((stale_pos or {}).get("entry_price") or price)
+                            )
                             storage.close_position(
-                                symbol=ex.symbol, exit_price=price,
+                                symbol=ex.symbol, exit_price=book_exit_price,
                                 exit_reason=f"{ex.reason}_stale_dust",
                             )
                             risk.clear_hwm(ex.symbol)

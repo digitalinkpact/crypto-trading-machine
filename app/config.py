@@ -258,7 +258,17 @@ class Settings(BaseSettings):
     orderbook_retry_attempts: int = Field(3, ge=1, le=10)
 
     # Exit gates (hard rules, evaluated every risk-tick)
-    stop_loss_pct: float = Field(0.015, ge=0.005, le=0.20)       # 1.5% hard stop (unchanged this pass — see MAE/MFE note)
+    stop_loss_pct: float = Field(0.015, ge=0.005, le=0.20)       # fixed fallback stop when ATR stop is off / ATR unknown
+    # ATR-based hard stop. A fixed 1.5% stop sits inside daily crypto noise —
+    # positions get shaken out before the thesis develops, which mechanically
+    # forces a low win-rate. When enabled, the stop scales with the coin's own
+    # daily ATR (stop = atr_stop_multiple * atr_pct) clamped to a sane band, so
+    # quiet coins get a tight stop and volatile coins get room to breathe.
+    # Falls back to stop_loss_pct when disabled or ATR is unavailable.
+    atr_stop_enabled: bool = True
+    atr_stop_multiple: float = Field(2.0, ge=0.5, le=6.0)        # stop distance = N x daily ATR%
+    atr_stop_min_pct: float = Field(0.02, ge=0.005, le=0.20)     # never tighter than 2%
+    atr_stop_max_pct: float = Field(0.08, ge=0.01, le=0.50)      # never wider than 8%
     take_profit_pct: float = Field(0.05, ge=0.005, le=0.50)      # 5% take-profit (unused by the
     # live TP1/TP2 ladder below; kept only as a display value + the
     # trailing_activation_pct getattr fallback in risk.py — do not read it
@@ -276,6 +286,12 @@ class Settings(BaseSettings):
     # the more robust choice per "prefer ranges over one curve-fitted value".
     trailing_stop_pct: float = Field(0.02, ge=0.005, le=0.20)    # 2.0% trail from HWM
     trailing_activation_pct: float = Field(0.02, ge=0.005, le=0.50)  # arm trailing after +2%
+    # Delayed trailing: only arm the trailing stop after TP1 (+8%) has banked
+    # partial profit, instead of at the bare +2% activation. A +2% arm with a
+    # 2% trail exits winners near breakeven on any wiggle, capping trades before
+    # they reach TP1/TP2. With this on, the runner rides the (wider) hard stop
+    # until real profit is booked, then the trail protects the remainder.
+    trailing_requires_tp1: bool = True
     # TP1/TP2 scale-out ladder actually used by risk.evaluate_exits(). These
     # fields had been silently dropped from Settings (same class of gap as
     # `min_trade_usdt`/`blocked_symbols` found in the 2026-08-25 audit) while
@@ -560,6 +576,11 @@ class Settings(BaseSettings):
     # LESS than the book (can't fully exit) by more than this fraction; surplus
     # dust / fee-rounding on the safe side never trips the startup halt.
     reconcile_qty_shortfall_tolerance_pct: float = Field(0.01, ge=0.0, le=0.10)
+    # When the exchange holds NONE of a booked position (phantom row), close it
+    # at its entry price (~0 realized PnL) instead of leaving it to reach a
+    # risk-exit that would fabricate PnL on qty we don't hold. Off = legacy
+    # read-only behavior (flag-only).
+    reconcile_auto_close_stale: bool = True
     # Resource pressure warnings surfaced by watchdog.
     health_memory_rss_warn_mb: float = Field(1_024.0, ge=128.0, le=65_536.0)
     health_cpu_warn_pct: float = Field(90.0, ge=1.0, le=4_000.0)
