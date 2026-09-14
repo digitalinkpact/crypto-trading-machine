@@ -114,7 +114,12 @@ class ProfitStreamStrategy:
             }
         )
 
-        if held and exit_ready:
+        if held and exit_ready and s.mean_reversion_exit_enabled:
+            # Disabled by default (2026-09-14): this intraday RSI-recovery exit
+            # was the most common LIVE exit and capped winners at ~+0.46% avg,
+            # pre-empting the far more profitable TP/trailing ladder. When off,
+            # held positions are managed only by the risk ladder. See
+            # Settings.mean_reversion_exit_enabled.
             # Evidence (scripts/daily_forensic_report.py against real live
             # trade history, both a 90-day and a 5-day post-deploy window):
             # this RSI-recovery exit was by FAR the worst-performing exit

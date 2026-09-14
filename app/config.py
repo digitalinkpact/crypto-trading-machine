@@ -286,12 +286,17 @@ class Settings(BaseSettings):
     # the more robust choice per "prefer ranges over one curve-fitted value".
     trailing_stop_pct: float = Field(0.02, ge=0.005, le=0.20)    # 2.0% trail from HWM
     trailing_activation_pct: float = Field(0.02, ge=0.005, le=0.50)  # arm trailing after +2%
-    # Delayed trailing: only arm the trailing stop after TP1 (+8%) has banked
-    # partial profit, instead of at the bare +2% activation. A +2% arm with a
-    # 2% trail exits winners near breakeven on any wiggle, capping trades before
-    # they reach TP1/TP2. With this on, the runner rides the (wider) hard stop
-    # until real profit is booked, then the trail protects the remainder.
-    trailing_requires_tp1: bool = True
+    # Arm the trailing stop as soon as a position gains `trailing_activation_pct`
+    # (+2%), WITHOUT waiting for the +8% TP1 to bank first. Live forensics
+    # (2026-09-14): on thin Binance.US, +8% moves are rare — take_profit_1 fired
+    # only twice ever, while trailing_stop was the single largest winner bucket.
+    # Requiring TP1 first therefore left the common +2-6% winners with NO profit
+    # protection: they rode the hard stop back down or gave the gain back to the
+    # stale/max-hold exit near breakeven. Arming at +2% lets the trail protect a
+    # run-up in proportion to how far it ran (this is the config the profitable
+    # walk-forward/strategy_lab backtest actually models). Set True to restore
+    # the delayed-trailing behavior.
+    trailing_requires_tp1: bool = False
     # TP1/TP2 scale-out ladder actually used by risk.evaluate_exits(). These
     # fields had been silently dropped from Settings (same class of gap as
     # `min_trade_usdt`/`blocked_symbols` found in the 2026-08-25 audit) while
@@ -369,6 +374,18 @@ class Settings(BaseSettings):
     # gate (recorded as exit_reason="mean_reversion_rsi").
     mean_reversion_exit_require_momentum_confirmation: bool = True
     mean_reversion_exit_require_price_confirmation: bool = True
+    # Master switch for the intraday RSI-recovery ("mean reversion") SELL signal.
+    # DISABLED by default (2026-09-14): live forensics showed this exit — which
+    # runs on intraday prices via the strategy tick / 15s risk loop — was the
+    # MOST COMMON live exit and closed winners at an average of only +0.46%
+    # (max +1.74%), pre-empting the TP1/TP2/trailing ladder. Per-trade it earned
+    # ~$0.074 vs ~$0.27 (trailing) and ~$1.35 (take-profit): the same positions,
+    # left to ride the ladder, are far more profitable (daily backtest avg_win
+    # +13.84% vs the capped +1.24% seen live). With this off, a held position is
+    # only ever exited by the risk ladder (stop-loss/TP/trailing/stale/max-hold),
+    # never scalped early on a bare RSI bounce. Set True to restore the
+    # confirmation-gated signal exit (its min-PnL/confirmation knobs still apply).
+    mean_reversion_exit_enabled: bool = False
     # Once a position has already run up to the trailing-stop's own activation
     # threshold (`trailing_activation_pct`), prefer letting the risk ladder
     # (TP1/TP2/trailing) manage it instead of closing early on this signal —
