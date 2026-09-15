@@ -1407,6 +1407,27 @@ class Autopilot:
                     # an extra bonus bar above the normal threshold.
                     regime_score = self._last_regime_score
                     _entry(symbol, sig)["btc_regime_score"] = regime_score
+                    # Optional stricter mode: only enter in STRONG_BULL (score>=2).
+                    if getattr(s, "require_strong_bull_regime", False) and regime_score < 2:
+                        _set_filter(
+                            symbol,
+                            "strong_bull_regime",
+                            False,
+                            f"btc_regime_score={regime_score}<2 (strong-bull-only mode)",
+                            sig,
+                        )
+                        _finish(
+                            symbol,
+                            "strong_bull_regime",
+                            f"btc_regime_score={regime_score}<2 requires STRONG_BULL",
+                            submitted=False,
+                            sig=sig,
+                        )
+                        log.info(
+                            "skip %s BUY: strong-bull-only mode (regime score %s<2)",
+                            symbol, regime_score,
+                        )
+                        continue
                     if regime_score == 0:
                         bonus = int(getattr(s, "market_regime_sideways_score_bonus", 15))
                         required_score = int(getattr(s, "profitstream_score_threshold", 80)) + bonus

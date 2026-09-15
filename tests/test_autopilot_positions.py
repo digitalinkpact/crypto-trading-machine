@@ -1050,6 +1050,78 @@ async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
     assert info["submitted"] is False
 
 
+async def test_strong_bull_regime_mode_blocks_weak_bull(monkeypatch):
+    ap = Autopilot()
+    ap.state.mode = "live"
+
+    class _Settings:
+        min_signal_confidence = 0.55
+        dynamic_threshold_enabled = False
+        ml_gate_enabled = False
+        buy_cooldown_minutes = 30
+        aggressive_mode_enabled = False
+        max_position_pct = 0.05
+        require_strong_bull_regime = True
+        market_regime_sideways_score_bonus = 15
+        profitstream_score_threshold = 80
+
+    captured = {}
+
+    async def _fake_snapshot(*, mode):
+        return {
+            "usdt_cash": Decimal("100"),
+            "total_usdt": Decimal("100"),
+            "all_balances": {"USDT": Decimal("100")},
+        }
+
+    async def _fake_count(*_a, **_k):
+        return 0, set()
+
+    async def _fake_atr(_self, _symbol: str):
+        return 0.02
+
+    async def _fake_market_gate(_self):
+        _self._last_regime_score = 1  # weak BULL: gate allows, strong-bull mode blocks
+        return True, "BTC regime BULL score=1 risk-on"
+
+    async def _fake_price(_self, _symbol: str):
+        return Decimal("50")
+
+    def _capture(_self, counter, tick_debug, *, total):
+        captured["counter"] = dict(counter)
+        captured["tick_debug"] = tick_debug
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _Settings())
+    monkeypatch.setattr(autopilot_module, "portfolio_snapshot", _fake_snapshot)
+    monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [])
+    monkeypatch.setattr(autopilot_module.storage, "closed_trades", lambda limit=100: [])
+    monkeypatch.setattr(Autopilot, "_count_non_dust_positions", _fake_count, raising=True)
+    monkeypatch.setattr(Autopilot, "_atr_pct", _fake_atr, raising=True)
+    monkeypatch.setattr(Autopilot, "_market_gate", _fake_market_gate, raising=True)
+    monkeypatch.setattr(Autopilot, "_entry_block_reason", lambda _self: None, raising=True)
+    monkeypatch.setattr(Autopilot, "_price", _fake_price, raising=True)
+    monkeypatch.setattr(Autopilot, "_trend_gate", lambda *_a, **_k: __import__("asyncio").sleep(0, result=(True, "ok")), raising=True)
+    monkeypatch.setattr(Autopilot, "_funding_gate", lambda *_a, **_k: __import__("asyncio").sleep(0, result=(True, "ok")), raising=True)
+    monkeypatch.setattr(Autopilot, "_onchain_gate", lambda *_a, **_k: __import__("asyncio").sleep(0, result=(True, "ok")), raising=True)
+    monkeypatch.setattr(Autopilot, "_record_signal_event", lambda *_a, **_k: __import__("asyncio").sleep(0), raising=True)
+    monkeypatch.setattr(Autopilot, "_persist_skip_stats", _capture, raising=True)
+    monkeypatch.setattr(autopilot_module.filters, "is_listed", lambda _s: True, raising=True)
+
+    class _BuySig:
+        action = autopilot_module.SignalAction.BUY
+        confidence = 0.9
+        contributing_agents = ["test"]
+        timeframe = autopilot_module.Timeframe.D1
+
+    await ap._execute({"BTCUSDT": _BuySig()}, allow_buys=True)
+
+    info = captured["tick_debug"]["BTCUSDT"]
+    assert captured["counter"]["strong_bull_regime"] == 1
+    assert info["filters"]["strong_bull_regime"]["ok"] is False
+    assert info["final_reason"] == "strong_bull_regime"
+    assert info["submitted"] is False
+
+
 # ── stop-loss re-entry cooldown ─────────────────────────────────────────────
 
 

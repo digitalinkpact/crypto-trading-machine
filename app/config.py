@@ -432,6 +432,16 @@ class Settings(BaseSettings):
     # SIDEWAYS (score==0) allows entries only if the strategy's own quality
     # score clears this extra bonus above `profitstream_score_threshold`.
     market_regime_sideways_score_bonus: int = Field(15, ge=0, le=100)
+    # Optional stricter mode (default OFF): only take new longs when BTC's
+    # scored regime is STRONG_BULL (score>=2), blocking the merely-BULL
+    # (score==1) tier. Live evidence (2026-09-15, closed_trades split by the
+    # stored entry_btc_regime): every instrumented trade taken in STRONG_BULL
+    # was net-positive (90 trades, 65.6% win), while a retroactive regime
+    # recompute showed the plain-BULL bucket net-negative (21.9% win). This is
+    # a single-window observation, so it stays OFF by default — enable via
+    # REQUIRE_STRONG_BULL_REGIME=true in .env to trade fewer, higher-conviction
+    # setups (fewer trades / more time in cash). Exits are never affected.
+    require_strong_bull_regime: bool = False
 
     # ── Anti-chase / extension guard ──────────────────────────────────
     # A dip-buy that is too far *below* its EMA20 is more likely a falling
