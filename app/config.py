@@ -258,7 +258,13 @@ class Settings(BaseSettings):
     orderbook_retry_attempts: int = Field(3, ge=1, le=10)
 
     # Exit gates (hard rules, evaluated every risk-tick)
-    stop_loss_pct: float = Field(0.015, ge=0.005, le=0.20)       # fixed fallback stop when ATR stop is off / ATR unknown
+    # 0.015->0.04 (2026-09-16 R:R expectancy sweep, scripts/strategy_lab sim on
+    # 25 cached daily symbols, market filter ON): a 1.5% fixed stop sits inside
+    # daily crypto noise and shook out winners before the thesis developed,
+    # mechanically forcing a low win-rate. A ~4% stop lifted pooled win-rate
+    # 58%->69% AND expectancy +6.05%->+7.44%, improving BOTH walk-forward folds
+    # independently (not curve-fit). Only used when ATR stop is off/unknown.
+    stop_loss_pct: float = Field(0.04, ge=0.005, le=0.20)       # fixed fallback stop when ATR stop is off / ATR unknown
     # ATR-based hard stop. A fixed 1.5% stop sits inside daily crypto noise —
     # positions get shaken out before the thesis develops, which mechanically
     # forces a low win-rate. When enabled, the stop scales with the coin's own
@@ -267,7 +273,9 @@ class Settings(BaseSettings):
     # Falls back to stop_loss_pct when disabled or ATR is unavailable.
     atr_stop_enabled: bool = True
     atr_stop_multiple: float = Field(2.0, ge=0.5, le=6.0)        # stop distance = N x daily ATR%
-    atr_stop_min_pct: float = Field(0.02, ge=0.005, le=0.20)     # never tighter than 2%
+    # min floor 0.02->0.03 (2026-09-16 R:R sweep): keep the tightest ATR stops
+    # out of the shake-out zone the fixed-stop finding above identified.
+    atr_stop_min_pct: float = Field(0.03, ge=0.005, le=0.20)     # never tighter than 3%
     atr_stop_max_pct: float = Field(0.08, ge=0.01, le=0.50)      # never wider than 8%
     take_profit_pct: float = Field(0.05, ge=0.005, le=0.50)      # 5% take-profit (unused by the
     # live TP1/TP2 ladder below; kept only as a display value + the
@@ -284,8 +292,16 @@ class Settings(BaseSettings):
     # trailing_activation_pct's own sweep (2.0/2.5/3.0%) showed only a
     # marginal, inconsistent edge from moving off 2.0% — left unchanged as
     # the more robust choice per "prefer ranges over one curve-fitted value".
-    trailing_stop_pct: float = Field(0.02, ge=0.005, le=0.20)    # 2.0% trail from HWM
-    trailing_activation_pct: float = Field(0.02, ge=0.005, le=0.50)  # arm trailing after +2%
+    # trailing_stop_pct 0.02->0.03 and trailing_activation_pct 0.02->0.05
+    # (2026-09-16 R:R expectancy sweep): arming the trail only after +5% (above
+    # the ~4% stop, so a protected winner is already >=~2x the risk) and giving
+    # it 3% of room lets winners run instead of being scalped at +2-4%. Pooled
+    # avg_win rose and expectancy +6.05%->+7.44% with max losing streak 8->4 in
+    # the profitable fold; both folds improved. This trades a little of the old
+    # +2-6% winner protection for materially bigger runners (the user's explicit
+    # "let winners run / widen R:R" goal). Restore 0.02/0.02 to revert.
+    trailing_stop_pct: float = Field(0.03, ge=0.005, le=0.20)    # 3.0% trail from HWM
+    trailing_activation_pct: float = Field(0.05, ge=0.005, le=0.50)  # arm trailing after +5%
     # Arm the trailing stop as soon as a position gains `trailing_activation_pct`
     # (+2%), WITHOUT waiting for the +8% TP1 to bank first. Live forensics
     # (2026-09-14): on thin Binance.US, +8% moves are rare — take_profit_1 fired
