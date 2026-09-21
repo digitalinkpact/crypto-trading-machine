@@ -1,6 +1,7 @@
 """Scheduler wiring. Single AsyncIOScheduler shared by the FastAPI app."""
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -112,6 +113,46 @@ async def ml_learning_pass() -> None:
     log.info("ml learning pass: %s", result)
 
 
+async def weekly_verdict_pass() -> None:
+    """Stage 5 verdict → Stage 6 decision ledger + notifier.
+
+    Runs the verdict CLI's data collection in-process, persists the resulting
+    card to the ``experiment_decisions`` table, and (on PAUSE/REJECT/PROMOTE)
+    sends a notification via the configured notifier. Never touches orders.
+    """
+    from app.research.decision_ledger import record_and_notify
+    from app.research.experiment_verdict import unify_verdict
+
+    def _collect_and_unify():
+        try:
+            from scripts.weekly_verdict import (
+                _stage3_drift, _stage4_spread_and_benefit, _try_stage1,
+            )
+            from app.trading.experiment_stats import evaluate_promotion, load_live_trades
+        except Exception as exc:  # noqa: BLE001
+            log.warning("weekly verdict imports failed: %s", exc)
+            return unify_verdict()
+        stage1 = _try_stage1()
+        trades = load_live_trades()
+        stage2 = evaluate_promotion(trades) if trades else None
+        stage3 = _stage3_drift()
+        stage4_spread, stage4_benefit = _stage4_spread_and_benefit()
+        return unify_verdict(
+            stage1_summary=stage1,
+            stage2_verdict=stage2,
+            stage3_drift=stage3,
+            stage4_spread=stage4_spread,
+            stage4_maker_benefit_pct=stage4_benefit,
+        )
+
+    try:
+        card = await asyncio.to_thread(_collect_and_unify)
+        row = await asyncio.to_thread(record_and_notify, card)
+        log.info("weekly verdict: id=%s overall=%s", row.id, row.overall)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("weekly verdict pass failed: %s", exc)
+
+
 def build_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(refresh_market_data, CronTrigger(minute="*/15"), id="market_data")
@@ -119,5 +160,10 @@ def build_scheduler() -> AsyncIOScheduler:
     scheduler.add_job(llm_signal_pass, CronTrigger(minute="7"), id="llm_pass")
     scheduler.add_job(ml_learning_pass, CronTrigger(minute="12", hour="*/6"), id="ml_learning")
     scheduler.add_job(equity_snapshot, CronTrigger(minute="55"), id="equity_curve")
+    scheduler.add_job(
+        weekly_verdict_pass,
+        CronTrigger(day_of_week="mon", hour=9, minute=0),
+        id="weekly_verdict",
+    )
     return scheduler
 

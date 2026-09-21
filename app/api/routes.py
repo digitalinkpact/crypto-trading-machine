@@ -549,3 +549,26 @@ async def config_summary() -> dict:
         },
     }
 
+
+@router.get("/research/decisions")
+async def research_decisions(limit: int = 20) -> dict:
+    """Recent Stage 5 verdict cards persisted by the Stage 6 ledger."""
+    from app.research.decision_ledger import DecisionLedger
+    rows = DecisionLedger().list_recent(limit=max(1, min(limit, 200)))
+    return {
+        "count": len(rows),
+        "decisions": [
+            {
+                "id": r.id,
+                "ts": r.ts,
+                "overall": r.overall,
+                "reasons": r.reasons,
+                "concerns": r.concerns,
+                "recommendations": r.recommendations,
+                "inputs_present": r.inputs_present,
+                "notification_channel": r.notification_channel,
+            }
+            for r in rows
+        ],
+    }
+
