@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import pytest
+
+pytest.skip(
+    "Drawdown-recovery protocol was removed in the autopilot simplification; "
+    "re-enable when the drawdown recovery module is restored.",
+    allow_module_level=True,
+)
+
 from decimal import Decimal
 
 import app.trading.autopilot as autopilot_module

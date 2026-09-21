@@ -1,5 +1,5 @@
 """Sanity tests — never hit Binance.US from unit tests."""
-from app.config import SYMBOLS, TIMEFRAMES, Timeframe, get_settings
+from app.config import SYMBOLS, TIMEFRAMES, Settings, Timeframe
 
 
 def test_universe_size():
@@ -12,7 +12,9 @@ def test_timeframes():
 
 
 def test_settings_defaults_safe():
-    s = get_settings()
+    # Bypass any local .env so this asserts the *code* defaults, not the
+    # operator's live overrides.
+    s = Settings(_env_file=None)
     assert s.dry_run is True
     assert s.paper_trading is True
     assert 0.0 < s.kelly_fraction_cap <= 1.0

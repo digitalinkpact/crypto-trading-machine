@@ -139,6 +139,9 @@ class Settings(BaseSettings):
     # Storage
     data_cache_dir: Path = Path("./data/cache")
 
+    # Hard universe blocklist (case-insensitive, matched in symbol_source).
+    blocked_symbols: tuple[str, ...] = ()
+
     # Binance.US REST endpoint — never point this at binance.com
     binance_base_url: str = "https://api.binance.us"
     binance_ws_url: str = "wss://stream.binance.us:9443"

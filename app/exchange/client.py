@@ -114,6 +114,15 @@ class BinanceUSClient:
 
         log.info("Submitting order coid=%s symbol=%s side=%s", coid, symbol, side.value)
         raw = await asyncio.to_thread(self._spot.new_order, **params)
+        return self.order_from_raw(order, raw)
+
+    @staticmethod
+    def order_from_raw(order: Order, raw: dict[str, Any]) -> Order:
+        """Reconstruct a persisted Order from an exchange response payload.
+
+        Pure, no I/O — safe to use in tests and in the order-failure protocol
+        when re-hydrating an order that landed but whose HTTP round-trip failed.
+        """
         return order.model_copy(
             update={
                 "status": OrderStatus(raw.get("status", "NEW")),

@@ -13,6 +13,43 @@ import vectorbt as vbt  # type: ignore[import-untyped]
 from app.config import get_settings
 
 
+# vectorbt's `freq` argument must parse as a timedelta. Pandas offset aliases
+# like "W-SUN", "M", "Q-DEC" do NOT — they represent calendar anchors, not
+# durations. Map the common non-timedelta aliases to a durational equivalent.
+_FREQ_EQUIVALENT: dict[str, str] = {
+    "D": "1D",
+    "H": "1H",
+}
+_FREQ_PREFIX: dict[str, str] = {
+    "W": "7D",
+    "M": "30D",
+    "MS": "30D",
+    "Q": "90D",
+    "QS": "90D",
+    "A": "365D",
+    "AS": "365D",
+    "Y": "365D",
+    "YS": "365D",
+}
+
+
+def _as_timedelta_freq(freq: str) -> str:
+    """Return a duration-safe frequency string for vectorbt.
+
+    Passes through inputs that already parse as timedeltas ("1H", "4H", "1D").
+    Converts calendar-anchored offset aliases ("W-SUN", "M", "Q-DEC") to their
+    approximate duration equivalents.
+    """
+    if not freq:
+        return "1H"
+    if freq in _FREQ_EQUIVALENT:
+        return _FREQ_EQUIVALENT[freq]
+    head = freq.split("-", 1)[0]
+    if head in _FREQ_PREFIX:
+        return _FREQ_PREFIX[head]
+    return freq
+
+
 def run_vectorbt_backtest(
     df: pd.DataFrame,
     entries: pd.Series,
@@ -26,13 +63,14 @@ def run_vectorbt_backtest(
     if fees is None:
         # Market entries/exits — charge taker on both sides.
         fees = get_settings().binance_taker_fee
+    resolved_freq = _as_timedelta_freq(freq or pd.infer_freq(df.index) or "1H")
     kwargs: dict[str, Any] = {
         "close": df["close"],
         "entries": entries,
         "exits": exits,
         "init_cash": init_cash,
         "fees": fees,
-        "freq": freq or pd.infer_freq(df.index) or "1H",
+        "freq": resolved_freq,
     }
     if sl_stop is not None:
         kwargs["sl_stop"] = sl_stop
