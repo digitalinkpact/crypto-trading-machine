@@ -1,12 +1,10 @@
 # Project Guidelines — AI Crypto Trading Machine
 
-> **Status:** Active build-out. Core app is implemented under [app/](app/) with a
-> passing test suite in [tests/](tests/). Paths below describe the real layout —
-> keep this file in sync as the code evolves.
+> **Status:** Greenfield. Repo currently contains only [README.md](README.md) and [requirements.txt](requirements.txt). All paths below are *target* layout — create them as you go and update this file when reality diverges.
 
 ## What this project is
 
-AI-driven crypto trading system on **Binance.US**. Seven cooperating agents monitor a **dynamically-discovered USDT universe** (a 25-coin static list in `app/config.py` is the fallback) across **4 timeframes**, fuse TA + LLM reasoning + an ML regime classifier into signals, size positions with Kelly, and (optionally) gate trades through a `vectorbt`/`jesse` backtest before sending orders.
+AI-driven crypto trading system on **Binance.US**. Seven cooperating agents monitor **25 coins** across **4 timeframes**, fuse TA + LLM reasoning + an ML regime classifier into signals, size positions with Kelly, and (optionally) gate trades through a `vectorbt`/`jesse` backtest before sending orders.
 
 This is **money-handling code**. Bias every decision toward correctness, idempotency, and reversibility over cleverness or speed.
 
@@ -19,7 +17,7 @@ This is **money-handling code**. Bias every decision toward correctness, idempot
 | Scheduling | `apscheduler` 3.10 | |
 | Exchange (primary) | `binance-connector` 3.7 | Official; preferred |
 | Exchange (fallback) | `python-binance` 1.0.19 | Only if connector lacks an endpoint |
-| LLM | `openai` 1.30 SDK | v1 syntax. Multi-provider via OpenAI-compatible APIs: DeepSeek / OpenAI / Groq / Gemini / GitHub Models, selected by `LLM_PROVIDER`. See [app/llm/reasoner.py](app/llm/reasoner.py) |
+| LLM | `openai` 1.30 | v1 SDK syntax |
 | TA | `pandas` 2.2, `ta` 0.11, `numpy` 1.26.4 (`pandas-ta` optional) | `numpy<2` is required by `vectorbt`; `pandas-ta` 0.4 wants numpy≥2.2 → unpinned |
 | Backtesting | `vectorbt` 0.26, `jesse` (separate install) | |
 | Market data | `pycoingecko` 3.1; `openbb`, `cryptofeed` optional | |
@@ -32,24 +30,18 @@ Create modules on demand; keep boundaries strict.
 
 ```
 app/
-  agents/        # trading agents, one module each, sharing a base class
+  agents/        # 7 trading agents, one module each, sharing a base class
   exchange/      # Binance.US wrapper — the ONLY place that talks to the exchange
-                 # (client, filters, orderbook, derivatives, ws_stream, symbols)
-  data/          # OHLCV fetchers, on-chain flows, on-disk cache
+  data/          # OHLCV fetchers, websocket streams, on-disk cache
   ta/            # indicator pipelines (pandas-ta first, fall back to ta)
-  signals/       # cross-agent / cross-timeframe signal types + aggregation
-  regime/        # sklearn regime classifier + online learner
+  signals/       # cross-agent / cross-timeframe signal aggregation
+  regime/        # sklearn regime classifier (bull / bear / chop / …)
   sizing/        # Kelly fraction + risk caps
   backtest/      # vectorbt + jesse adapters
-  llm/           # multi-provider reasoner, web context, caching
-  trading/       # autopilot, paper engine, portfolio, risk limits
-  auth/          # session auth, email verification, middleware
-  storage/       # sqlite persistence (paper balances, sessions, locks)
+  llm/           # openai prompts, caching, reasoning agents
   api/           # FastAPI routers
   scheduler/     # APScheduler jobs (data pulls, agent ticks, rebalance)
   config.py      # pydantic Settings: symbols, timeframes, risk caps, keys
-  credentials.py # atomic .env credential persistence
-  logging_setup.py
   main.py        # FastAPI entrypoint
 tests/           # pytest + pytest-asyncio
 scripts/         # one-off backtests, data dumps, ops tools
@@ -75,10 +67,10 @@ pip install -r requirements.txt
 pip install jesse                       # heavy, installed separately
 # pip install openbb cryptofeed         # optional
 
-cp .env.example .env                    # then fill in keys
-uvicorn app.main:app --reload
+cp .env.example .env                    # once .env.example exists
+uvicorn app.main:app --reload           # once app/main.py exists
 
-pytest -q
+pytest -q                               # once tests/ exists
 ```
 
 ## Conventions

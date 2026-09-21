@@ -63,24 +63,6 @@ def s_dip_buy(df: pd.DataFrame) -> Signals:
     return _cross_up(entries).fillna(False), exits.fillna(False)
 
 
-def s_dip_buy_confirmed_exit(df: pd.DataFrame) -> Signals:
-    """Same dip_buy entry, but the RSI-recovery exit additionally requires
-    momentum deterioration (MACD histogram declining) OR price confirmation
-    (close back below EMA20) — mirrors the live fix in
-    ProfitStreamStrategy._mean_reversion_exit (2026-08-25). vectorbt's simple
-    entries/exits signal API has no notion of running position PnL, so this
-    approximates only the confirmation half of the live fix; the
-    breakeven-or-better PnL floor is NOT modeled here (see the live code for
-    that part — it needs per-position state this simple boolean-mask backtest
-    doesn't carry)."""
-    close, rsi, mh = df["close"], df["rsi_14"], df["macd_hist"]
-    entries = (rsi < 30) & (close <= df["bb_lower"])
-    momentum_deteriorating = mh < mh.shift(1)
-    price_confirmation = close < df["ema_20"]
-    exits = (rsi > 55) & (momentum_deteriorating | price_confirmation)
-    return _cross_up(entries).fillna(False), exits.fillna(False)
-
-
 def s_trend_follow(df: pd.DataFrame) -> Signals:
     """Long-only trend following: enter when EMA20>EMA50 AND price>EMA200."""
     close, ema20, ema50, ema200 = df["close"], df["ema_20"], df["ema_50"], df["ema_200"]
@@ -109,99 +91,12 @@ def s_donchian_trend(df: pd.DataFrame) -> Signals:
     return _cross_up(entries).fillna(False), exits.fillna(False)
 
 
-# ── Candidate entry types under evaluation (not yet live) ──────────────
-# Requested as a replacement for the single dip-buy signal. Measuring each
-# independently, out-of-sample, before any of them touch live gates — per
-# "each component must be tested independently" / "do not force more trades".
-
-def s_oversold_bounce(df: pd.DataFrame) -> Signals:
-    """RSI<40 dip near/below the lower band, but already showing recovery
-    (price >5% above its own 5-day low) rather than still free-falling."""
-    close, rsi = df["close"], df["rsi_14"]
-    low5 = df["low"].rolling(5).min()
-    entries = (rsi < 40) & (close < df["bb_lower"] * 1.02) & (close > low5 * 1.05)
-    exits = rsi > 55
-    return _cross_up(entries).fillna(False), exits.fillna(False)
-
-
-def s_pullback_to_ema(df: pd.DataFrame) -> Signals:
-    """Uptrend (EMA20>EMA50) pullback to within 2% of EMA20, RSI cooled to
-    45-55, MACD histogram turning back up (momentum shift)."""
-    close, ema20, ema50, rsi, mh = df["close"], df["ema_20"], df["ema_50"], df["rsi_14"], df["macd_hist"]
-    near_ema = (close - ema20).abs() / ema20 <= 0.02
-    entries = near_ema & (rsi >= 45) & (rsi <= 55) & (ema20 > ema50) & (mh > mh.shift(1))
-    exits = ema20 < ema50
-    return _cross_up(entries).fillna(False), exits.fillna(False)
-
-
-def s_breakout_momentum(df: pd.DataFrame) -> Signals:
-    """20-day high breakout on >1.5x average volume, RSI rising but not
-    yet overbought (55-75) — trend continuation, not a blow-off top."""
-    close, rsi, vol, vol_avg = df["close"], df["rsi_14"], df["volume"], df["vol_sma_20"]
-    hi20 = df["high"].rolling(20).max().shift(1)
-    entries = (close > hi20) & (vol > vol_avg * 1.5) & (rsi > 55) & (rsi < 75)
-    exits = close < df["ema_20"]
-    return _cross_up(entries).fillna(False), exits.fillna(False)
-
-
-def s_ma_reversion(df: pd.DataFrame) -> Signals:
-    """Price settling back to its 50-day MA (not EMA) after cooling off
-    (RSI<50), with the prior day's momentum still positive. Requested as
-    "VWAP_REVERSION" but daily candles have no intraday VWAP — this is a
-    literal 50-day simple-moving-average reversion instead."""
-    close, rsi = df["close"], df["rsi_14"]
-    sma50 = close.rolling(50).mean()
-    prev_up = close.shift(1) > close.shift(2)
-    near_sma = (close - sma50).abs() / sma50 <= 0.01
-    entries = near_sma & (rsi < 50) & prev_up
-    exits = rsi > 60
-    return _cross_up(entries).fillna(False), exits.fillna(False)
-
-
-def make_multi_factor_score(min_score: int = 60, trend_gate: bool = True) -> Strategy:
-    """0-100 weighted score (RSI + BB position + volume spike + recovery-off-
-    low + trend alignment), entering at score>=min_score instead of the single
-    RSI<30-and-below-band condition. Compared directly against s_dip_buy to
-    see whether the extra factors add or dilute the existing edge. Parameterized
-    so --min-score / --no-trend-gate can sweep it from the CLI."""
-
-    def strat(df: pd.DataFrame) -> Signals:
-        close, rsi, bb_lower, bb_mid = df["close"], df["rsi_14"], df["bb_lower"], df["bb_mid"]
-        ema20, ema50, vol, low = df["ema_20"], df["ema_50"], df["volume"], df["low"]
-        vol_avg = vol.rolling(20).mean()
-        low5 = low.rolling(5).min()
-
-        score = pd.Series(0.0, index=df.index)
-        score += np.select([rsi < 30, rsi < 40, rsi < 50], [25, 20, 10], default=0)
-        score += np.select([close <= bb_lower, close <= bb_lower * 1.02, close <= bb_mid], [25, 20, 10], default=0)
-        score += np.select([vol > vol_avg * 1.5, vol > vol_avg * 1.2], [20, 10], default=0)
-        score += np.where(close / low5 > 1.02, 15, 0)
-        score += np.where(ema20 > ema50, 15, 0)
-
-        entries = score >= min_score
-        if trend_gate:
-            entries = entries & (close > df["ema_200"])
-        exits = rsi > 55
-        return _cross_up(entries).fillna(False), exits.fillna(False)
-
-    return strat
-
-
-s_multi_factor_score = make_multi_factor_score()
-
-
 STRATEGIES: dict[str, Strategy] = {
     "baseline":         s_baseline,
     "dip_buy":          s_dip_buy,
-    "dip_buy_confirmed_exit": s_dip_buy_confirmed_exit,
     "trend_follow":     s_trend_follow,
     "trend_confluence": s_trend_confluence,
     "donchian_trend":   s_donchian_trend,
-    "oversold_bounce":  s_oversold_bounce,
-    "pullback_to_ema":  s_pullback_to_ema,
-    "breakout_momentum": s_breakout_momentum,
-    "ma_reversion":     s_ma_reversion,
-    "multi_factor_score": s_multi_factor_score,
 }
 
 
@@ -211,11 +106,8 @@ async def _load(repo: OHLCVRepository, tf: Timeframe, bars: int) -> dict[str, pd
     for sym in SYMBOLS:
         try:
             df = await repo.get(sym, tf, limit=bars, refresh=True)
-        except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.exception(f"Trade execution failure: {e}")
-            raise
+        except Exception:
+            continue
         if df is None or len(df) < 220:
             continue
         df = add_indicators(df).dropna()
@@ -270,8 +162,7 @@ def _eval_fold(
 
 
 async def main_async(
-    tf: Timeframe, folds: int, sl: float, tp: float, bars: int, market_filter: bool,
-    min_score: int = 60, trend_gate: bool = True, only: list[str] | None = None,
+    tf: Timeframe, folds: int, sl: float, tp: float, bars: int, market_filter: bool
 ) -> None:
     fees = get_settings().binance_taker_fee
     repo = OHLCVRepository()
@@ -294,19 +185,13 @@ async def main_async(
     span = min(df.index.min() for df in frames.values()), max(df.index.max() for df in frames.values())
     print(f"loaded {len(frames)} symbols on {tf.value} | exits: signal+SL {sl:.0%}/TP {tp:.0%} "
           f"| fees {fees:.2%}/side | market_filter={'BTC 50>200 EMA' if market is not None else 'off'}")
-    print(f"multi_factor_score: min_score={min_score} trend_gate(ema200)={trend_gate}")
     print(f"window ~ {span[0].date()} → {span[1].date()}, {folds} folds\n")
-
-    strategies = dict(STRATEGIES)
-    strategies["multi_factor_score"] = make_multi_factor_score(min_score, trend_gate)
-    if only:
-        strategies = {k: v for k, v in strategies.items() if k in only}
 
     print(f"{'strategy':>17} {'fold':>5} {'ret':>9} {'median':>9} {'pos%':>6} "
           f"{'sharpe':>8} {'trades':>7} {'syms':>5}")
     print("-" * 76)
     summary: dict[str, list[float]] = {}
-    for name, strat in strategies.items():
+    for name, strat in STRATEGIES.items():
         fold_rets: list[float] = []
         for f in range(folds):
             m = _eval_fold(frames, strat, f, folds, sl, tp, fees, market)
@@ -344,17 +229,10 @@ def main() -> None:
     p.add_argument("--tp", type=float, default=0.25, help="take-profit fraction")
     p.add_argument("--bars", type=int, default=1000, help="bars to fetch per symbol")
     p.add_argument("--market-filter", action="store_true",
-                   help="only allow entries when BTC 50-EMA > 200-EMA (risk-on)")
-    p.add_argument("--min-score", type=int, default=60,
-                   help="multi_factor_score entry threshold (0-100)")
-    p.add_argument("--trend-gate", action=argparse.BooleanOptionalAction, default=True,
-                   help="gate multi_factor_score entries by close>ema_200 (default: on; use --no-trend-gate to disable)")
-    p.add_argument("--only", nargs="*", default=None,
-                   help="restrict output to these strategy names (e.g. --only dip_buy multi_factor_score)")
+                   help="only allow entries when BTC > its 200-EMA (risk-on)")
     args = p.parse_args()
     asyncio.run(main_async(Timeframe(args.timeframe), args.folds, args.sl, args.tp,
-                           args.bars, args.market_filter, args.min_score,
-                           args.trend_gate, args.only))
+                           args.bars, args.market_filter))
 
 
 if __name__ == "__main__":

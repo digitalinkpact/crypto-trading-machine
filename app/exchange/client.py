@@ -6,10 +6,9 @@ of the app stays async-first. All order placement is gated by `dry_run`.
 from __future__ import annotations
 
 import asyncio
-import re
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, Optional
 
 import pandas as pd
@@ -19,7 +18,6 @@ from app.config import Settings, Timeframe, get_settings
 from app.logging_setup import get_logger
 
 from .models import Order, OrderSide, OrderStatus, OrderType
-from .telemetry import exchange_telemetry
 
 log = get_logger(__name__)
 
@@ -27,83 +25,6 @@ log = get_logger(__name__)
 def _new_client_order_id(prefix: str = "ctm") -> str:
     """Idempotency key for orders. Binance.US allows up to 36 chars."""
     return f"{prefix}-{uuid.uuid4().hex[:24]}"
-
-
-def _extract_avg_fill_price(raw: dict[str, Any]) -> Optional[Decimal]:
-    """Best-effort average fill price from Binance order payload.
-
-    Priority:
-      1) Weighted average from fills[] (price * qty / sum(qty))
-      2) cummulativeQuoteQty / executedQty
-      3) explicit price field
-    """
-    fills = raw.get("fills")
-    if isinstance(fills, list) and fills:
-        total_qty = Decimal("0")
-        total_quote = Decimal("0")
-        for fill in fills:
-            try:
-                qty = Decimal(str(fill.get("qty", "0")))
-                px = Decimal(str(fill.get("price", "0")))
-            except (ValueError, TypeError, ArithmeticError):  # noqa: BLE001
-                continue
-            if qty <= 0 or px <= 0:
-                continue
-            total_qty += qty
-            total_quote += (qty * px)
-        if total_qty > 0:
-            return total_quote / total_qty
-
-    try:
-        executed_qty = Decimal(str(raw.get("executedQty", "0")))
-        cum_quote = Decimal(str(raw.get("cummulativeQuoteQty", "0")))
-        if executed_qty > 0 and cum_quote > 0:
-            return cum_quote / executed_qty
-    except (ValueError, TypeError, ArithmeticError):  # noqa: BLE001
-        pass
-
-    try:
-        px = Decimal(str(raw.get("price", "0")))
-        if px > 0:
-            return px
-    except (ValueError, TypeError, ArithmeticError):  # noqa: BLE001
-        pass
-    return None
-
-
-def _extract_commission(raw: dict[str, Any]) -> tuple[Optional[Decimal], Optional[str]]:
-    """Sum the REAL commission Binance charged, from the order's fills[].
-
-    Returns (total_commission, commission_asset) only when every fill paid
-    commission in the SAME asset — a mixed-asset order (e.g. partially paid
-    in BNB, partially in the quote asset) can't be summed into one honest
-    number, so this returns (None, None) rather than fabricate one. Callers
-    must fall back to a modeled fee estimate in that case.
-    """
-    fills = raw.get("fills")
-    if not isinstance(fills, list) or not fills:
-        return None, None
-    total = Decimal("0")
-    asset: Optional[str] = None
-    for fill in fills:
-        try:
-            commission = Decimal(str(fill.get("commission", "0")))
-        except (InvalidOperation, ValueError, TypeError):
-            return None, None
-        fill_asset = fill.get("commissionAsset")
-        if asset is None:
-            asset = fill_asset
-        elif fill_asset != asset:
-            return None, None  # mixed commission assets — don't guess
-        total += commission
-    return (total, asset) if asset else (None, None)
-
-
-def _safe_order_status(raw_status: Any) -> OrderStatus:
-    try:
-        return OrderStatus(str(raw_status or "NEW"))
-    except ValueError:
-        return OrderStatus.NEW
 
 
 class BinanceUSClient:
@@ -117,90 +38,17 @@ class BinanceUSClient:
             base_url=self._settings.binance_base_url,
         )
 
-    def generate_client_order_id(self, prefix: str = "ctm") -> str:
-        """Create a Binance-safe client order id used for idempotency."""
-        return _new_client_order_id(prefix)
-
-    async def _api_call(self, operation: str, func, *args, **kwargs):
-        started = asyncio.get_running_loop().time()
-        try:
-            result = await asyncio.to_thread(func, *args, **kwargs)
-        except Exception as exc:
-            exchange_telemetry.record(operation, asyncio.get_running_loop().time() - started, exc)
-            raise
-        exchange_telemetry.record(operation, asyncio.get_running_loop().time() - started)
-        return result
-
-    @staticmethod
-    def order_from_raw(
-        *,
-        symbol: str,
-        side: OrderSide,
-        type: OrderType,
-        quantity: Decimal,
-        client_order_id: str,
-        raw: dict[str, Any],
-    ) -> Order:
-        """Reconstruct a domain Order from Binance raw payload."""
-        submitted_at: Optional[datetime] = None
-        try:
-            transact_ms = raw.get("transactTime")
-            if transact_ms is not None:
-                submitted_at = datetime.fromtimestamp(float(transact_ms) / 1000.0, tz=timezone.utc)
-        except (TypeError, ValueError):
-            submitted_at = None
-        commission, commission_asset = _extract_commission(raw)
-        return Order(
-            symbol=symbol,
-            side=side,
-            type=type,
-            quantity=quantity,
-            client_order_id=client_order_id,
-            status=_safe_order_status(raw.get("status")),
-            exchange_order_id=(str(raw.get("orderId")) if raw.get("orderId") is not None else None),
-            submitted_at=submitted_at,
-            filled_quantity=Decimal(str(raw.get("executedQty", "0"))),
-            avg_fill_price=_extract_avg_fill_price(raw),
-            commission=commission,
-            commission_asset=commission_asset,
-            raw=raw,
-        )
-
-    async def get_order_by_client_id(
-        self, symbol: str, client_order_id: str
-    ) -> tuple[str, Optional[dict[str, Any]]]:
-        """Lookup order outcome by idempotency key.
-
-        Returns a tuple `(outcome, raw)` where outcome is one of:
-        - `"found"`: exchange returned an order payload.
-        - `"confirmed_absent"`: exchange confirms no such order exists.
-        - `"inconclusive"`: lookup failed or could not be trusted.
-        """
-        try:
-            raw = await self._api_call(
-                "order_confirmation", self._spot.get_order,
-                symbol=symbol, origClientOrderId=client_order_id,
-            )
-            if isinstance(raw, dict) and raw:
-                return "found", raw
-            return "inconclusive", None
-        except Exception as exc:  # noqa: BLE001
-            msg = str(exc)
-            # Binance "unknown order" is expected when an order truly never landed.
-            if "-2013" in msg or re.search(r"order\s+does\s+not\s+exist", msg, re.IGNORECASE):
-                return "confirmed_absent", None
-            return "inconclusive", None
-
     # ── Market data ──────────────────────────────────────────────────────
     async def klines(
         self,
         symbol: str,
-        timeframe: Timeframe | str,
+        timeframe: Timeframe,
         limit: int = 500,
     ) -> pd.DataFrame:
         """Fetch OHLCV candles. Returns a DataFrame indexed by close_time (UTC)."""
-        interval = timeframe.value if hasattr(timeframe, "value") else str(timeframe)
-        raw = await self._api_call("klines", self._spot.klines, symbol, interval, limit=limit)
+        raw = await asyncio.to_thread(
+            self._spot.klines, symbol, timeframe.value, limit=limit
+        )
         cols = [
             "open_time", "open", "high", "low", "close", "volume",
             "close_time", "quote_volume", "trades",
@@ -216,49 +64,11 @@ class BinanceUSClient:
         ]
 
     async def ticker_price(self, symbol: str) -> Decimal:
-        data = await self._api_call("ticker_price", self._spot.ticker_price, symbol)
+        data = await asyncio.to_thread(self._spot.ticker_price, symbol)
         return Decimal(str(data["price"]))
 
-    async def order_book(self, symbol: str, limit: int = 10) -> dict[str, Any]:
-        """Fetch the L2 order book (top `limit` levels each side).
-
-        Public endpoint — no auth required. Returns the raw Binance.US payload
-        with `bids` and `asks` as lists of [price, qty] string pairs.
-        """
-        return await self._api_call("order_book", self._spot.depth, symbol, limit=limit)
-
     async def account(self) -> dict[str, Any]:
-        return await self._api_call("account", self._spot.account)
-
-    async def trade_fees(self) -> dict[str, Decimal]:
-        """Read this account's REAL spot maker/taker fee rates from Binance.US.
-
-        Returns fractions (e.g. ``Decimal("0.001")`` == 0.10%). Prefers the
-        ``commissionRates`` block (already decimal strings); falls back to the
-        legacy integer ``makerCommission``/``takerCommission`` fields, which are
-        expressed in units of 1/10000 (15 -> 0.0015). Signed endpoint — requires
-        API credentials. Raises if neither form is present.
-        """
-        acct = await self._api_call("trade_fees", self._spot.account)
-        rates = acct.get("commissionRates") or {}
-
-        def _rate(decimal_key: str, int_key: str) -> Optional[Decimal]:
-            v = rates.get(decimal_key)
-            if v is not None:
-                return Decimal(str(v))
-            iv = acct.get(int_key)
-            if iv is not None:
-                return Decimal(str(iv)) / Decimal("10000")
-            return None
-
-        maker = _rate("maker", "makerCommission")
-        taker = _rate("taker", "takerCommission")
-        if maker is None or taker is None:
-            raise RuntimeError(
-                "Binance.US account payload had no commission rates "
-                "(commissionRates / makerCommission / takerCommission missing)"
-            )
-        return {"maker": maker, "taker": taker}
+        return await asyncio.to_thread(self._spot.account)
 
     # ── Orders ───────────────────────────────────────────────────────────
     async def place_order(
@@ -289,16 +99,6 @@ class BinanceUSClient:
             )
             return order.model_copy(update={"status": OrderStatus.DRY_RUN})
 
-        # This is the last exchange-boundary protection for all callers,
-        # including one-off scripts and any future API path that bypasses the
-        # autopilot. SELLs remain available for risk exits and liquidation.
-        if side is OrderSide.BUY and not self._settings.live_buys_enabled:
-            log.critical(
-                "LIVE BUY REJECTED by global kill switch coid=%s symbol=%s",
-                coid, symbol,
-            )
-            return order.model_copy(update={"status": OrderStatus.REJECTED})
-
         params: dict[str, Any] = {
             "symbol": symbol,
             "side": side.value,
@@ -313,16 +113,12 @@ class BinanceUSClient:
             params["timeInForce"] = "GTC"
 
         log.info("Submitting order coid=%s symbol=%s side=%s", coid, symbol, side.value)
-        raw = await self._api_call("place_order", self._spot.new_order, **params)
-        commission, commission_asset = _extract_commission(raw)
+        raw = await asyncio.to_thread(self._spot.new_order, **params)
         return order.model_copy(
             update={
                 "status": OrderStatus(raw.get("status", "NEW")),
                 "exchange_order_id": str(raw.get("orderId")),
                 "filled_quantity": Decimal(str(raw.get("executedQty", "0"))),
-                "avg_fill_price": _extract_avg_fill_price(raw),
-                "commission": commission,
-                "commission_asset": commission_asset,
                 "raw": raw,
             }
         )
@@ -331,14 +127,13 @@ class BinanceUSClient:
         if self._settings.dry_run or self._settings.paper_trading:
             log.warning("[DRY-RUN] cancel coid=%s symbol=%s", client_order_id, symbol)
             return {"status": "DRY_RUN", "origClientOrderId": client_order_id}
-        return await self._api_call(
-            "cancel_order", self._spot.cancel_order,
-            symbol=symbol, origClientOrderId=client_order_id,
+        return await asyncio.to_thread(
+            self._spot.cancel_order, symbol=symbol, origClientOrderId=client_order_id
         )
 
     async def open_orders(self, symbol: Optional[str] = None) -> list[dict[str, Any]]:
         kwargs = {"symbol": symbol} if symbol else {}
-        return await self._api_call("open_orders", self._spot.get_open_orders, **kwargs)
+        return await asyncio.to_thread(self._spot.get_open_orders, **kwargs)
 
     # ── Liquidation ──────────────────────────────────────────────────────
     async def liquidate_all(self, quote: str = "USDT") -> list[Order]:
@@ -397,7 +192,6 @@ class BinanceUSClient:
                     exchange_order_id=str(raw.get("orderId")),
                     submitted_at=datetime.now(timezone.utc),
                     filled_quantity=Decimal(str(raw.get("executedQty", "0"))),
-                    avg_fill_price=_extract_avg_fill_price(raw),
                     raw=raw,
                 )
             )

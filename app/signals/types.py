@@ -36,20 +36,6 @@ class Signal(BaseModel):
     rationale: str = ""
     contributing_agents: tuple[str, ...] = ()
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    # Raw trade-quality score (0-110, see app/trading/strategy.py). Distinct
-    # from `confidence` (which is clamped to [0, 1] and, for a single-voter
-    # symbol, gets renormalized to 1.0 by the aggregator below) — this is the
-    # un-lossy value position sizing keys off. 0 when not produced by the
-    # quality-scoring strategy (e.g. legacy per-agent signals).
-    quality_score: int = 0
-    # Forensic metadata, set by ProfitStreamStrategy so it survives into
-    # closed_trades: WHY a SELL fired (e.g. "mean_reversion_rsi_momentum",
-    # "stop_loss") and what produced a BUY (e.g. "dip_buy"/"oversold_bounce"),
-    # plus the scored BTC regime (-2..+2) at signal time. Empty/None when not
-    # produced by ProfitStream.
-    exit_reason: str = ""
-    entry_strategy: str = ""
-    entry_btc_regime: int | None = None
 
 
 # Higher timeframes carry more weight in cross-timeframe fusion.
@@ -93,10 +79,7 @@ def _load_win_rates() -> dict[str, float]:
     try:
         from app.storage import storage
         return storage.agent_win_rates(min_trades=5)
-    except Exception as e:  # noqa: BLE001
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.exception("Trade execution failure: %s", e)
+    except Exception:  # noqa: BLE001
         return {}
 
 

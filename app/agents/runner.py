@@ -2,18 +2,13 @@
 from __future__ import annotations
 
 import asyncio
-import time
 
-from app.config import TIMEFRAMES, Timeframe, get_settings
+from app.config import SYMBOLS, TIMEFRAMES, Timeframe
 from app.data import OHLCVRepository
-from app.exchange.symbol_source import get_symbols
 from app.logging_setup import get_logger
 from app.regime import RegimeClassifier
 from app.signals import Signal, SignalAggregator
-from app.storage import storage
-from app.exchange.telemetry import exchange_telemetry
 from app.ta import add_indicators
-from app.trading.strategy import ProfitStreamStrategy
 
 from .base import AgentContext
 from .breakout import BreakoutAgent
@@ -46,11 +41,6 @@ LLM_TIMEFRAMES = (Timeframe.D1, Timeframe.W1)
 # Cap concurrent LLM calls. Free tiers throttle aggressively at higher fan-out.
 _LLM_CONCURRENCY = 4
 
-# Minimum candles before indicators are computable. The `ta` ATR/RSI windows
-# (14) raise on shorter frames; newly-listed coins are skipped until they have
-# enough history.
-_MIN_BARS = 30
-
 
 async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
     """Run every agent over every (symbol, timeframe), return aggregated signals.
@@ -64,160 +54,23 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
     raw_signals: list[Signal] = []
     llm_tasks: list[asyncio.Task[Signal | None]] = []
     llm_sem = asyncio.Semaphore(_LLM_CONCURRENCY)
-    settings = get_settings()
-    mode = "paper" if settings.paper_trading else "live"
-
-
-    # --- ML model gating for LLM signals ---
-    import numpy as np
-    ML_MODEL_NAME = "signal_quality_v1"
-    ml_confidence_threshold = settings.ml_gate_threshold
-    ml_model_artifact = storage.load_model_artifact(ML_MODEL_NAME)
-    ml_model = ml_model_artifact["model"] if ml_model_artifact else None
-
-    def _llm_features_from_signal(sig: Signal, ctx: AgentContext) -> np.ndarray:
-        # Features must match those in _rows_to_xy in regime/trainer.py
-        last = ctx.df.dropna().iloc[-1]
-        tf_weight = {
-            "1h": 1.0,
-            "4h": 1.5,
-            "1d": 2.5,
-            "1w": 4.0,
-        }.get(ctx.timeframe.value, 1.0)
-        ema_gap = float(last["ema_20"]) - float(last["ema_50"])
-        ema_gap_pct = ema_gap / float(last["close"]) if float(last["close"]) else 0.0
-        atr_pct = float(last["atr_14"]) / float(last["close"]) if float(last["close"]) else 0.0
-        features = [
-            float(sig.confidence),
-            atr_pct,
-            float(last["rsi_14"]),
-            ema_gap_pct,
-            1.0,  # agent_count (LLM is always 1)
-            tf_weight,
-            1.0 if sig.action == "BUY" else 0.0,
-        ]
-        return np.asarray(features, dtype=float).reshape(1, -1)
-
-    def _llm_gate_threshold_for_action(action: str) -> float:
-        return 0.40 if action == "BUY" else 0.50
 
     async def _llm_call(c: AgentContext) -> Signal | None:
         async with llm_sem:
             try:
-                sig = await LLM_AGENT.analyze_async(c)
-                if sig is None or ml_model is None:
-                    return sig
-                # Only allow if ML model predicts high win probability
-                features = _llm_features_from_signal(sig, c)
-                proba = ml_model.predict_proba(features)[0, 1]
-                gate_threshold = _llm_gate_threshold_for_action(sig.action)
-                if proba >= gate_threshold:
-                    return sig
-                else:
-                    log.info(
-                        "LLM signal for %s/%s filtered by ML model: proba=%.2f < %.2f",
-                        c.symbol,
-                        c.timeframe.value,
-                        proba,
-                        gate_threshold,
-                    )
-                    return None
+                return await LLM_AGENT.analyze_async(c)
             except Exception as exc:  # noqa: BLE001
                 log.warning("llm agent failed %s/%s: %s", c.symbol, c.timeframe.value, exc)
                 return None
 
-    symbols = await get_symbols()
-
-    if settings.profitstream_enabled:
-        strategy_started = time.perf_counter()
-        strategy = ProfitStreamStrategy()
-        configured_threshold = int(getattr(settings, "profitstream_score_threshold", 80))
-        score_threshold = configured_threshold
-        try:
-            btc_1d = await strategy._candles("BTCUSDT", "1d", 320)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("ProfitStream BTC context unavailable; skipping strategy pass: %s", exc)
-            exchange_telemetry.record_stage("strategy", time.perf_counter() - strategy_started)
-            return {}
-        for symbol in symbols:
-            decision = await strategy.analyze_symbol(symbol, mode=mode, btc_1d=btc_1d)
-            executed = (
-                decision.action.value == "SELL"
-                or (
-                    decision.action.value == "BUY"
-                    and decision.score >= score_threshold
-                )
-            )
-            reason = "; ".join(decision.reasons) if decision.reasons else "score_pass"
-            storage.record_tick_audit(
-                mode=mode,
-                symbol=symbol,
-                timeframe="1m/5m/15m/1h",
-                action=decision.action.value,
-                score=decision.score,
-                executed=executed,
-                reason=reason,
-                indicators=decision.indicators,
-                filters={"score_threshold": score_threshold},
-            )
-            if executed:
-                raw_signals.append(
-                    Signal(
-                        agent="profitstream_strategy",
-                        symbol=symbol,
-                        timeframe=Timeframe.H1,
-                        action=decision.action,
-                        confidence=max(0.0, min(1.0, decision.score / 100.0)),
-                        quality_score=decision.score,
-                        rationale=reason,
-                        contributing_agents=("profitstream_strategy",),
-                        exit_reason=str(decision.indicators.get("exit_reason") or ""),
-                        entry_strategy=str(decision.indicators.get("entry_strategy") or ""),
-                        entry_btc_regime=decision.indicators.get("btc_regime_score"),
-                    )
-                )
-
-        if not settings.profitstream_use_legacy_agents:
-            # ProfitStream is the SOLE strategy — do not fall back to the
-            # noisier legacy multi-agent ensemble just because this tick
-            # produced few or zero qualifying signals. An all-HOLD tick is the
-            # intended, healthy outcome of a stricter quality bar, not a
-            # trigger to reach for a worse strategy. (Live evidence: 2026-07-28
-            # audit found the legacy ensemble was silently producing most live
-            # trades — at a 14.6% win rate — precisely because this fallback
-            # fired on almost every tick where ProfitStream stayed quiet.)
-            # Bypass SignalAggregator here too: with at most one signal per
-            # symbol, its weighted-vote renormalization collapses confidence
-            # to 1.0 and would destroy the real 0-110 quality_score-derived
-            # confidence computed above.
-            exchange_telemetry.record_stage("strategy", time.perf_counter() - strategy_started)
-            return {sig.symbol: sig for sig in raw_signals}
-
-        if raw_signals:
-            return SignalAggregator().aggregate(raw_signals)
-
-        log.warning(
-            "ProfitStream produced no BUY/SELL signals; falling back to legacy agents "
-            "(profitstream_use_legacy_agents=true)"
-        )
-        exchange_telemetry.record_stage("strategy", time.perf_counter() - strategy_started)
-
-    for symbol in symbols:
+    for symbol in SYMBOLS:
         for tf in TIMEFRAMES:
             try:
                 df = await repo.get(symbol, tf, refresh=False)
             except Exception as exc:  # noqa: BLE001
                 log.warning("data fetch failed %s/%s: %s", symbol, tf.value, exc)
                 continue
-            # Newly-listed coins can have very few candles; the indicator stack
-            # (ATR/RSI window=14) raises on short frames. Skip them quietly.
-            if df is None or len(df) < _MIN_BARS:
-                continue
-            try:
-                df = add_indicators(df)
-            except Exception as exc:  # noqa: BLE001
-                log.debug("indicators failed %s/%s: %s", symbol, tf.value, exc)
-                continue
+            df = add_indicators(df)
             try:
                 regime = classifier.classify(df)
             except Exception as exc:  # noqa: BLE001

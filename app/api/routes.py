@@ -1,10 +1,7 @@
 """HTTP routes — dashboard, settings, autopilot controls, trades log."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from html import escape
-
-from fastapi import APIRouter, Form, HTTPException, Response
+from fastapi import APIRouter, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.config import SYMBOLS, TIMEFRAMES, get_settings
@@ -17,8 +14,6 @@ from app.credentials import (
 from app.storage import storage
 from app.trading.autopilot import autopilot
 from app.trading.portfolio import portfolio_snapshot
-from app.exchange.ws_stream import live_prices
-from app.exchange.telemetry import exchange_telemetry
 
 router = APIRouter()
 
@@ -80,25 +75,9 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 def _layout(title: str, body: str, active: str = "home") -> str:
     nav = []
-    for slug, label in (
-        ("home", "Dashboard"),
-        ("trades", "Trades"),
-        ("settings", "Settings"),
-        ("audit", "Audit"),
-        ("account", "Account"),
-        ("logout", "Sign out"),
-    ):
+    for slug, label in (("home", "Dashboard"), ("trades", "Trades"), ("settings", "Settings")):
         cls = "active" if active == slug else ""
-        if slug == "home":
-            href = "/"
-        elif slug == "audit":
-            href = "/auth/audit"
-        elif slug == "account":
-            href = "/auth/password"
-        elif slug == "logout":
-            href = "/auth/logout"
-        else:
-            href = f"/{slug}"
+        href = "/" if slug == "home" else f"/{slug}"
         nav.append(f"<a class='{cls}' href='{href}'>{label}</a>")
     return (
         "<!doctype html><html><head><meta charset='utf-8'/>"
@@ -116,82 +95,6 @@ def _mode_pill() -> str:
     return "<span class='pill real'>LIVE &mdash; REAL MONEY</span>"
 
 
-def _render_tick_diagnostics() -> tuple[str, str]:
-    data = storage.kv_get("autopilot_last_tick_debug") or {}
-    reasons = data.get("by_reason") or {}
-    per_symbol = data.get("per_symbol") or {}
-    market_hits = int(reasons.get("market_gate", 0) or 0)
-    banner = ""
-    if market_hits > 0:
-        banner = (
-            "<div class='banner warn'>"
-            f"Last tick blocked {market_hits} BUY signal(s) at the BTC market-regime gate. "
-            "Review the diagnostics card below to confirm the regime and downstream sizing checks."
-            "</div>"
-        )
-
-    if not data:
-        return banner, (
-            "<div class='card'><h2>Last tick diagnostics</h2>"
-            "<div class='muted'>No tick diagnostics recorded yet.</div></div>"
-        )
-
-    reason_rows = "".join(
-        f"<div class='row'><span>{escape(str(reason))}</span><b>{int(count)}</b></div>"
-        for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:8]
-    ) or "<div class='row muted'><span>No skip reasons</span><span>&mdash;</span></div>"
-
-    buy_entries = [
-        (symbol, info) for symbol, info in per_symbol.items()
-        if isinstance(info, dict) and info.get("action") == "BUY"
-    ]
-    buy_rows = ""
-    for symbol, info in buy_entries[:8]:
-        filters_info = info.get("filters") or {}
-        market = filters_info.get("market_regime") or {}
-        min_check = filters_info.get("min_notional") or {}
-        sizing = info.get("sizing") or {}
-        qty = escape(str(sizing.get("rounded_qty", "-")))
-        notional = escape(str(sizing.get("notional", "-")))
-        final_reason = escape(str(info.get("final_reason") or info.get("reason") or "-"))
-        detail = escape(str(info.get("detail") or ""))
-        market_detail = escape(str(market.get("detail") or "not evaluated"))
-        min_detail = escape(str(min_check.get("detail") or "not evaluated"))
-        submitted = "yes" if info.get("submitted") else "no"
-        buy_rows += (
-            "<tr>"
-            f"<td>{escape(symbol)}</td>"
-            f"<td class='num'>{float(info.get('confidence', 0.0)):.2f}</td>"
-            f"<td>{market_detail}</td>"
-            f"<td class='num'>{qty}</td>"
-            f"<td class='num'>{notional}</td>"
-            f"<td>{min_detail}</td>"
-            f"<td>{submitted}</td>"
-            f"<td>{final_reason}<br/><span class='muted'>{detail}</span></td>"
-            "</tr>"
-        )
-    if buy_rows:
-        buy_table = (
-            "<table style='margin-top:0.75rem;'><thead><tr>"
-            "<th>BUY symbol</th><th class='num'>Conf</th><th>Market regime</th>"
-            "<th class='num'>Qty</th><th class='num'>Notional</th><th>Min check</th>"
-            "<th>Submitted</th><th>Final</th></tr></thead>"
-            f"<tbody>{buy_rows}</tbody></table>"
-        )
-    else:
-        buy_table = "<div class='muted' style='margin-top:0.75rem;'>No BUY traces recorded on the last tick.</div>"
-
-    card = f"""
-<div class='card'>
-  <h2>Last tick diagnostics</h2>
-  <div class='muted'>Signals: {int(data.get('total_signals', 0) or 0)} &middot; Timestamp: {escape(str(data.get('ts') or '&mdash;'))}</div>
-  {reason_rows}
-  {buy_table}
-</div>
-"""
-    return banner, card
-
-
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def dashboard() -> str:
     s = get_settings()
@@ -200,7 +103,6 @@ async def dashboard() -> str:
     st = autopilot.state
     pill_class = "live" if st.running else "off"
     pill_text = "RUNNING" if st.running else "STOPPED"
-    diag_banner, diag_card = _render_tick_diagnostics()
 
     if is_paper:
         creds_banner = (
@@ -220,17 +122,11 @@ async def dashboard() -> str:
         )
 
     balance_card = ""
-    low_cash_banner = ""
     try:
         snap = await portfolio_snapshot()
         total = snap["total_usdt"]
         cash = snap["usdt_cash"]
         invested = total - cash
-        if not is_paper and cash < 10:
-            low_cash_banner = (
-                "<div class='banner warn'>LIVE mode has less than 10 USDT free. "
-                "New BUYs will fail the minimum trade sizing check until more USDT is available.</div>"
-            )
         baseline = st.starting_balance_usdt
         if baseline and baseline > 0:
             pnl = total - baseline
@@ -377,8 +273,6 @@ async def dashboard() -> str:
 
     body = f"""
 {creds_banner}
-{diag_banner}
-{low_cash_banner}
 <div class='card'>
   <h2>Autopilot <span class='pill {pill_class}'>{pill_text}</span> {_mode_pill()}</h2>
   <div class='muted'>Trading runs automatically every 15 minutes once started.
@@ -396,21 +290,9 @@ async def dashboard() -> str:
   </form>
 </div>
 {balance_card}
-{diag_card}
 {equity_card}
 {agent_card}
 {risk_card}
-<div class='card'>
-    <h2>LIVE trading monitor</h2>
-    <div class='row'><span>Last signal</span><b>{escape(str((storage.recent_trade_audit(limit=1)[0]['signal'] if storage.recent_trade_audit(limit=1) else '—')))}</b></div>
-    <div class='row'><span>Last order</span><b>{escape(str((storage.recent_orders(limit=1)[0]['side'] + ' ' + storage.recent_orders(limit=1)[0]['symbol'] if storage.recent_orders(limit=1) else '—')))}</b></div>
-    <div class='row'><span>Last Binance response</span><b>{escape(str((storage.recent_trade_audit(limit=1)[0]['binance_response'] if storage.recent_trade_audit(limit=1) else '—')))}</b></div>
-    <div class='row'><span>Last exception</span><b>{escape(str((storage.recent_trade_audit(limit=1)[0]['exception'] if storage.recent_trade_audit(limit=1) and storage.recent_trade_audit(limit=1)[0]['exception'] else st.last_error or '—')))}</b></div>
-    <div class='row'><span>Open positions</span><b>{len([p for p in storage.all_positions() if p['mode'] == st.mode])}</b></div>
-    <div class='row'><span>Account balances</span><b>{escape(str(len((await portfolio_snapshot(mode=st.mode)).get('all_balances', {}))))} assets</b></div>
-    <div class='row'><span>Bot uptime</span><b>{escape(str((datetime.now(timezone.utc) - st.started_at) if st.started_at else '—'))}</b></div>
-    <div class='row'><span>Scheduler uptime</span><b>{escape(str((storage.kv_get('health_status') or {}).get('timestamp') or '—'))}</b></div>
-</div>
 <div class='card'>
   <h2>Universe</h2>
   <div class='muted'>{len(SYMBOLS)} symbols &middot; {len(TIMEFRAMES)} timeframes
@@ -583,11 +465,6 @@ async def save_credentials(
 async def save_mode(mode: str = Form(...)):
     if mode not in ("paper", "live"):
         raise HTTPException(status_code=400, detail="mode must be 'paper' or 'live'")
-    if autopilot.state.running and mode != autopilot.state.mode:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop autopilot before changing trading mode",
-        )
     save_trading_mode(paper=(mode == "paper"))
     autopilot.state.mode = mode
     return RedirectResponse(url="/settings?mode_saved=1", status_code=303)
@@ -635,67 +512,14 @@ async def autopilot_stop():
     return RedirectResponse(url="/", status_code=303)
 
 
-@router.post("/autopilot/drawdown-recovery", include_in_schema=False)
-async def autopilot_drawdown_recovery(
-    confirmation: str = Form(...),
-    reason: str = Form(...),
-):
-    if confirmation != "RESUME_LIVE_ENTRIES":
-        raise HTTPException(status_code=400, detail="explicit confirmation is required")
-    try:
-        await autopilot.resume_after_drawdown_halt(reason=reason)
-    except (RuntimeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return RedirectResponse(url="/", status_code=303)
-
-
 @router.get("/health")
-async def health(response: Response) -> dict:
-    """Liveness+readiness probe for external supervisors (systemd timer,
-    watchdog.sh, uptime monitors). Returns HTTP 200 only when the process is
-    alive AND the last Binance.US price update is fresh (<`live_price_max_age_
-    seconds`, default 30s) AND the local SQLite DB is writable. Any failing
-    check drops the status to 503 so a monitor can tell "up but broken" apart
-    from "actually fine".
-    """
-    s = get_settings()
-    problems: list[str] = []
-
-    ws_status = live_prices.status()
-    price_age = ws_status.get("last_msg_age_s")
-    price_fresh = True
-    if ws_status.get("enabled"):
-        if price_age is None or price_age > s.live_price_max_age_seconds:
-            price_fresh = False
-            problems.append(
-                f"last Binance.US price update {price_age if price_age is not None else 'never'}s "
-                f"ago (max {s.live_price_max_age_seconds}s)"
-            )
-
-    db_writable = True
-    try:
-        storage.kv_set("healthz_probe", {"ts": datetime.now(timezone.utc).isoformat()})
-    except Exception as exc:  # noqa: BLE001
-        db_writable = False
-        problems.append(f"db not writable: {exc}")
-
-    body = {
-        "status": "ok" if not problems else "degraded",
-        "process_alive": True,
-        "price_fresh": price_fresh,
-        "price_age_s": price_age,
-        "db_writable": db_writable,
-        "problems": problems,
-    }
-    if problems:
-        response.status_code = 503
-    return body
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
 
 
 @router.get("/autopilot/status")
 async def autopilot_status() -> dict:
     s = autopilot.state
-    entry_status = storage.kv_get("entry_status") or {}
     return {
         "running": s.running,
         "mode": s.mode,
@@ -705,13 +529,6 @@ async def autopilot_status() -> dict:
         "trades_executed": s.trades_executed,
         "last_action": s.last_action,
         "last_error": s.last_error,
-        # ENTRY_HALTED (new BUYs blocked, e.g. drawdown breaker/emergency halt)
-        # is distinct from SYSTEM_OFFLINE (the whole process/scheduler down).
-        # Existing positions keep receiving stop-loss/TP/trailing/reconciliation
-        # regardless of entry_halted — see Autopilot.tick().
-        "entry_halted": bool(entry_status.get("entry_halted")),
-        "entry_halted_reasons": entry_status.get("reasons") or [],
-        "system_offline": bool(entry_status.get("system_offline", False)),
     }
 
 
@@ -720,7 +537,6 @@ async def config_summary() -> dict:
     s = get_settings()
     return {
         "env": s.env,
-        "live_mode": s.live_mode,
         "dry_run": s.dry_run,
         "paper_trading": s.paper_trading,
         "mode": "paper" if s.paper_trading else "live",
@@ -732,48 +548,4 @@ async def config_summary() -> dict:
             "kelly_fraction_cap": s.kelly_fraction_cap,
         },
     }
-
-
-@router.get("/metrics")
-async def metrics() -> dict:
-    """Operational metrics, including ML quality-gate stats.
-
-    `gate.cumulative` accumulates across ticks since the gate was enabled;
-    `gate.last_tick` is the most recent tick snapshot. `avg_win_prob` is the
-    mean predicted win-probability over all evaluated BUY/SELL signals.
-    """
-    s = get_settings()
-    raw = storage.kv_get("ml_gate_stats") or {}
-    cum = raw.get("cumulative", {}) if isinstance(raw, dict) else {}
-    evaluated = int(cum.get("evaluated", 0))
-    proba_sum = float(cum.get("proba_sum", 0.0))
-    return {
-        "exchange_api": exchange_telemetry.snapshot(),
-        "gate": {
-            "enabled": s.ml_gate_enabled,
-            "threshold": s.ml_gate_threshold,
-            "model_version": raw.get("model_version") if isinstance(raw, dict) else None,
-            "cumulative": {
-                "evaluated": evaluated,
-                "accepted": int(cum.get("accepted", 0)),
-                "gated": int(cum.get("gated", 0)),
-                "avg_win_prob": (proba_sum / evaluated) if evaluated else None,
-            },
-            "last_tick": raw.get("last_tick") if isinstance(raw, dict) else None,
-        },
-    }
-
-
-@router.get("/live/diagnostics")
-async def live_diagnostics() -> dict:
-    health = storage.kv_get("health_status") or {}
-    startup = storage.kv_get("startup_report") or {}
-    audit = storage.recent_trade_audit(limit=25)
-    return {
-        "health": health,
-        "startup_report": startup,
-        "websocket": live_prices.status(),
-        "trade_audit": audit,
-    }
-
 

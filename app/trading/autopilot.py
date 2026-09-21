@@ -14,11 +14,7 @@ Each tick:
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import os
-import subprocess
-import time
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
@@ -33,16 +29,13 @@ from app.exchange.derivatives import derivatives
 from app.exchange.filters import filters
 from app.exchange.orderbook import liquidity_gate
 from app.exchange.ws_stream import live_prices
-from app.exchange.telemetry import exchange_telemetry
 from app.logging_setup import get_logger
 from app.regime import online_regime
 from app.signals import SignalAction
 from app.storage import storage
-from app.trading.audit import trade_audit_logger
 from app.trading import risk
 from app.trading.paper import paper_exchange
 from app.trading.portfolio import portfolio_snapshot
-from app.trading.risk_manager import RiskManager
 
 log = get_logger(__name__)
 
@@ -50,15 +43,6 @@ _STATE_KEY = "autopilot_state"
 _SKIP_STATS_KEY = "autopilot_skip_stats"
 _LAST_TICK_DEBUG_KEY = "autopilot_last_tick_debug"
 _ML_GATE_STATS_KEY = "ml_gate_stats"
-_DRAWDOWN_HALT_KEY = "drawdown_halt"
-_BASELINE_HALT_KEY = "baseline_unavailable"
-_CIRCUIT_BREAKER_FAILURE_KEY = "circuit_breaker_check_failed"
-_FILTERS_HALT_KEY = "exchange_filters_unavailable"
-_ML_GATE_HALT_KEY = "ml_gate_unavailable"
-
-# Exit reasons that sell only a fraction of the position (the TP scale-out
-# ladder). Every other reason is a full exit that flattens the free balance.
-_PARTIAL_EXIT_REASONS = frozenset({"take_profit_1", "take_profit_2"})
 
 
 @dataclass
@@ -127,33 +111,6 @@ def _model_age_hours(trained_at: Optional[str]) -> Optional[float]:
     return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
 
 
-def _jsonable(value):
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, dict):
-        return {k: _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
-    return value
-
-
-def _active_revision() -> str:
-    configured = os.getenv("GIT_REVISION")
-    if configured:
-        return configured
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return "unknown"
-
-
 class Autopilot:
     """Singleton trading controller."""
 
@@ -174,62 +131,13 @@ class Autopilot:
         # The regime is portfolio-wide, so it is computed once and reused for
         # every symbol within a tick instead of refetching BTC per candidate.
         self._market_regime_cache: Optional[tuple[bool, str, float]] = None
-        # Scored BTC regime (-2..+2) from the most recent _market_gate() call.
-        # Defaults to "bull" (2) so unit tests that mock _market_gate wholesale
-        # never trip the sideways-tier stricter-score check below by accident;
-        # real ticks always overwrite this before it's read.
-        self._last_regime_score: int = 2
-        self._orderbook_retry_tasks: dict[tuple[str, str], asyncio.Task] = {}
-        self._initial_tick_task: Optional[asyncio.Task] = None
 
     # ── persistence ────────────────────────────────────────────────────
     def _save(self) -> None:
         storage.kv_set(_STATE_KEY, self.state.to_dict())
 
-    def _set_entry_safety_halt(self, key: str, reason: str) -> None:
-        storage.kv_set(key, {
-            "active": True,
-            "reason": reason,
-            "since": datetime.now(timezone.utc).isoformat(),
-        })
-
-    def _clear_entry_safety_halt(self, key: str) -> None:
-        existing = storage.kv_get(key) or {}
-        if isinstance(existing, dict) and existing.get("active"):
-            existing["active"] = False
-            existing["cleared_at"] = datetime.now(timezone.utc).isoformat()
-            storage.kv_set(key, existing)
-
-    def _entry_block_reason(self) -> Optional[str]:
-        """Return a human-readable reason if new BUY entries must be blocked."""
-        if self.state.starting_balance_usdt is None:
-            return "baseline_unavailable: no valid starting portfolio equity"
-        for key, name in (
-            (_BASELINE_HALT_KEY, "baseline_unavailable"),
-            (_CIRCUIT_BREAKER_FAILURE_KEY, "circuit_breaker_check_failed"),
-            (_FILTERS_HALT_KEY, "exchange_filters_unavailable"),
-            (_ML_GATE_HALT_KEY, "ml_gate_unavailable"),
-        ):
-            state = storage.kv_get(key) or {}
-            if isinstance(state, dict) and state.get("active"):
-                return f"{name}: {state.get('reason') or 'safety dependency unavailable'}"
-        if not getattr(get_settings(), "emergency_halt_enabled", True):
-            return None
-        halt = storage.kv_get("emergency_halt") or {}
-        if isinstance(halt, dict) and halt.get("active"):
-            level = halt.get("level") or "new_entries_blocked"
-            reason = halt.get("reason") or "watchdog emergency halt"
-            return f"emergency_halt:{level}:{reason}"
-        tick_protection = storage.kv_get("tick_protection") or {}
-        if isinstance(tick_protection, dict) and tick_protection.get("active"):
-            reason = tick_protection.get("reason") or "stale_tick_protection"
-            return f"tick_protection:{reason}"
-        return None
-
     # ── lifecycle ──────────────────────────────────────────────────────
     async def start(self) -> AutopilotState:
-        if self.state.running:
-            raise RuntimeError("Autopilot is already running; stop it before restarting")
         s = get_settings()
         self.state.mode = "paper" if s.paper_trading else "live"
 
@@ -247,40 +155,25 @@ class Autopilot:
         try:
             snap = await portfolio_snapshot(mode=self.state.mode)
             self.state.starting_balance_usdt = snap["total_usdt"]
-            self._clear_entry_safety_halt(_BASELINE_HALT_KEY)
         except Exception as exc:  # noqa: BLE001
             self.state.last_error = f"baseline fetch failed: {exc}"
-            self._set_entry_safety_halt(_BASELINE_HALT_KEY, self.state.last_error)
-            log.critical("%s; new BUY entries blocked", self.state.last_error)
+            log.warning("baseline portfolio fetch failed: %s", exc)
 
         self.state.running = True
         self.state.started_at = datetime.now(timezone.utc)
         self.state.trades_executed = 0
-        if self.state.starting_balance_usdt is not None:
-            self.state.last_error = ""
+        self.state.last_error = ""
         self.state.last_action = f"started ({self.state.mode})"
         log.warning("AUTOPILOT STARTED — mode=%s", self.state.mode)
         self._save()
         # Kick an immediate tick in the background so the user doesn't wait up
         # to 15 min for the next cron slot before any trade can fire.
         try:
-            self._initial_tick_task = asyncio.create_task(
-                self.tick(), name="autopilot-initial-tick"
-            )
-            self._initial_tick_task.add_done_callback(self._log_initial_tick_result)
+            asyncio.create_task(self.tick())
             log.info("autopilot first tick scheduled immediately after Start")
         except RuntimeError as exc:  # no running loop — extremely unlikely here
             log.warning("could not schedule immediate tick: %s", exc)
         return self.state
-
-    @staticmethod
-    def _log_initial_tick_result(task: asyncio.Task) -> None:
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            log.info("autopilot initial tick cancelled")
-        except Exception as exc:  # noqa: BLE001
-            log.exception("autopilot initial tick failed: %s", exc)
 
     async def stop_and_liquidate(self) -> AutopilotState:
         """Stop the loop AND market-sell every non-USDT balance back to USDT."""
@@ -305,7 +198,6 @@ class Autopilot:
     # ── scheduled tick ─────────────────────────────────────────────────
     async def tick(self) -> None:
         """Called by the scheduler. No-op when stopped."""
-        tick_started = time.perf_counter()
         if not self.state.running:
             return
         if self._lock.locked():
@@ -321,13 +213,6 @@ class Autopilot:
         async with self._lock:
             self.state.last_tick_at = datetime.now(timezone.utc)
             try:
-                # -1. Ensure paper mode has seeded balance (cold-start after restart).
-                if self.state.mode == "paper":
-                    try:
-                        paper_exchange.ensure_seeded()
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("paper balance ensure-seeded failed: %s", exc)
-                
                 # 0. Ensure LOT_SIZE / MIN_NOTIONAL filters are loaded before any
                 #    order is placed. `filters.meets_min` fails OPEN when the
                 #    exchangeInfo cache is empty, so a tick that fires before the
@@ -338,30 +223,22 @@ class Autopilot:
                     await filters.load()
                 except Exception as exc:  # noqa: BLE001
                     log.warning("filter load failed at tick start: %s", exc)
-                if not filters.loaded:
-                    reason = "Binance.US LOT_SIZE/MIN_NOTIONAL filters unavailable"
-                    self._set_entry_safety_halt(_FILTERS_HALT_KEY, reason)
-                    log.critical("%s; new BUY entries blocked", reason)
-                else:
-                    self._clear_entry_safety_halt(_FILTERS_HALT_KEY)
 
-                # 1. Drawdown circuit breaker.
+                # 1. Risk gates — stop-loss / take-profit / trailing / max-hold.
+                #    Run BEFORE agents so we exit losers regardless of new signals.
+                try:
+                    await self._run_risk_gates()
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("risk gate run failed: %s", exc)
+
+                # 2. Drawdown circuit breaker.
                 try:
                     breaker_tripped = await self._check_circuit_breaker()
                 except Exception as exc:  # noqa: BLE001
-                    self.state.last_error = f"circuit breaker check failed: {exc}"
-                    self._set_entry_safety_halt(
-                        _CIRCUIT_BREAKER_FAILURE_KEY, self.state.last_error
-                    )
-                    log.critical("%s; new BUY entries blocked", self.state.last_error)
-                    breaker_tripped = True
-                else:
-                    self._clear_entry_safety_halt(_CIRCUIT_BREAKER_FAILURE_KEY)
+                    log.warning("circuit breaker check failed: %s", exc)
+                    breaker_tripped = False
 
-                # Risk exits run on the independent risk loop. Keeping them here
-                # too would submit the same protective SELLs from two cadences.
-
-                # 2. Agent signals → execute (skip BUYs if breaker tripped).
+                # 3. Agent signals → execute (skip BUYs if breaker tripped).
                 try:
                     signals = await run_all_agents(use_llm=get_settings().llm_in_trading_loop)
                 except Exception as exc:  # noqa: BLE001
@@ -373,36 +250,7 @@ class Autopilot:
                     await self._execute(signals, allow_buys=not breaker_tripped)
                 finally:
                     self._save()
-                    # Explicit ENTRY_HALTED vs SYSTEM_OFFLINE distinction: the
-                    # breaker/emergency-halt/tick-protection flags above only
-                    # ever block NEW BUYS inside _execute — the scheduler,
-                    # this tick, the independent risk loop, watchdog, and
-                    # reconciliation all keep running regardless. Persist one
-                    # explicit, single-source-of-truth status so that fact is
-                    # visible externally (API/dashboard) instead of only
-                    # implicit in the code structure. `system_offline` is
-                    # always False here on purpose — the very fact this line
-                    # is executing proves the system is online; true offline
-                    # detection is the watchdog's heartbeat-staleness checks
-                    # (trade_loop_alive/risk_loop_alive), not a flag a dead
-                    # process would have to set for itself.
-                    try:
-                        reasons = []
-                        if breaker_tripped:
-                            reasons.append("drawdown_circuit_breaker")
-                        entry_block_reason = self._entry_block_reason()
-                        if entry_block_reason:
-                            reasons.append(entry_block_reason)
-                        storage.kv_set("entry_status", {
-                            "entry_halted": bool(reasons),
-                            "reasons": reasons,
-                            "system_offline": False,
-                            "checked_at": datetime.now(timezone.utc).isoformat(),
-                        })
-                    except Exception as exc:  # noqa: BLE001
-                        log.debug("entry_status persist failed: %s", exc)
             finally:
-                exchange_telemetry.record_stage("tick", time.perf_counter() - tick_started)
                 storage.release_lock("autopilot_tick", owner=self._owner)
 
     # ── risk gates ─────────────────────────────────────────────────────
@@ -422,36 +270,19 @@ class Autopilot:
         balances_known = False
         try:
             snap = await portfolio_snapshot(mode=self.state.mode)
-            balance_source = snap.get("free_balances") or snap.get("all_balances") or {}
             free_balances = {
-                a: Decimal(str(q)) for a, q in balance_source.items()
+                a: Decimal(str(q)) for a, q in snap["all_balances"].items()
             }
             balances_known = True
         except Exception as exc:  # noqa: BLE001
             log.warning("risk-gate balance fetch failed: %s", exc)
-            try:
-                from app.trading import watchdog
-
-                watchdog.trigger_emergency_halt(
-                    "risk exits could not verify exchange balances",
-                    level="new_entries_blocked",
-                )
-            except Exception as halt_exc:  # noqa: BLE001
-                log.error("failed to engage halt after balance verification failure: %s", halt_exc)
-            return
         prices: dict[str, Decimal] = {}
-        atr_by_symbol: dict[str, float] = {}
         for pos in positions:
             try:
                 prices[pos["symbol"]] = await self._price(pos["symbol"])
             except Exception as exc:  # noqa: BLE001
                 log.warning("price fetch failed for %s: %s", pos["symbol"], exc)
-            # Best-effort ATR% drives the ATR-scaled hard stop; a None here just
-            # falls back to the fixed stop_loss_pct inside evaluate_exits.
-            atr = await self._atr_pct(pos["symbol"])
-            if atr is not None:
-                atr_by_symbol[pos["symbol"]] = atr
-        exits = risk.evaluate_exits(positions=positions, prices=prices, atr_pct=atr_by_symbol)
+        exits = risk.evaluate_exits(positions=positions, prices=prices)
         for ex in exits:
             try:
                 price = prices.get(ex.symbol) or await self._price(ex.symbol)
@@ -460,32 +291,14 @@ class Autopilot:
                 # exchange holds zero of it — a zombie book position. Use 0 so
                 # the cleanup branch below closes it instead of submitting a
                 # doomed full-qty SELL that Binance rejects with -2010 forever.
-                # A failed balance fetch returns above; no unverified SELL is
-                # ever submitted from the risk loop.
+                # Only when the fetch FAILED (balances unknown) do we fall back
+                # to the book qty.
                 if balances_known:
                     avail = free_balances.get(base, Decimal("0"))
                 else:
                     avail = None
-                # Sell the real free balance, not the tracked book qty. min()
-                # alone only guarded against overselling when book > free; if
-                # free > book (drift from a missed pyramid-buy accumulation,
-                # a stale entry, etc.) the exit must still flatten the WHOLE
-                # real holding — otherwise the surplus is silently stranded
-                # with no further stop-loss/take-profit coverage forever.
-                # EXCEPT partial take-profit slices (TP1/TP2): those must sell
-                # only their slice so the remainder rides to the next rung.
-                # Overriding them with the full free balance flattens the whole
-                # position at TP1 and the ladder never reaches TP2/trailing.
-                if avail is not None and ex.reason in _PARTIAL_EXIT_REASONS:
-                    sell_qty = min(ex.qty, avail)
-                else:
-                    if avail is not None and avail > ex.qty:
-                        log.warning(
-                            "risk-exit %s: free=%s exceeds tracked book=%s — "
-                            "selling the full free balance so nothing is left "
-                            "stranded untracked", ex.symbol, avail, ex.qty,
-                        )
-                    sell_qty = ex.qty if avail is None else avail
+                # Clamp the exit to the real free balance when we know it.
+                sell_qty = ex.qty if avail is None else min(ex.qty, avail)
                 qty = filters.round_qty(ex.symbol, sell_qty)
                 if qty <= 0 or not filters.meets_min(ex.symbol, qty, price):
                     # Nothing sellable (dust below min-notional, or the balance
@@ -497,429 +310,38 @@ class Autopilot:
                             "below min — closing stale position", ex.symbol, ex.qty, avail,
                         )
                         try:
-                            # The exchange holds ~none of this — the book row is
-                            # phantom. Booking at the current price fabricates a
-                            # win/loss on a position we don't actually hold, which
-                            # corrupts realized PnL, win-rate and agent stats.
-                            # Close at the entry price so realized PnL is ~0
-                            # (bookkeeping cleanup, not a real trade).
-                            stale_pos = storage.get_position(ex.symbol)
-                            book_exit_price = Decimal(
-                                str((stale_pos or {}).get("entry_price") or price)
-                            )
-                            storage.close_position(
-                                symbol=ex.symbol, exit_price=book_exit_price,
-                                exit_reason=f"{ex.reason}_stale_dust",
-                            )
+                            storage.close_position(symbol=ex.symbol, exit_price=price)
                             risk.clear_hwm(ex.symbol)
-                            risk.clear_tp1(ex.symbol)
-                            risk.clear_tp2(ex.symbol)
                         except Exception as exc:  # noqa: BLE001
                             log.warning("stale close failed for %s: %s", ex.symbol, exc)
                     else:
                         log.info("risk-exit %s skipped: filters reject qty=%s", ex.symbol, qty)
-                    storage.record_tick_audit(
-                        mode=self.state.mode,
-                        symbol=ex.symbol,
-                        timeframe="risk",
-                        action="SELL",
-                        score=100,
-                        executed=False,
-                        reason=f"risk_exit_skip:{ex.reason}",
-                        indicators={
-                            "entry_qty": str(ex.qty),
-                            "free_qty": str(avail) if avail is not None else None,
-                            "rounded_qty": str(qty),
-                            "price": str(price),
-                        },
-                        filters={"meets_min": False},
-                    )
                     continue
                 log.warning("RISK EXIT %s reason=%s qty=%s price=%s (book=%s free=%s)",
                             ex.symbol, ex.reason, qty, price, ex.qty, avail)
-                order = await self._submit(ex.symbol, OrderSide.SELL, qty, [f"risk:{ex.reason}"])
-                storage.record_tick_audit(
-                    mode=self.state.mode,
-                    symbol=ex.symbol,
-                    timeframe="risk",
-                    action="SELL",
-                    score=100,
-                    executed=self._order_filled(order),
-                    reason=f"risk_exit:{ex.reason}",
-                    indicators={
-                        "entry_qty": str(ex.qty),
-                        "free_qty": str(avail) if avail is not None else None,
-                        "rounded_qty": str(qty),
-                        "price": str(price),
-                    },
-                    filters={"meets_min": True},
-                )
-                if self._order_filled(order):
-                    if ex.reason == "take_profit_1":
-                        risk.mark_tp1_taken(ex.symbol)
-                    elif ex.reason == "take_profit_2":
-                        risk.mark_tp2_taken(ex.symbol)
-                    else:
-                        risk.clear_hwm(ex.symbol)
-                        risk.clear_tp1(ex.symbol)
-                        risk.clear_tp2(ex.symbol)
-                else:
-                    log.error(
-                        "RISK EXIT %s did NOT fill (status=%s) — position remains "
-                        "open, will retry next tick", ex.symbol,
-                        getattr(order, "status", None),
-                    )
+                await self._submit(ex.symbol, OrderSide.SELL, qty, [f"risk:{ex.reason}"])
+                risk.clear_hwm(ex.symbol)
             except Exception as exc:  # noqa: BLE001
                 log.exception("risk-exit failed for %s: %s", ex.symbol, exc)
 
     async def _check_circuit_breaker(self) -> bool:
-        drawdown_halt = storage.kv_get(_DRAWDOWN_HALT_KEY) or {}
-        if isinstance(drawdown_halt, dict) and drawdown_halt.get("active"):
-            self.state.last_error = (
-                "DRAWDOWN BREAKER HALTED — explicit operator recovery required "
-                "before new BUYs can resume"
-            )
-            log.warning(self.state.last_error)
-            return True
         try:
             snap = await portfolio_snapshot(mode=self.state.mode)
         except Exception as exc:  # noqa: BLE001
-            self.state.last_error = f"breaker portfolio fetch failed: {exc}; new BUYs halted"
-            log.critical(self.state.last_error)
-            return True
+            log.warning("breaker portfolio fetch failed: %s", exc)
+            return False
         tripped, dd = risk.is_circuit_breaker_tripped(
             starting_balance=self.state.starting_balance_usdt,
             current_balance=Decimal(str(snap["total_usdt"])),
         )
-        legacy_halt = "DRAWDOWN BREAKER TRIPPED" in self.state.last_error
         if tripped:
             self.state.last_error = (
                 f"DRAWDOWN BREAKER TRIPPED at {dd:.1%} — new BUYs halted"
             )
-            storage.kv_set(
-                _DRAWDOWN_HALT_KEY,
-                self._drawdown_halt_record(dd, Decimal(str(snap["total_usdt"]))),
-            )
             log.warning(self.state.last_error)
-            return True
-        if legacy_halt:
-            storage.kv_set(
-                _DRAWDOWN_HALT_KEY,
-                self._drawdown_halt_record(dd, Decimal(str(snap["total_usdt"])), legacy=True),
-            )
-            self.state.last_error = (
-                "DRAWDOWN BREAKER legacy halt preserved — explicit operator recovery "
-                "required before new BUYs can resume"
-            )
-            log.warning(self.state.last_error)
-            return True
-
-        # Distinct from cumulative drawdown: halts new BUYs once TODAY's
-        # realized losses exceed daily_loss_limit_pct of starting equity.
-        # Existing positions are still protected/managed either way.
-        daily_tripped, today_pnl = risk.is_daily_loss_limit_tripped(
-            mode=self.state.mode,
-            starting_balance=self.state.starting_balance_usdt,
-        )
-        if daily_tripped:
-            self.state.last_error = (
-                f"DAILY LOSS LIMIT TRIPPED (today's realized pnl={today_pnl:.2f}) — new BUYs halted"
-            )
-            log.warning(self.state.last_error)
-            return True
-        return False
-
-    def _drawdown_halt_record(
-        self, drawdown_pct: float, current_equity: Decimal, *, legacy: bool = False
-    ) -> dict:
-        s = get_settings()
-        risk_limits = {
-            "max_position_pct": s.max_position_pct,
-            "max_open_positions": s.max_open_positions,
-            "max_long_exposure_pct": s.max_long_exposure_pct,
-            "drawdown_circuit_breaker_pct": s.drawdown_circuit_breaker_pct,
-            "daily_loss_limit_pct": s.daily_loss_limit_pct,
-            "profitstream_score_threshold": s.profitstream_score_threshold,
-        }
-        config_hash = hashlib.sha256(
-            json.dumps(risk_limits, sort_keys=True).encode("ascii")
-        ).hexdigest()
-        return {
-            "active": True,
-            "triggered_at": datetime.now(timezone.utc).isoformat(),
-            "legacy": legacy,
-            "drawdown_pct": drawdown_pct,
-            "drawdown_limit_pct": s.drawdown_circuit_breaker_pct,
-            "baseline_equity_usdt": str(self.state.starting_balance_usdt),
-            "current_equity_usdt": str(current_equity),
-            "bot_revision": _active_revision(),
-            "risk_limits": risk_limits,
-            "config_hash": config_hash,
-        }
-
-    async def resume_after_drawdown_halt(self, *, reason: str) -> None:
-        """Explicitly rebaseline after an operator-approved drawdown recovery.
-
-        This never runs from startup, watchdog recovery, or configuration reload.
-        It only records the decision and permits subsequent eligible entries.
-        """
-        if not reason.strip():
-            raise ValueError("drawdown recovery requires an operator reason")
-        accounting_status = storage.kv_get("accounting_status") or {}
-        if not isinstance(accounting_status, dict) or not accounting_status.get("verified"):
-            raise RuntimeError(
-                "drawdown recovery requires verified authoritative accounting; "
-                "deposits, withdrawals, and transfers must be reconciled first"
-            )
-        halt = storage.kv_get(_DRAWDOWN_HALT_KEY) or {}
-        if not isinstance(halt, dict) or not halt.get("active"):
-            raise RuntimeError("drawdown breaker is not persistently halted")
-        snap = await portfolio_snapshot(mode=self.state.mode)
-        current_equity = Decimal(str(snap["total_usdt"]))
-        previous_drawdown = halt.get("drawdown_pct")
-        halt.update({
-            "active": False,
-            "operator_action": "explicit_rebaseline",
-            "operator_reason": reason.strip(),
-            "recovered_at": datetime.now(timezone.utc).isoformat(),
-            "previous_drawdown_pct": previous_drawdown,
-            "new_baseline_equity_usdt": str(current_equity),
-            "accounting_verification": accounting_status,
-        })
-        self.state.starting_balance_usdt = current_equity
-        self.state.last_error = ""
-        self.state.last_action = "drawdown recovery approved; baseline re-established"
-        storage.kv_set(_DRAWDOWN_HALT_KEY, halt)
-        trade_audit_logger.log_event(
-            mode=self.state.mode,
-            symbol="PORTFOLIO",
-            signal="DRAWDOWN_RECOVERY",
-            risk_passed=True,
-            final_outcome="operator_recovery",
-            detail=halt,
-        )
-        self._save()
-        log.warning("drawdown recovery recorded; new entries remain subject to all other gates")
+        return tripped
 
     # ── execution ──────────────────────────────────────────────────────
-    async def _execute_signal(self, symbol: str, sig, *, allow_buys: bool) -> tuple[bool, str]:
-        """Execute one aggregated signal through Validate -> Risk -> Execute -> Log."""
-        s = get_settings()
-        snap = await portfolio_snapshot(mode=self.state.mode)
-        balance_source = snap.get("free_balances") or snap.get("all_balances") or {}
-        balances: dict[str, Decimal] = {
-            asset: Decimal(str(qty)) for asset, qty in balance_source.items()
-        }
-        usdt_free = Decimal(str(snap["usdt_cash"]))
-        total_eq = Decimal(str(snap["total_usdt"]))
-        open_positions = [
-            p for p in storage.all_positions() if p["mode"] == self.state.mode
-        ]
-        position_exists = any(p["symbol"] == symbol for p in open_positions)
-
-        if sig.action == SignalAction.HOLD:
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                final_outcome="rejected: hold",
-                detail={"reason": "signal_hold"},
-            )
-            return False, "hold"
-
-        if sig.confidence < s.min_signal_confidence:
-            reason = "Confidence below threshold"
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                final_outcome=f"rejected: {reason}",
-                detail={"threshold": s.min_signal_confidence},
-            )
-            return False, reason
-
-        if sig.action == SignalAction.BUY and not allow_buys:
-            reason = "Max exposure exceeded"
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=False,
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                final_outcome=f"rejected: {reason}",
-            )
-            return False, reason
-
-        if sig.action == SignalAction.BUY and position_exists:
-            reason = "Position already exists"
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=True,
-                position_exists=True,
-                available_balance=usdt_free,
-                final_outcome=f"rejected: {reason}",
-            )
-            return False, reason
-
-        if sig.action == SignalAction.SELL:
-            base = symbol.removesuffix("USDT")
-            free = balances.get(base, Decimal("0"))
-            tracked_qty = next(
-                (
-                    Decimal(str(p.get("qty") or 0))
-                    for p in open_positions
-                    if p["symbol"] == symbol and p["mode"] == self.state.mode
-                ),
-                Decimal("0"),
-            )
-            sell_qty = min(tracked_qty, free)
-            if tracked_qty <= 0:
-                reason = "SELL rejected: no tracked position"
-                trade_audit_logger.log_event(
-                    mode=self.state.mode, symbol=symbol, signal=sig.action.value,
-                    confidence=float(sig.confidence), risk_passed=False,
-                    position_exists=False, available_balance=free,
-                    execution_attempted=False, final_outcome=f"rejected: {reason}",
-                )
-                return False, reason
-            if sell_qty <= 0:
-                reason = "SELL rejected: no exchange balance"
-                trade_audit_logger.log_event(
-                    mode=self.state.mode,
-                    symbol=symbol,
-                    signal=sig.action.value,
-                    confidence=float(sig.confidence),
-                    risk_passed=True,
-                    position_exists=True,
-                    available_balance=free,
-                    execution_attempted=False,
-                    final_outcome=f"rejected: {reason}",
-                )
-                return False, reason
-            order = await self._submit(symbol, OrderSide.SELL, sell_qty, list(getattr(sig, "contributing_agents", []) or []))
-            ok = self._order_filled(order)
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=True,
-                position_exists=position_exists,
-                available_balance=sell_qty,
-                execution_attempted=True,
-                min_notional_passed=True,
-                binance_response=(getattr(order, "status", "NONE") if order else "NONE"),
-                final_outcome=("executed" if ok else "rejected: Binance rejected order"),
-                detail={"order_id": getattr(order, "exchange_order_id", None) if order else None},
-            )
-            return ok, ("executed" if ok else "Binance rejected order")
-
-        # BUY path
-        entry_block_reason = self._entry_block_reason()
-        if entry_block_reason:
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=False,
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                final_outcome=f"rejected: {entry_block_reason}",
-            )
-            return False, entry_block_reason
-
-        long_exposure_pct = float(
-            (total_eq - usdt_free) / total_eq if total_eq > 0 else Decimal("0")
-        )
-        open_count = len(open_positions)
-        ok_risk, why = risk.can_open_new_position(
-            open_positions=open_count,
-            long_exposure_pct=long_exposure_pct,
-        )
-        if not ok_risk:
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=False,
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                final_outcome="rejected: Max exposure exceeded",
-                detail={"reason": why},
-            )
-            return False, why
-
-        atr_pct = await self._atr_pct(symbol)
-        eff_pct = risk.volatility_scaled_pct(s.max_position_pct, atr_pct)
-        per_trade_usdt = usdt_free * Decimal(str(eff_pct))
-        if per_trade_usdt < 10:
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=True,
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                min_notional_passed=False,
-                final_outcome="rejected: No available funds",
-                detail={"required_min_usdt": 10, "computed_usdt": str(per_trade_usdt)},
-            )
-            return False, "No available funds"
-
-        plan = await self._buy_order_plan(symbol, per_trade_usdt)
-        meets_min = bool(plan["meets_min"])
-        if not meets_min:
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=True,
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                min_notional_passed=False,
-                final_outcome="rejected: Min notional check failed",
-                detail={"plan": _jsonable(plan)},
-            )
-            return False, "Min notional check failed"
-
-        order = await self._submit(
-            symbol,
-            OrderSide.BUY,
-            plan["rounded_qty"],
-            list(getattr(sig, "contributing_agents", []) or []),
-        )
-        ok = self._order_filled(order)
-        trade_audit_logger.log_event(
-            mode=self.state.mode,
-            symbol=symbol,
-            signal=sig.action.value,
-            confidence=float(sig.confidence),
-            risk_passed=True,
-            position_exists=position_exists,
-            available_balance=usdt_free,
-            min_notional_passed=True,
-            execution_attempted=True,
-            binance_response=(getattr(order, "status", "NONE") if order else "NONE"),
-            final_outcome=("executed" if ok else "rejected: Binance rejected order"),
-            detail={"plan": _jsonable(plan), "order_id": getattr(order, "exchange_order_id", None) if order else None},
-        )
-        return ok, ("executed" if ok else "Binance rejected order")
-
     async def _execute(self, signals, *, allow_buys: bool = True) -> None:
         skip_counter: Counter[str] = Counter()
         tick_debug: dict[str, dict] = {}
@@ -927,65 +349,7 @@ class Autopilot:
         def _bump(reason: str, sym: str = "", detail: str = "") -> None:
             skip_counter[reason] += 1
             if sym:
-                entry = tick_debug.setdefault(sym, {})
-                entry["reason"] = reason
-                entry["detail"] = detail
-
-        def _entry(sym: str, sig=None) -> dict:
-            entry = tick_debug.setdefault(sym, {})
-            if sig is not None:
-                entry.setdefault("action", getattr(sig.action, "value", str(sig.action)))
-                entry.setdefault("confidence", float(sig.confidence))
-                entry.setdefault(
-                    "agents", list(getattr(sig, "contributing_agents", []) or [])
-                )
-                entry.setdefault("quality_score", getattr(sig, "quality_score", None))
-            entry.setdefault("filters", {})
-            return entry
-
-        def _set_filter(sym: str, name: str, ok: bool, detail: str, sig=None) -> None:
-            entry = _entry(sym, sig)
-            entry["filters"][name] = {"ok": ok, "detail": detail}
-
-        def _set_sizing(sym: str, payload: dict, sig=None) -> None:
-            entry = _entry(sym, sig)
-            entry["sizing"] = _jsonable(payload)
-
-        def _finish(sym: str, reason: str, detail: str, *, submitted: bool, sig=None) -> None:
-            entry = _entry(sym, sig)
-            entry["final_reason"] = reason
-            entry["submitted"] = submitted
-            _bump(reason, sym, detail)
-            audit_detail = {"detail": detail, **_jsonable(entry)}
-            min_notional_info = (entry.get("filters") or {}).get("min_notional") or {}
-            min_notional_passed = min_notional_info.get("ok") if min_notional_info else None
-            signal_val = entry.get("action") or (getattr(sig.action, "value", "HOLD") if sig is not None else "HOLD")
-            confidence = entry.get("confidence")
-            balances = (
-                snap.get("free_balances") or snap.get("all_balances")
-                if isinstance(snap, dict) else {}
-            )
-            avail = Decimal(str(snap.get("usdt_cash", "0"))) if isinstance(snap, dict) else Decimal("0")
-            if signal_val == SignalAction.SELL.value:
-                base = sym.removesuffix("USDT")
-                avail = Decimal(str((balances or {}).get(base, 0)))
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=sym,
-                signal=signal_val,
-                confidence=float(confidence) if confidence is not None else None,
-                risk_passed=(reason not in {"risk_cap", "breaker_tripped"}),
-                position_exists=bool(sym in held_symbols),
-                available_balance=avail,
-                min_notional_passed=min_notional_passed,
-                execution_attempted=submitted,
-                binance_response=("SUCCESS" if submitted else "REJECTED"),
-                exception=None,
-                final_outcome=reason,
-                detail=audit_detail,
-            )
-            if entry.get("action") == SignalAction.BUY.value:
-                log.info("[BUY_TRACE] %s %s", sym, json.dumps(_jsonable(entry), sort_keys=True))
+                tick_debug[sym] = {"reason": reason, "detail": detail}
 
         if not signals:
             _bump("no_signals")
@@ -1017,9 +381,8 @@ class Autopilot:
         long_exposure_pct = float(
             (total_eq - usdt_free) / total_eq if total_eq > 0 else Decimal("0")
         )
-        balance_source = snap.get("free_balances") or snap.get("all_balances") or {}
         balances: dict[str, Decimal] = {
-            asset: Decimal(str(qty)) for asset, qty in balance_source.items()
+            asset: Decimal(str(qty)) for asset, qty in snap["all_balances"].items()
         }
         open_positions = [
             p for p in storage.all_positions() if p["mode"] == self.state.mode
@@ -1030,7 +393,6 @@ class Autopilot:
         )
         now = datetime.now(timezone.utc)
         cooldown = timedelta(minutes=s.buy_cooldown_minutes)
-        risk_manager = RiskManager()
 
         # ML quality gate — load the learned model once per tick. Trades whose
         # predicted win-probability is below the threshold are skipped. Loaded
@@ -1043,23 +405,20 @@ class Autopilot:
                 if artifact:
                     ml_model = artifact["model"]
                     ml_model_version = artifact.get("version")
-                    # A model from a past regime cannot safely approve a new
-                    # entry. Keep exits available, but block new BUYs until a
-                    # fresh artifact is available.
+                    # Staleness guard: a model trained in a past market regime
+                    # must not hold an indefinite veto. If it's older than the
+                    # configured window, go advisory (fail-open) so entries
+                    # aren't frozen forever while the learning loop retrains.
                     age_h = _model_age_hours(artifact.get("trained_at"))
                     if age_h is not None and age_h > s.ml_gate_max_model_age_hours:
                         if self._ml_logged_version != -2:
                             log.warning(
                                 "[ML_GATE] model v%s is stale (%.1fh > %dh) — gate "
-                                "blocks new BUYs until a fresher model trains",
+                                "is fail-open until a fresher model trains",
                                 ml_model_version, age_h, s.ml_gate_max_model_age_hours,
                             )
                             self._ml_logged_version = -2
                         ml_model = None
-                        self._set_entry_safety_halt(
-                            _ML_GATE_HALT_KEY,
-                            f"model v{ml_model_version} is stale ({age_h:.1f}h)",
-                        )
                     # Log once per distinct version so retrains are visible
                     # without spamming every tick.
                     elif ml_model_version != self._ml_logged_version:
@@ -1079,43 +438,17 @@ class Autopilot:
                     if self._ml_logged_version != -1:
                         log.warning(
                             "[ML_GATE] enabled but no trained model found "
-                            "(signal_quality_v1) — new BUYs blocked"
+                            "(signal_quality_v1) — gate is fail-open, all signals pass"
                         )
                         self._ml_logged_version = -1
-                    self._set_entry_safety_halt(
-                        _ML_GATE_HALT_KEY, "no trained signal_quality_v1 model"
-                    )
             except Exception as exc:  # noqa: BLE001
-                log.warning("ml gate model load failed: %s", exc)
+                log.debug("ml gate model load failed: %s", exc)
                 ml_model = None
-                self._set_entry_safety_halt(_ML_GATE_HALT_KEY, f"model load failed: {exc}")
-            else:
-                if ml_model is not None:
-                    self._clear_entry_safety_halt(_ML_GATE_HALT_KEY)
         # Per-tick gate telemetry (exposed via /metrics).
         gate_evaluated = 0
         gate_accepted = 0
         gate_gated = 0
         gate_proba_sum = 0.0
-        entry_block_reason = self._entry_block_reason()
-        if entry_block_reason:
-            allow_buys = False
-            log.critical("entry protection active: %s", entry_block_reason)
-        buy_block_detail = (
-            entry_block_reason if entry_block_reason else "new BUYs halted by circuit breaker"
-        )
-        buy_block_reason = (
-            entry_block_reason.split(":", 1)[0]
-            if entry_block_reason else "drawdown_circuit_breaker"
-        )
-        aggressive_mode, aggressive_reason = self._aggressive_mode_active()
-        spread_cap = Decimal(
-            str(
-                getattr(s, "aggressive_max_spread_pct", 0.0025)
-                if aggressive_mode else getattr(s, "rollback_max_spread_pct", getattr(s, "max_spread_pct", 0.0015))
-            )
-        )
-        log.info("[AGGRESSIVE] %s spread_cap=%.4f%%", aggressive_reason, float(spread_cap) * 100)
 
         # Rank candidates by confidence (desc) so scarce cash and the
         # long-exposure cap are spent on the strongest signals first. Without
@@ -1126,77 +459,13 @@ class Autopilot:
             signals.items(), key=lambda kv: kv[1].confidence, reverse=True
         )
         for symbol, sig in ranked_signals:
-            ml_proba: Optional[float] = None
-            open_pos = next(
-                (p for p in open_positions if p["symbol"] == symbol and p["mode"] == self.state.mode),
-                None,
-            )
             if sig.action == SignalAction.HOLD:
                 _bump("action_hold", symbol, f"conf={sig.confidence:.2f}")
                 continue
-            # A SELL of a coin we actually hold is an EXIT, not an entry. Exits
-            # must never be blocked by the entry-oriented gates below: the
-            # dynamic confidence bar is leaned UP in risk-off (which would make
-            # it harder to sell exactly when we most want out), and the ML
-            # quality gate is calibrated on entry win-rates. If the ensemble
-            # says SELL and we hold the asset, let the sale through — worst case
-            # we sit in cash, the safe/reversible direction on spot.
-            is_exit = (
-                sig.action == SignalAction.SELL
-                and balances.get(symbol.removesuffix("USDT"), Decimal("0")) > 0
-            )
-            signal_min_conf = self._signal_min_confidence(sig.action)
-            if sig.action == SignalAction.BUY:
-                _set_filter(
-                    symbol,
-                    "signal_confidence",
-                    sig.confidence >= signal_min_conf,
-                    f"conf={sig.confidence:.3f} threshold={signal_min_conf:.3f}",
-                    sig,
-                )
-            if sig.confidence < signal_min_conf and not is_exit:
-                if sig.action == SignalAction.BUY:
-                    _finish(
-                        symbol,
-                        "low_confidence",
-                        f"{sig.action.value} conf={sig.confidence:.2f} < {signal_min_conf:.2f}",
-                        submitted=False,
-                        sig=sig,
-                    )
-                else:
-                    _bump("low_confidence", symbol,
-                          f"{sig.action.value} conf={sig.confidence:.2f} < {signal_min_conf:.2f}")
-                log.info("[SIGNAL] SKIP %s %s conf=%.3f < %.2f (agents: %s)",
-                         symbol, sig.action.value, sig.confidence, signal_min_conf,
-                         ", ".join(sig.contributing_agents) or "none")
+            if sig.confidence < min_conf:
+                _bump("low_confidence", symbol,
+                      f"{sig.action.value} conf={sig.confidence:.2f} < {min_conf:.2f}")
                 continue
-            current_price: Optional[Decimal] = None
-            aggressive_exit_reason: Optional[str] = None
-            if open_pos is not None:
-                current_price = await self._price(symbol)
-                entry_price = Decimal(str(open_pos.get("entry_price") or "0"))
-                if entry_price > 0:
-                    position_return_pct = (current_price - entry_price) / entry_price
-                    aggressive_exit_reason = self._aggressive_exit_reason(sig, position_return_pct)
-                    if aggressive_exit_reason is not None:
-                        _set_filter(symbol, "aggressive_sell", True, aggressive_exit_reason, sig)
-                        free = balances.get(symbol.removesuffix("USDT"), Decimal("0"))
-                        tracked_qty = Decimal(str(open_pos.get("qty") or 0))
-                        sell_qty = min(tracked_qty, free)
-                        if tracked_qty > 0 and sell_qty > 0:
-                            placed = await self._place_sell(symbol, sig, sell_qty)
-                            if placed:
-                                skip_counter["executed_sell"] += 1
-                                risk.clear_hwm(symbol)
-                                risk.clear_tp1(symbol)
-                                risk.clear_tp2(symbol)
-                                self._clear_pyramid_adds_count(symbol)
-                                _finish(symbol, "executed_sell", aggressive_exit_reason, submitted=True, sig=sig)
-                            else:
-                                _bump("filter_reject_sell", symbol)
-                        else:
-                            _bump("sell_no_balance", symbol)
-                        continue
             # Record the candidate signal for ML training BEFORE the quality gate.
             # The gate filters EXECUTION, but must never censor LEARNING: if we
             # only recorded gate-approved signals, a model biased against one
@@ -1206,188 +475,42 @@ class Autopilot:
             # loop fed with counterfactual outcomes so the gate can self-correct.
             if sig.action in (SignalAction.BUY, SignalAction.SELL):
                 await self._record_signal_event(symbol, sig)
-            if ml_model is not None and not is_exit and sig.action in (SignalAction.BUY, SignalAction.SELL):
-                ml_proba = await self._ml_win_proba(ml_model, symbol, sig)
-                if ml_proba is None or not 0.0 <= ml_proba <= 1.0:
-                    reason = (
-                        "ML probability unavailable"
-                        if ml_proba is None else f"invalid ML probability={ml_proba}"
-                    )
-                    self._set_entry_safety_halt(_ML_GATE_HALT_KEY, reason)
-                    if sig.action == SignalAction.BUY:
-                        _set_filter(symbol, "ml_gate", False, reason, sig)
-                        _finish(symbol, "ml_gate_unavailable", reason, submitted=False, sig=sig)
-                    else:
-                        _bump("ml_gate_unavailable", symbol, reason)
-                    continue
-                else:
-                    gate_threshold = self._ml_gate_threshold_for_confidence(
-                        sig.confidence,
-                        aggressive_mode,
-                        sig.action,
-                    )
+            if ml_model is not None and sig.action in (SignalAction.BUY, SignalAction.SELL):
+                proba = await self._ml_win_proba(ml_model, symbol, sig)
+                if proba is not None:
                     gate_evaluated += 1
-                    gate_proba_sum += ml_proba
-                    if ml_proba < gate_threshold:
+                    gate_proba_sum += proba
+                    if proba < s.ml_gate_threshold:
                         gate_gated += 1
                         log.info("[ML_GATE] SKIP %s %s proba=%.3f < %.2f",
-                                 symbol, sig.action.value, ml_proba, gate_threshold)
-                        if sig.action == SignalAction.BUY:
-                            _set_filter(
-                                symbol,
-                                "ml_gate",
-                                False,
-                                f"proba={ml_proba:.3f} threshold={gate_threshold:.3f}",
-                                sig,
-                            )
-                            _finish(
-                                symbol,
-                                "ml_gate",
-                                f"{sig.action.value} proba={ml_proba:.2f} < {gate_threshold}",
-                                submitted=False,
-                                sig=sig,
-                            )
-                        else:
-                            _bump("ml_gate", symbol,
-                                  f"{sig.action.value} proba={ml_proba:.2f} < {gate_threshold}")
+                                 symbol, sig.action.value, proba, s.ml_gate_threshold)
+                        _bump("ml_gate", symbol,
+                              f"{sig.action.value} proba={proba:.2f} < {s.ml_gate_threshold}")
                         continue
                     gate_accepted += 1
                     log.info("[ML_GATE] PASS %s %s proba=%.3f >= %.2f",
-                             symbol, sig.action.value, ml_proba, gate_threshold)
-                    if sig.action == SignalAction.BUY:
-                        _set_filter(
-                            symbol,
-                            "ml_gate",
-                            True,
-                            f"proba={ml_proba:.3f} threshold={gate_threshold:.3f}",
-                            sig,
-                        )
+                             symbol, sig.action.value, proba, s.ml_gate_threshold)
             if not filters.is_listed(symbol):
-                if sig.action == SignalAction.BUY:
-                    _set_filter(symbol, "listed", False, "symbol not trading on Binance.US", sig)
-                    _finish(symbol, "not_listed", "symbol not trading on Binance.US", submitted=False, sig=sig)
-                else:
-                    _bump("not_listed", symbol)
+                _bump("not_listed", symbol)
                 continue
-            if sig.action == SignalAction.BUY:
-                _set_filter(symbol, "listed", True, "symbol trading on Binance.US", sig)
             try:
                 if sig.action == SignalAction.BUY:
-                    pyramid_adds = self._pyramid_adds_count(symbol)
-                    pyramid_threshold = 0.75
-                    max_pyramid_adds = 2
-                    is_pyramid = bool(
-                        open_pos
-                        and aggressive_mode
-                        and sig.confidence >= pyramid_threshold
-                        and pyramid_adds < max_pyramid_adds
-                    )
                     if not allow_buys:
-                        _set_filter(symbol, "drawdown_breaker", False, buy_block_detail, sig)
-                        _finish(symbol, buy_block_reason, buy_block_detail, submitted=False, sig=sig)
+                        _bump("breaker_tripped", symbol)
                         continue
-                    _set_filter(symbol, "drawdown_breaker", True, "circuit breaker allows BUY", sig)
-                    # Defense-in-depth: the universe builder (get_symbols/
-                    # _apply_blocklist) already excludes blocked_symbols from
-                    # what agents ever see, but a hard re-check here means a
-                    # blocked symbol can never receive a new entry regardless
-                    # of which code path produced the signal.
-                    blocked = tuple(b.upper() for b in getattr(s, "blocked_symbols", ()) or ())
-                    if symbol.upper() in blocked:
-                        _set_filter(symbol, "blocked_symbol", False, f"{symbol} is in blocked_symbols", sig)
-                        _finish(symbol, "blocked_symbol", f"{symbol} is in blocked_symbols", submitted=False, sig=sig)
-                        continue
-                    _set_filter(symbol, "blocked_symbol", True, "not blocked", sig)
-                    if symbol in held_symbols and not is_pyramid:
-                        reason = "existing position already held"
-                        if open_pos and aggressive_mode and sig.confidence >= pyramid_threshold and pyramid_adds >= max_pyramid_adds:
-                            reason = f"pyramid limit reached ({pyramid_adds}/{max_pyramid_adds})"
-                        _set_filter(symbol, "already_held", False, reason, sig)
-                        _finish(symbol, "already_held", reason, submitted=False, sig=sig)
+                    if symbol in held_symbols:
+                        _bump("already_held", symbol)
                         continue  # don't pyramid into existing position
-                    if is_pyramid:
-                        _set_filter(
-                            symbol,
-                            "already_held",
-                            True,
-                            (
-                                f"pyramiding allowed conf={sig.confidence:.3f} >= {pyramid_threshold:.3f} "
-                                f"add={pyramid_adds + 1}/{max_pyramid_adds}"
-                            ),
-                            sig,
-                        )
-                    else:
-                        _set_filter(symbol, "already_held", True, "position not currently held", sig)
-                    if self._on_cooldown(symbol, now, cooldown) and not is_pyramid:
-                        _set_filter(symbol, "cooldown", False, f"cooldown={cooldown}", sig)
-                        _finish(symbol, "cooldown", f"cooldown={cooldown}", submitted=False, sig=sig)
+                    if self._on_cooldown(symbol, now, cooldown):
+                        _bump("cooldown", symbol)
                         continue
-                    _set_filter(
-                        symbol,
-                        "cooldown",
-                        True,
-                        ("cooldown bypassed for pyramid add" if is_pyramid else f"cooldown window clear ({cooldown})"),
-                        sig,
-                    )
-                    # Extra, reason-specific cooldown after a stop-loss exit —
-                    # don't let the bot immediately re-enter the exact setup
-                    # that just lost money. Separate from the flat time cooldown
-                    # above (which applies after any BUY, win or loss).
-                    sl_cooldown, sl_why = self._stop_loss_cooldown_active(symbol)
-                    if sl_cooldown and not is_pyramid:
-                        _set_filter(symbol, "stop_loss_cooldown", False, sl_why, sig)
-                        _finish(symbol, "stop_loss_cooldown", sl_why, submitted=False, sig=sig)
-                        continue
-                    _set_filter(symbol, "stop_loss_cooldown", True, "ok", sig)
-                    entry_price = current_price if current_price is not None else await self._price(symbol)
-                    current_position_notional = None
-                    if open_pos is not None:
-                        current_position_notional = Decimal(str(open_pos.get("qty") or "0")) * entry_price
-                    entry_risk = risk_manager.evaluate_entry(
-                        mode=self.state.mode,
-                        total_equity_usdt=total_eq,
+                    ok, why = risk.can_open_new_position(
                         open_positions=open_count,
                         long_exposure_pct=long_exposure_pct,
-                        entry_price=entry_price,
-                        aggressive_mode=aggressive_mode,
-                        is_pyramid=is_pyramid,
-                        current_position_notional=current_position_notional,
                     )
-                    _set_filter(symbol, "risk_manager", entry_risk.allow, entry_risk.reason, sig)
-                    if not entry_risk.allow:
-                        _finish(symbol, "risk_manager", entry_risk.reason, submitted=False, sig=sig)
-                        log.info("skip %s BUY: %s", symbol, entry_risk.reason)
-                        continue
-
-                    atr_pct = await self._atr_pct(symbol)
-                    per_trade_usdt = entry_risk.notional_usdt
-                    eff_pct = float(per_trade_usdt / total_eq) if total_eq > 0 else 0.0
-                    buy_plan = await self._buy_order_plan(symbol, per_trade_usdt)
-                    buy_plan["atr_pct"] = atr_pct
-                    buy_plan["effective_position_pct"] = eff_pct
-                    buy_plan["usdt_free"] = usdt_free
-                    _set_sizing(symbol, buy_plan, sig)
-                    _set_filter(
-                        symbol,
-                        "min_notional",
-                        bool(buy_plan["meets_min"]),
-                        (
-                            f"qty={buy_plan['rounded_qty']} notional={buy_plan['notional']} "
-                            f"min_qty={buy_plan['min_qty']} min_notional={buy_plan['min_notional']}"
-                        ),
-                        sig,
-                    )
-
-                    # Correlation / basket exposure cap — BTC/ETH/SOL/... tend to
-                    # move together, so stacking several "independent" longs in
-                    # the same basket is really one concentrated bet.
-                    corr_ok, corr_why = await self._correlation_basket_gate(
-                        symbol, per_trade_usdt, open_positions, total_eq
-                    )
-                    _set_filter(symbol, "correlation_gate", corr_ok, corr_why, sig)
-                    if not corr_ok:
-                        _finish(symbol, "correlation_gate", corr_why, submitted=False, sig=sig)
-                        log.info("skip %s BUY: %s", symbol, corr_why)
+                    if not ok:
+                        _bump("risk_cap", symbol, why)
+                        log.info("skip %s BUY: %s", symbol, why)
                         continue
 
                     # Market-regime kill-switch — block ALL new longs while the
@@ -1395,177 +518,64 @@ class Autopilot:
                     # long-only; walk-forward backtests show every sustained loss
                     # happens in BTC bear regimes, so sit in cash instead.
                     market_ok, market_why = await self._market_gate()
-                    _set_filter(symbol, "market_regime", market_ok, market_why, sig)
                     if not market_ok:
-                        _finish(symbol, "market_gate", market_why, submitted=False, sig=sig)
+                        _bump("market_gate", symbol, market_why)
                         log.info("skip %s BUY: %s", symbol, market_why)
                         continue
-
-                    # Sideways-tier stricter setup requirement: when BTC's scored
-                    # regime is neutral (neither confirmed bull nor bear), only
-                    # take the trade if the strategy's own quality score clears
-                    # an extra bonus bar above the normal threshold.
-                    regime_score = self._last_regime_score
-                    _entry(symbol, sig)["btc_regime_score"] = regime_score
-                    # Optional stricter mode: only enter in STRONG_BULL (score>=2).
-                    if getattr(s, "require_strong_bull_regime", False) and regime_score < 2:
-                        _set_filter(
-                            symbol,
-                            "strong_bull_regime",
-                            False,
-                            f"btc_regime_score={regime_score}<2 (strong-bull-only mode)",
-                            sig,
-                        )
-                        _finish(
-                            symbol,
-                            "strong_bull_regime",
-                            f"btc_regime_score={regime_score}<2 requires STRONG_BULL",
-                            submitted=False,
-                            sig=sig,
-                        )
-                        log.info(
-                            "skip %s BUY: strong-bull-only mode (regime score %s<2)",
-                            symbol, regime_score,
-                        )
-                        continue
-                    if regime_score == 0:
-                        bonus = int(getattr(s, "market_regime_sideways_score_bonus", 15))
-                        required_score = int(getattr(s, "profitstream_score_threshold", 80)) + bonus
-                        local_score = int(getattr(sig, "quality_score", 0) or 0)
-                        sideways_ok = local_score >= required_score
-                        _set_filter(
-                            symbol,
-                            "market_regime_sideways",
-                            sideways_ok,
-                            f"local_score={local_score} required>={required_score} (sideways BTC regime)",
-                            sig,
-                        )
-                        if not sideways_ok:
-                            _finish(
-                                symbol,
-                                "market_regime_sideways",
-                                f"local_score={local_score}<{required_score} required in sideways BTC regime",
-                                submitted=False,
-                                sig=sig,
-                            )
-                            log.info(
-                                "skip %s BUY: sideways regime needs stronger setup (score=%s<%s)",
-                                symbol, local_score, required_score,
-                            )
-                            continue
 
                     # Long-term trend filter — don't buy an asset below its
                     # 200-EMA. Spot is long-only, so a downtrend long just feeds
                     # the stop-loss gate. Backtest-validated structural guard.
                     trend_ok, trend_why = await self._trend_gate(symbol)
-                    trend_ok, trend_why, adjusted_quality_score = self._profitstream_trend_adjustment(
-                        sig, trend_ok, trend_why
-                    )
-                    if adjusted_quality_score is not None:
-                        trend_entry = _entry(symbol, sig)
-                        trend_entry["trend_original_quality_score"] = int(
-                            getattr(sig, "quality_score", 0) or 0
-                        )
-                        trend_entry["trend_adjusted_quality_score"] = adjusted_quality_score
-                        if hasattr(sig, "model_copy"):
-                            sig = sig.model_copy(update={"quality_score": adjusted_quality_score})
-                    if not trend_ok and self._trend_gate_bypass_allowed(sig.confidence, ml_proba, aggressive_mode):
-                        trend_ok = True
-                        trend_why = f"bypassed conf={sig.confidence:.3f} ml_proba={ml_proba:.3f}"
-                    _set_filter(symbol, "trend_gate", trend_ok, trend_why, sig)
                     if not trend_ok:
-                        _finish(symbol, "trend_gate", trend_why, submitted=False, sig=sig)
+                        _bump("trend_gate", symbol, trend_why)
                         log.info("skip %s BUY: %s", symbol, trend_why)
                         continue
+
+                    # Volatility-scaled sizing.
+                    atr_pct = await self._atr_pct(symbol)
+                    eff_pct = risk.volatility_scaled_pct(s.max_position_pct, atr_pct)
+                    per_trade_usdt = usdt_free * Decimal(str(eff_pct))
                     # Enforce $10 minimum per trade
                     if per_trade_usdt < 10:
                         if usdt_free >= 10:
                             per_trade_usdt = Decimal("10")
                         else:
-                            _set_filter(
-                                symbol,
-                                "cash_available",
-                                False,
-                                f"per_trade={per_trade_usdt:.4f} cash={usdt_free:.2f} eff={eff_pct:.4f}",
-                                sig,
-                            )
-                            _finish(
-                                symbol,
-                                "insufficient_usdt",
-                                f"per_trade={per_trade_usdt:.4f} cash={usdt_free:.2f} eff={eff_pct:.4f}",
-                                submitted=False,
-                                sig=sig,
-                            )
+                            _bump("insufficient_usdt", symbol,
+                                  f"per_trade={per_trade_usdt:.4f} cash={usdt_free:.2f} eff={eff_pct:.4f}")
                             continue
-                    _set_filter(symbol, "cash_available", True, f"usdt_free={usdt_free}", sig)
 
                     # Derivatives context gate (funding too negative → skip long).
                     fund_ok, fund_why = await self._funding_gate(symbol)
-                    _set_filter(symbol, "funding_gate", fund_ok, fund_why, sig)
                     if not fund_ok:
-                        _finish(symbol, "funding_gate", fund_why, submitted=False, sig=sig)
+                        _bump("funding_gate", symbol, fund_why)
                         log.info("skip %s BUY: %s", symbol, fund_why)
                         continue
 
                     # On-chain whale-flow gate (exchange inflow spike → skip long).
                     flow_ok, flow_why = await self._onchain_gate(symbol)
-                    _set_filter(symbol, "onchain_gate", flow_ok, flow_why, sig)
                     if not flow_ok:
-                        _finish(symbol, "onchain_gate", flow_why, submitted=False, sig=sig)
+                        _bump("onchain_gate", symbol, flow_why)
                         log.info("skip %s BUY: %s", symbol, flow_why)
                         continue
 
                     # Order-book liquidity gate (reject thin/wide books).
                     ob_ok, ob_why = await liquidity_gate(
-                        symbol, SignalAction.BUY, per_trade_usdt, max_spread_pct=spread_cap
+                        symbol, SignalAction.BUY, per_trade_usdt
                     )
-                    _set_filter(symbol, "orderbook_gate", ob_ok, ob_why, sig)
                     if not ob_ok:
-                        retry_scheduled = False
-                        if aggressive_mode and getattr(s, "orderbook_retry_enabled", True):
-                            task_key = (symbol, sig.action.value)
-                            if task_key not in self._orderbook_retry_tasks:
-                                self._orderbook_retry_tasks[task_key] = asyncio.create_task(
-                                    self._retry_orderbook_recheck(
-                                        symbol=symbol,
-                                        sig=sig,
-                                        per_trade_usdt=per_trade_usdt,
-                                        attempt=1,
-                                        aggressive_mode=aggressive_mode,
-                                        spread_cap=spread_cap,
-                                    )
-                                )
-                                retry_scheduled = True
-                        detail = ob_why if not retry_scheduled else f"{ob_why}; retry_scheduled=60s x{int(getattr(s, 'orderbook_retry_attempts', 3))}"
-                        _finish(symbol, "orderbook_gate", detail, submitted=False, sig=sig)
+                        _bump("orderbook_gate", symbol, ob_why)
                         log.info("skip %s BUY: order book %s", symbol, ob_why)
                         continue
 
                     placed = await self._place_buy(symbol, sig, per_trade_usdt)
                     if not placed:
-                        _finish(symbol, "filter_reject_buy", "exchange filters rejected computed qty", submitted=False, sig=sig)
+                        _bump("filter_reject_buy", symbol)
                         continue
-                    risk.clear_hwm(symbol)
-                    risk.clear_tp1(symbol)
-                    risk.clear_tp2(symbol)
                     self.state.cooldowns[symbol] = now.isoformat()
-                    if not is_pyramid:
-                        open_count += 1
-                        held_symbols.add(symbol)
-                        self._clear_pyramid_adds_count(symbol)
-                    else:
-                        self._set_pyramid_adds_count(symbol, pyramid_adds + 1)
+                    open_count += 1
+                    held_symbols.add(symbol)
                     skip_counter["executed_buy"] += 1
-                    _finish(
-                        symbol,
-                        ("executed_pyramid_buy" if is_pyramid else "executed_buy"),
-                        (
-                            f"submitted qty={buy_plan['rounded_qty']} notional={buy_plan['notional']} "
-                            f"price={buy_plan['price']}"
-                        ),
-                        submitted=True,
-                        sig=sig,
-                    )
                     # Approximate exposure update so subsequent BUYs see the new total.
                     long_exposure_pct = min(
                         1.0,
@@ -1574,25 +584,15 @@ class Autopilot:
                 elif sig.action == SignalAction.SELL:
                     base = symbol.removesuffix("USDT")
                     free = balances.get(base, Decimal("0"))
-                    tracked_qty = Decimal(str(open_pos.get("qty") or 0)) if open_pos else Decimal("0")
-                    sell_qty = min(tracked_qty, free)
-                    # SAFETY: normal strategy SELLs may only reduce a tracked position.
-                    if tracked_qty > 0 and sell_qty > 0:
-                        placed = await self._place_sell(symbol, sig, sell_qty)
+                    if free > 0:
+                        placed = await self._place_sell(symbol, sig, free)
                         if placed:
                             skip_counter["executed_sell"] += 1
                             risk.clear_hwm(symbol)
-                            risk.clear_tp1(symbol)
-                            risk.clear_tp2(symbol)
-                            self._clear_pyramid_adds_count(symbol)
                         else:
                             _bump("filter_reject_sell", symbol)
                     else:
-                        _bump(
-                            "sell_no_position" if tracked_qty <= 0 else "sell_no_balance",
-                            symbol,
-                            f"tracked={tracked_qty} free={free}",
-                        )
+                        _bump("sell_no_balance", symbol)
             except Exception as exc:  # noqa: BLE001
                 self.state.last_error = f"{symbol}: {exc}"
                 log.warning("execute failed %s: %s", symbol, exc)
@@ -1702,272 +702,6 @@ class Autopilot:
             return False
         return (now - last) < cooldown
 
-    def _stop_loss_cooldown_active(self, symbol: str) -> tuple[bool, str]:
-        """Longer, reason-specific cooldown after a stop-loss exit.
-
-        Distinct from the flat `buy_cooldown_minutes` (which applies after any
-        BUY fill regardless of outcome): this specifically blocks immediately
-        re-entering a symbol that JUST stopped out, so the bot can't repeatedly
-        lose money re-buying the same failed setup. Only the symbol's most
-        recent closed trade matters — a win since then clears this cooldown.
-        """
-        s = get_settings()
-        minutes = int(getattr(s, "stop_loss_cooldown_minutes", 60))
-        if minutes <= 0:
-            return False, "ok"
-        trades = [
-            t for t in storage.closed_trades(limit=10)
-            if t.get("symbol") == symbol and t.get("mode") == self.state.mode
-        ]
-        if not trades:
-            return False, "ok"
-        last = trades[0]  # closed_trades() is ORDER BY id DESC — most recent first
-        if last.get("exit_reason") != "stop_loss":
-            return False, "ok"
-        exit_ts = _parse_dt(last.get("exit_ts"))
-        if exit_ts is None:
-            return False, "ok"
-        if exit_ts.tzinfo is None:
-            exit_ts = exit_ts.replace(tzinfo=timezone.utc)
-        resume_at = exit_ts + timedelta(minutes=minutes)
-        now = datetime.now(timezone.utc)
-        if now < resume_at:
-            return True, f"stop_loss_cooldown active until {resume_at.isoformat()}"
-        return False, "ok"
-
-    async def _correlation_basket_gate(
-        self,
-        symbol: str,
-        proposed_notional: Decimal,
-        open_positions: list[dict],
-        total_eq: Decimal,
-    ) -> tuple[bool, str]:
-        """Cap combined exposure to a basket of correlated symbols.
-
-        BTC/ETH/SOL/... tend to move together, so several "independent" longs
-        in the same basket are really one concentrated bet. Disabled checks or
-        symbols outside configured groups allow the trade; unavailable equity
-        or position pricing rejects it because concentration cannot be verified.
-        """
-        s = get_settings()
-        if not getattr(s, "correlation_gate_enabled", True):
-            return True, "correlation_gate_disabled"
-        group = next(
-            (g for g in getattr(s, "correlated_symbol_groups", ()) if symbol in g),
-            None,
-        )
-        if group is None:
-            return True, "not_in_correlated_group"
-        if total_eq <= 0:
-            return False, "correlation_no_equity_data"
-
-        basket_notional = proposed_notional
-        for pos in open_positions:
-            if pos.get("symbol") not in group or pos.get("symbol") == symbol:
-                continue
-            try:
-                qty = Decimal(str(pos.get("qty") or "0"))
-                price = await self._price(pos["symbol"])
-                basket_notional += qty * price
-            except Exception as exc:  # noqa: BLE001
-                log.warning("[CORRELATION] price lookup failed for %s: %s", pos.get("symbol"), exc)
-                return False, f"correlation_unavailable:{exc}"
-
-        cap_pct = float(getattr(s, "max_correlated_exposure_pct", 0.35))
-        basket_pct = float(basket_notional / total_eq)
-        if basket_pct > cap_pct:
-            return False, f"correlated_basket_exposure={basket_pct:.1%}>{cap_pct:.0%} group={group}"
-        return True, f"correlated_basket_exposure={basket_pct:.1%}<={cap_pct:.0%}"
-
-    def _pyramid_adds_key(self, symbol: str) -> str:
-        return f"pyramid_adds:{self.state.mode}:{symbol}"
-
-    def _pyramid_adds_count(self, symbol: str) -> int:
-        return int(storage.kv_get(self._pyramid_adds_key(symbol), 0) or 0)
-
-    def _set_pyramid_adds_count(self, symbol: str, count: int) -> None:
-        storage.kv_set(self._pyramid_adds_key(symbol), max(0, int(count)))
-
-    def _clear_pyramid_adds_count(self, symbol: str) -> None:
-        self._set_pyramid_adds_count(symbol, 0)
-
-    def _aggressive_mode_active(self) -> tuple[bool, str]:
-        s = get_settings()
-        if not getattr(s, "aggressive_mode_enabled", True):
-            return False, "disabled"
-        min_trades = int(getattr(s, "aggressive_rollback_min_trades", 30))
-        min_win_rate = float(getattr(s, "aggressive_rollback_min_win_rate", 0.50))
-        trades = [
-            t for t in storage.closed_trades(limit=min_trades)
-            if t.get("mode") == self.state.mode
-        ]
-        if len(trades) < min_trades:
-            return True, f"warmup:{len(trades)}/{min_trades}"
-        wins = sum(1 for t in trades if Decimal(str(t.get("pnl", 0))) > 0)
-        win_rate = wins / len(trades) if trades else 0.0
-        if win_rate < min_win_rate:
-            return False, f"rollback:win_rate={win_rate:.2f}<{min_win_rate:.2f}"
-        return True, f"active:win_rate={win_rate:.2f}"
-
-    def _ml_gate_threshold_for_confidence(
-        self,
-        confidence: float,
-        aggressive_mode: bool,
-        action: SignalAction | str | None = None,
-    ) -> float:
-        del confidence, aggressive_mode
-        action_value = getattr(action, "value", action)
-        if action_value == SignalAction.BUY.value:
-            return 0.40
-        if action_value == SignalAction.SELL.value:
-            return 0.50
-        return 0.50
-
-    def _signal_min_confidence(self, action: SignalAction | str) -> float:
-        action_value = getattr(action, "value", action)
-        if action_value == SignalAction.BUY.value:
-            return 0.40
-        if action_value == SignalAction.SELL.value:
-            return 0.40
-        return 0.40
-
-    def _aggressive_exit_reason(
-        self,
-        sig,
-        position_return_pct: Decimal,
-    ) -> Optional[str]:
-        if sig.action == SignalAction.SELL and sig.confidence >= 0.70:
-            return f"sell confidence={sig.confidence:.2f} >= 0.70"
-        if position_return_pct >= Decimal("0.03"):
-            return f"profit={float(position_return_pct) * 100:.2f}% >= 3.00%"
-        if position_return_pct <= Decimal("-0.05"):
-            return f"loss={float(position_return_pct) * 100:.2f}% <= -5.00%"
-        return None
-
-    def _trend_gate_bypass_allowed(
-        self,
-        confidence: float,
-        ml_proba: Optional[float],
-        aggressive_mode: bool,
-    ) -> bool:
-        s = get_settings()
-        if not aggressive_mode or ml_proba is None:
-            return False
-        return (
-            confidence > float(getattr(s, "trend_gate_bypass_confidence", 0.85))
-            and ml_proba > float(getattr(s, "trend_gate_bypass_ml_proba", 0.55))
-        )
-
-    def _profitstream_trend_adjustment(
-        self,
-        sig,
-        trend_ok: bool,
-        trend_why: str,
-    ) -> tuple[bool, str, Optional[int]]:
-        if trend_ok:
-            return True, trend_why, None
-        agents = set(getattr(sig, "contributing_agents", ()) or ())
-        if getattr(sig, "agent", "") != "profitstream_strategy" and "profitstream_strategy" not in agents:
-            return False, trend_why, None
-        quality_score = int(getattr(sig, "quality_score", 0) or 0)
-        if trend_why == "trend_no_data" or trend_why.startswith("trend_unavailable:"):
-            return False, trend_why, None
-        adjusted_score = max(0, quality_score - 10)
-        return (
-            True,
-            f"soft_penalty quality_score={quality_score}->{adjusted_score}; {trend_why}",
-            adjusted_score,
-        )
-
-    async def _retry_orderbook_recheck(
-        self,
-        *,
-        symbol: str,
-        sig,
-        per_trade_usdt: Decimal,
-        attempt: int,
-        aggressive_mode: bool,
-        spread_cap: Decimal,
-    ) -> None:
-        s = get_settings()
-        task_key = (symbol, sig.action.value)
-        try:
-            await asyncio.sleep(int(getattr(s, "orderbook_retry_delay_seconds", 60)))
-            if not self.state.running or sig.action != SignalAction.BUY:
-                return
-
-            snap = await portfolio_snapshot(mode=self.state.mode)
-            balance_source = snap.get("free_balances") or snap.get("all_balances") or {}
-            balances: dict[str, Decimal] = {
-                asset: Decimal(str(qty)) for asset, qty in balance_source.items()
-            }
-            open_positions = [
-                p for p in storage.all_positions() if p["mode"] == self.state.mode
-            ]
-            open_count, held_symbols = await self._count_non_dust_positions(
-                open_positions=open_positions,
-                balances=balances,
-            )
-            if symbol in held_symbols:
-                return
-
-            usdt_free = Decimal(str(snap["usdt_cash"]))
-            total_eq = Decimal(str(snap["total_usdt"]))
-            long_exposure_pct = float(
-                (total_eq - usdt_free) / total_eq if total_eq > 0 else Decimal("0")
-            )
-            entry_price = await self._price(symbol)
-            entry_risk = RiskManager().evaluate_entry(
-                mode=self.state.mode,
-                total_equity_usdt=total_eq,
-                open_positions=open_count,
-                long_exposure_pct=long_exposure_pct,
-                entry_price=entry_price,
-                aggressive_mode=aggressive_mode,
-            )
-            if not entry_risk.allow:
-                log.info("[OB_RETRY] %s attempt=%d skipped: %s", symbol, attempt, entry_risk.reason)
-                return
-
-            retry_notional = min(per_trade_usdt, usdt_free, entry_risk.notional_usdt)
-            if retry_notional <= 0:
-                return
-            ob_ok, ob_why = await liquidity_gate(
-                symbol,
-                SignalAction.BUY,
-                retry_notional,
-                max_spread_pct=spread_cap,
-            )
-            if not ob_ok:
-                log.info("[OB_RETRY] %s attempt=%d blocked: %s", symbol, attempt, ob_why)
-                if getattr(s, "orderbook_retry_enabled", True) and attempt < int(getattr(s, "orderbook_retry_attempts", 3)):
-                    next_task = asyncio.create_task(
-                        self._retry_orderbook_recheck(
-                            symbol=symbol,
-                            sig=sig,
-                            per_trade_usdt=retry_notional,
-                            attempt=attempt + 1,
-                            aggressive_mode=aggressive_mode,
-                            spread_cap=spread_cap,
-                        )
-                    )
-                    self._orderbook_retry_tasks[task_key] = next_task
-                return
-
-            placed = await self._place_buy(symbol, sig, retry_notional)
-            if placed:
-                self.state.cooldowns[symbol] = datetime.now(timezone.utc).isoformat()
-                self._save()
-                log.info("[OB_RETRY] %s attempt=%d executed after recheck", symbol, attempt)
-            else:
-                log.info("[OB_RETRY] %s attempt=%d failed at submit stage", symbol, attempt)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("[OB_RETRY] %s attempt=%d failed: %s", symbol, attempt, exc)
-        finally:
-            task = self._orderbook_retry_tasks.get(task_key)
-            if task is asyncio.current_task():
-                self._orderbook_retry_tasks.pop(task_key, None)
-
     async def _count_non_dust_positions(
         self,
         *,
@@ -1998,8 +732,7 @@ class Autopilot:
                     log.debug("non-dust price fetch failed for %s: %s", symbol, exc)
                     try:
                         entry = Decimal(str(pos.get("entry_price") or "0"))
-                    except Exception as e:  # noqa: BLE001
-                        log.exception("Trade execution failure: %s", e)
+                    except Exception:  # noqa: BLE001
                         entry = Decimal("0")
                     if entry <= 0:
                         continue
@@ -2096,8 +829,7 @@ class Autopilot:
         """Veto new longs when perp funding is deeply negative (crowded short).
 
         Also records OI-vs-price trend confirmation (informational, non-blocking).
-        Disabled checks allow the trade; enabled checks fail closed if their
-        data cannot be verified.
+        FAIL-OPEN: disabled or unavailable derivatives data always allows the trade.
         """
         s = get_settings()
         if not s.derivatives_data_enabled:
@@ -2105,10 +837,10 @@ class Autopilot:
         try:
             ctx = await derivatives.context(symbol)
         except Exception as exc:  # noqa: BLE001
-            log.warning("[DERIV] %s context failed (%s) — rejecting", symbol, exc)
-            return False, f"deriv_unavailable:{exc}"
+            log.debug("[DERIV] %s context failed (%s) — allowing", symbol, exc)
+            return True, f"deriv_unavailable:{exc}"
         if ctx is None:
-            return False, "deriv_none"
+            return True, "deriv_none"
 
         # OI trend confirmation: rising OI + rising price = fresh-money trend.
         try:
@@ -2131,8 +863,7 @@ class Autopilot:
         prev = store.get(symbol) if isinstance(store, dict) else None
         try:
             price_now = float(await self._price(symbol))
-        except Exception as e:  # noqa: BLE001
-            log.exception("Trade execution failure: %s", e)
+        except Exception:  # noqa: BLE001
             price_now = None
         if prev and price_now is not None:
             d_oi = ctx.open_interest - float(prev.get("oi", 0.0))
@@ -2151,8 +882,7 @@ class Autopilot:
         Binance.US spot is long-only, so buying an asset that is trending down
         only feeds the stop-loss/take-profit gate and churns fees. Require the
         latest daily close to be at or above the 200-EMA.
-        Disabled checks allow the trade; enabled checks fail closed when daily
-        trend data cannot be verified.
+        FAIL-OPEN: disabled or missing data always allows the trade.
         """
         s = get_settings()
         if not s.trend_filter_enabled:
@@ -2164,80 +894,63 @@ class Autopilot:
             df = await OHLCVRepository().get(symbol, Timeframe.D1, refresh=False)
             df = add_indicators(df).dropna()
             if df.empty or "ema_200" not in df.columns:
-                return False, "trend_no_data"
+                return True, "trend_no_data"
             last = df.iloc[-1]
             close = float(last["close"])
             ema200 = float(last["ema_200"])
             if ema200 <= 0:
-                return False, "trend_no_data"
+                return True, "trend_no_data"
             if close < ema200:
                 return False, f"close {close:.6g} < ema200 {ema200:.6g} (downtrend)"
             return True, f"close>={ema200:.6g}"
         except Exception as exc:  # noqa: BLE001
-            log.warning("[TREND] %s gate failed (%s) — rejecting", symbol, exc)
-            return False, f"trend_unavailable:{exc}"
+            log.debug("[TREND] %s gate failed (%s) — allowing", symbol, exc)
+            return True, f"trend_unavailable:{exc}"
 
     async def _market_gate(self) -> tuple[bool, str]:
         """Portfolio-wide kill-switch: block new longs in a BTC downtrend.
 
-        Uses the multi-factor scored regime (app/regime/btc_regime.py, -2..+2)
-        rather than a single EMA cross. BULL/STRONG_BULL (score>=1) allows
-        entries; BEAR/STRONG_BEAR (score<=-1) blocks ALL new longs — spot is
-        long-only, so there is no edge to take there and no walk-forward-
-        validated reversal setup exists to justify a bypass. SIDEWAYS
-        (score==0) still returns allowed=True here; `_execute` additionally
-        requires a higher-quality local setup in that tier (see
-        `market_regime_sideways_score_bonus`) via `self._last_regime_score`.
-        The verdict is identical for every symbol in a tick, so it is cached
-        briefly to avoid refetching BTC per candidate.
-        FAIL-CLOSED: if the gate is enabled but BTC regime data can't be
-        computed (fetch error, empty/short history), NEW entries are blocked —
-        the bot must not open a position while it cannot verify the broad
-        market isn't in a downtrend; missing a trade is always safer than
-        buying blind. Explicitly disabling the gate
-        (`market_regime_gate_enabled=False`) is the only way to skip this
-        check entirely.
+        Risk-OFF when BTC's 50-EMA is below its 200-EMA (a confirmed "death
+        cross"). Walk-forward backtests show every sustained loss occurs while
+        the broad market bleeds; spot is long-only so there is no edge to take
+        there — stay in cash. The verdict is identical for every symbol in a
+        tick, so it is cached briefly to avoid refetching BTC per candidate.
+        FAIL-OPEN: disabled or missing BTC data always allows trading.
         """
         s = get_settings()
         if not getattr(s, "market_regime_gate_enabled", True):
-            self._last_regime_score = 2
             return True, "market_gate_disabled"
         cache = self._market_regime_cache
         if cache is not None and (asyncio.get_event_loop().time() - cache[2]) < 300.0:
-            self._last_regime_score = cache[3] if len(cache) > 3 else 2
             return cache[0], cache[1]
-        allowed, reason, score = False, "market_no_data", -1
+        allowed, reason = True, "market_no_data"
         try:
             from app.data import OHLCVRepository
-            from app.regime.btc_regime import compute_btc_regime_score
             from app.ta import add_indicators
 
             df = await OHLCVRepository().get("BTCUSDT", Timeframe.D1, refresh=False)
             df = add_indicators(df).dropna()
             if not df.empty and {"ema_50", "ema_200"} <= set(df.columns):
-                result = compute_btc_regime_score(df)
-                score = result.score
-                if score <= -1:
-                    allowed = False
-                    reason = f"BTC regime {result.label} score={score} risk-off ({result.detail})"
-                else:
-                    allowed = True
-                    reason = f"BTC regime {result.label} score={score} risk-on ({result.detail})"
-            else:
-                log.warning("[MARKET] BTC regime data unavailable/insufficient — blocking new entries (fail-closed)")
+                last = df.iloc[-1]
+                ema50 = float(last["ema_50"])
+                ema200 = float(last["ema_200"])
+                if ema200 > 0:
+                    if ema50 < ema200:
+                        allowed = False
+                        reason = f"BTC risk-off (ema50 {ema50:.0f} < ema200 {ema200:.0f})"
+                    else:
+                        allowed = True
+                        reason = f"BTC risk-on (ema50 {ema50:.0f} >= ema200 {ema200:.0f})"
         except Exception as exc:  # noqa: BLE001
-            log.warning("[MARKET] regime gate failed (%s) — blocking new entries (fail-closed)", exc)
+            log.debug("[MARKET] regime gate failed (%s) — allowing", exc)
             reason = f"market_unavailable:{exc}"
-            score = -1
-        self._market_regime_cache = (allowed, reason, asyncio.get_event_loop().time(), score)
-        self._last_regime_score = score
+        self._market_regime_cache = (allowed, reason, asyncio.get_event_loop().time())
         return allowed, reason
 
     async def _onchain_gate(self, symbol: str) -> tuple[bool, str]:
         """Veto new longs on an exchange-inflow spike (coins moving in to be sold).
 
-        Disabled checks allow the trade; enabled checks fail closed when their
-        data cannot be verified.
+        FAIL-OPEN: disabled, no key, or unavailable on-chain data allows the trade.
         """
         s = get_settings()
         if not s.onchain_enabled:
@@ -2247,45 +960,22 @@ class Autopilot:
 
             spiked, detail = await inflow_spike(symbol)
         except Exception as exc:  # noqa: BLE001
-            log.warning("[ONCHAIN] %s check failed (%s) — rejecting", symbol, exc)
-            return False, f"onchain_unavailable:{exc}"
+            log.debug("[ONCHAIN] %s check failed (%s) — allowing", symbol, exc)
+            return True, f"onchain_unavailable:{exc}"
         if spiked:
             return False, f"exchange inflow spike ({detail})"
         return True, detail
 
     async def _place_buy(self, symbol: str, sig, per_trade_usdt: Decimal) -> bool:
-        plan = await self._buy_order_plan(symbol, per_trade_usdt)
-        price = plan["price"]
-        qty = plan["rounded_qty"]
-        if qty <= 0 or not plan["meets_min"]:
+        price = await self._price(symbol)
+        raw_qty = per_trade_usdt / price
+        qty = filters.round_qty(symbol, raw_qty)
+        if qty <= 0 or not filters.meets_min(symbol, qty, price):
             log.info("skip %s BUY: filters reject qty=%s price=%s", symbol, qty, price)
             return False
         agents = list(getattr(sig, "contributing_agents", []) or [])
-        order = await self._submit(
-            symbol, OrderSide.BUY, qty, agents,
-            entry_confidence=float(getattr(sig, "confidence", 0.0) or 0.0),
-            entry_strategy=(str(getattr(sig, "entry_strategy", "") or "") or None),
-            entry_btc_regime=getattr(sig, "entry_btc_regime", None),
-        )
-        return self._order_filled(order)
-
-    async def _buy_order_plan(self, symbol: str, per_trade_usdt: Decimal) -> dict[str, Decimal | bool | None]:
-        price = await self._price(symbol)
-        raw_qty = (per_trade_usdt / price) if price > 0 else Decimal("0")
-        rounded_qty = filters.round_qty(symbol, raw_qty)
-        min_check = filters.diagnostics(symbol, rounded_qty, price)
-        return {
-            "price": price,
-            "per_trade_usdt": per_trade_usdt,
-            "raw_qty": raw_qty,
-            "rounded_qty": rounded_qty,
-            "notional": rounded_qty * price,
-            "min_qty": min_check.get("min_qty"),
-            "min_notional": min_check.get("min_notional"),
-            "meets_min": bool(min_check.get("meets_min")),
-            "qty_ok": bool(min_check.get("qty_ok")),
-            "notional_ok": bool(min_check.get("notional_ok")),
-        }
+        await self._submit(symbol, OrderSide.BUY, qty, agents)
+        return True
 
     async def _place_sell(self, symbol: str, sig, free: Decimal) -> bool:
         price = await self._price(symbol)
@@ -2294,110 +984,21 @@ class Autopilot:
             log.info("skip %s SELL: filters reject qty=%s", symbol, qty)
             return False
         agents = list(getattr(sig, "contributing_agents", []) or [])
-        # Carry the strategy's own declared exit reason (e.g.
-        # "mean_reversion_rsi_price") through to closed_trades instead of
-        # letting it collapse into the generic "signal" bucket — required so
-        # forensic queries can tell exactly which exit path produced a trade.
-        sig_exit_reason = str(getattr(sig, "exit_reason", "") or "")
-        if sig_exit_reason:
-            agents = [*agents, f"exit:{sig_exit_reason}"]
-        order = await self._submit(symbol, OrderSide.SELL, qty, agents)
-        return self._order_filled(order)
-
-    @staticmethod
-    def _order_filled(order: Optional[Order]) -> bool:
-        """True only if the exchange actually filled the order (partial counts).
-
-        `_submit` can return a non-None Order that never filled — a live order
-        rejected/expired by Binance, or a config-drift DRY_RUN status — without
-        raising. Callers MUST check this before treating a BUY/SELL as executed;
-        otherwise cooldowns, position slots, and risk high-water-marks get
-        updated for a trade that never actually happened on the exchange.
-        """
-        if order is None:
-            return False
-        filled = order.filled_quantity or Decimal("0")
-        return order.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED) and filled > 0
+        await self._submit(symbol, OrderSide.SELL, qty, agents)
+        return True
 
     async def _submit(
-        self,
-        symbol: str,
-        side: OrderSide,
-        qty: Decimal,
-        agents: list[str],
-        *,
-        entry_confidence: Optional[float] = None,
-        entry_strategy: Optional[str] = None,
-        entry_btc_regime: Optional[int] = None,
-    ) -> Optional[Order]:
-        order_lock = f"order:{self.state.mode}:{symbol}:{side.value}"
-        if not storage.try_acquire_lock(order_lock, ttl_seconds=300.0, owner=self._owner):
-            log.warning("order skipped: another submission is active for %s %s", symbol, side.value)
-            return None
-        try:
-            return await self._submit_locked(
-                symbol, side, qty, agents,
-                entry_confidence=entry_confidence,
-                entry_strategy=entry_strategy,
-                entry_btc_regime=entry_btc_regime,
-            )
-        finally:
-            storage.release_lock(order_lock, owner=self._owner)
-
-    async def _submit_locked(
-        self,
-        symbol: str,
-        side: OrderSide,
-        qty: Decimal,
-        agents: list[str],
-        *,
-        entry_confidence: Optional[float] = None,
-        entry_strategy: Optional[str] = None,
-        entry_btc_regime: Optional[int] = None,
+        self, symbol: str, side: OrderSide, qty: Decimal, agents: list[str]
     ) -> Optional[Order]:
         if self.state.mode == "paper":
             order = await paper_exchange.place_order(
                 symbol=symbol, side=side, quantity=qty, agents=agents,
-                entry_confidence=entry_confidence, entry_strategy=entry_strategy,
-                entry_btc_regime=entry_btc_regime,
             )
         else:
-            if side is OrderSide.BUY:
-                allowed, reason, detail = await self._final_live_buy_safety_check(
-                    symbol=symbol, qty=qty
-                )
-                if not allowed:
-                    self.state.last_error = f"live BUY blocked: {reason}"
-                    log.critical("LIVE BUY BLOCKED %s: %s", symbol, reason)
-                    trade_audit_logger.log_event(
-                        mode="live",
-                        symbol=symbol,
-                        signal="BUY",
-                        execution_attempted=False,
-                        final_outcome=reason,
-                        detail=detail,
-                    )
-                    return None
             client = BinanceUSClient()
-            coid = client.generate_client_order_id()
-            try:
-                order = await client.place_order(
-                    symbol=symbol,
-                    side=side,
-                    type=OrderType.MARKET,
-                    quantity=qty,
-                    client_order_id=coid,
-                )
-            except Exception as exc:  # noqa: BLE001
-                order = await self._resolve_order_after_exception(
-                    symbol=symbol,
-                    side=side,
-                    qty=qty,
-                    coid=coid,
-                    exc=exc,
-                )
-                if order is None:
-                    return None
+            order = await client.place_order(
+                symbol=symbol, side=side, type=OrderType.MARKET, quantity=qty,
+            )
             # Only mirror a live order into our book if the exchange actually
             # filled it. Recording the *requested* qty on a partial fill (or a
             # config-drift DRY_RUN) would leave a phantom/oversized position the
@@ -2424,204 +1025,22 @@ class Autopilot:
                 )
             try:
                 price = order.avg_fill_price or order.price or await self._price(symbol)
-                order_fee_usdt = (
-                    float(order.commission)
-                    if order.commission is not None and order.commission_asset == "USDT"
-                    else 0
-                )
                 storage.record_order(
                     mode="live", symbol=symbol, side=side.value,
-                    qty=filled, price=price, fee=order_fee_usdt,
+                    qty=filled, price=price,
                     client_order_id=order.client_order_id, agents=agents,
                 )
                 if side is OrderSide.BUY:
-                    entry_fee_usdt = (
-                        float(order.commission)
-                        if order.commission is not None and order.commission_asset == "USDT"
-                        else None
-                    )
                     storage.open_position(
                         symbol=symbol, mode="live", qty=filled,
                         entry_price=price, agents=agents,
-                        entry_confidence=entry_confidence, entry_strategy=entry_strategy,
-                        entry_btc_regime=entry_btc_regime, entry_fee_usdt=entry_fee_usdt,
                     )
                 else:
-                    pos = next(
-                        (p for p in storage.all_positions() if p["symbol"] == symbol and p["mode"] == "live"),
-                        None,
-                    )
-                    mfe_pct, mae_pct = risk.mfe_mae_pct(
-                        symbol, Decimal(str((pos or {}).get("entry_price") or 0))
-                    )
-                    # Exchange fill reconciliation: use the REAL commission
-                    # Binance charged (from the order's fills[]) instead of a
-                    # modeled estimate — but only when BOTH the original
-                    # entry's and this exit's commission are known and were
-                    # paid in the quote asset (USDT). A commission paid in
-                    # another asset (e.g. BNB fee discount) isn't directly a
-                    # USDT cost without a conversion we don't have here, and
-                    # mixing one real leg with one modeled leg would blur
-                    # `fee_source` — storage.reduce_position falls back to a
-                    # fully modeled estimate for the whole trade rather than
-                    # fabricate a partial number.
-                    actual_exit_fee_usdt = None
-                    entry_fee = (pos or {}).get("entry_fee_usdt")
-                    if order.commission is not None and order.commission_asset == "USDT":
-                        actual_exit_fee_usdt = float(order.commission)
-                    storage.reduce_position(
-                        symbol=symbol, mode="live", qty=filled, exit_price=price,
-                        exit_reason=risk.infer_exit_reason(agents),
-                        mfe_pct=mfe_pct, mae_pct=mae_pct,
-                        actual_exit_fee_usdt=actual_exit_fee_usdt,
-                    )
+                    storage.close_position(symbol=symbol, exit_price=price)
             except Exception as exc:  # noqa: BLE001
-                log.critical(
-                    "LIVE order filled but local persistence failed for %s %s coid=%s: %s; "
-                    "blocking new entries until reconciliation",
-                    symbol, side.value, order.client_order_id, exc,
-                )
-                try:
-                    from app.trading import watchdog
-
-                    watchdog.trigger_emergency_halt(
-                        f"filled {side.value} {symbol} could not be persisted",
-                        level="new_entries_blocked",
-                    )
-                except Exception as halt_exc:  # noqa: BLE001
-                    log.error("failed to engage halt after persistence failure: %s", halt_exc)
+                log.warning("storage write failed for live order %s: %s", symbol, exc)
         self.state.trades_executed += 1
         return order
-
-    async def _final_live_buy_safety_check(
-        self, *, symbol: str, qty: Decimal
-    ) -> tuple[bool, str, dict]:
-        """Last mutable-state check before a Binance.US BUY submission.
-
-        Earlier strategy gates decide whether a setup is desirable. This guard
-        decides whether it is still safe to submit right now. Any unreadable or
-        inconsistent state rejects the entry; protective SELLs never use it.
-        """
-        detail = {
-            "pid": os.getpid(),
-            "revision": _active_revision(),
-            "symbol": symbol,
-            "qty": str(qty),
-        }
-        try:
-            settings = get_settings()
-            detail["live_buys_enabled"] = settings.live_buys_enabled
-            if not settings.live_buys_enabled:
-                return False, "live_buy_kill_switch", detail
-            if not self.state.running or self.state.mode != "live":
-                return False, "autopilot_not_running_live", detail
-            if self.state.starting_balance_usdt is None or self.state.starting_balance_usdt <= 0:
-                return False, "baseline_unavailable", detail
-            if not filters.loaded:
-                return False, "exchange_filters_unavailable", detail
-            for key in ("drawdown_halt", "emergency_halt", "tick_protection"):
-                value = storage.kv_get(key)
-                detail[key] = value
-                if not isinstance(value, dict):
-                    return False, f"safety_state_unknown:{key}", detail
-                if value.get("active"):
-                    return False, key, detail
-            entry_status = storage.kv_get("entry_status")
-            detail["entry_status"] = entry_status
-            if not isinstance(entry_status, dict):
-                return False, "safety_state_unknown:entry_status", detail
-            if entry_status.get("entry_halted"):
-                return False, "entry_status_halted", detail
-            if qty <= 0 or not filters.is_listed(symbol):
-                return False, "exchange_filter_reject", detail
-            price = await self._price(symbol)
-            detail["price"] = str(price)
-            if price <= 0 or not filters.meets_min(symbol, qty, price):
-                return False, "exchange_filter_reject", detail
-            snapshot = await portfolio_snapshot(mode="live")
-            usdt_free = Decimal(str(snapshot["usdt_cash"]))
-            detail["usdt_free"] = str(usdt_free)
-            detail["order_notional"] = str(qty * price)
-            if usdt_free < qty * price:
-                return False, "insufficient_usdt", detail
-            return True, "ok", detail
-        except Exception as exc:  # noqa: BLE001
-            detail["exception"] = str(exc)
-            return False, "final_safety_check_failed", detail
-
-    async def _resolve_order_after_exception(
-        self,
-        *,
-        symbol: str,
-        side: OrderSide,
-        qty: Decimal,
-        coid: str,
-        exc: Exception,
-    ) -> Optional[Order]:
-        """Resolve live order outcome after a placement exception.
-
-        Never guesses. If outcome cannot be proven, block new entries via the
-        watchdog emergency-halt path instead of risking duplicate fills.
-        """
-        client = BinanceUSClient()
-        outcome, raw = await client.get_order_by_client_id(symbol, coid)
-        if outcome == "found" and isinstance(raw, dict):
-            recovered = client.order_from_raw(
-                symbol=symbol,
-                side=side,
-                type=OrderType.MARKET,
-                quantity=qty,
-                client_order_id=coid,
-                raw=raw,
-            )
-            log.warning(
-                "order placement raised but outcome recovered from exchange: %s %s coid=%s status=%s filled=%s err=%s",
-                symbol,
-                side.value,
-                coid,
-                recovered.status,
-                recovered.filled_quantity,
-                exc,
-            )
-            return recovered
-
-        if outcome == "confirmed_absent":
-            self.state.last_error = (
-                f"{symbol} {side.value} placement exception but order confirmed not placed "
-                f"(coid={coid}): {exc}"
-            )
-            log.error(self.state.last_error)
-            return None
-
-        payload = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "mode": self.state.mode,
-            "symbol": symbol,
-            "side": side.value,
-            "qty": str(qty),
-            "client_order_id": coid,
-            "error": str(exc),
-            "outcome": outcome,
-        }
-        storage.kv_set("order_outcome_unknown", payload)
-        try:
-            from app.trading import watchdog as watchdog_module
-
-            watchdog_module.trigger_emergency_halt(
-                (
-                    f"order outcome unknown for {symbol} {side.value} coid={coid}; "
-                    "new entries blocked until operator verifies exchange state"
-                ),
-                level="order_outcome_unknown",
-            )
-        except Exception as halt_exc:  # noqa: BLE001
-            log.error("failed to trigger emergency halt for unknown order outcome: %s", halt_exc)
-        self.state.last_error = (
-            f"ORDER OUTCOME UNKNOWN for {symbol} {side.value} coid={coid}; "
-            "new entries halted"
-        )
-        log.critical("%s; original error=%s", self.state.last_error, exc)
-        return None
 
 
 autopilot = Autopilot()

@@ -19,4 +19,3 @@ data/cache/
 *.db
 .ipynb_checkpoints/
 logs/
-*.log

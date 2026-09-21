@@ -1,24 +1,20 @@
 """FastAPI entrypoint. Wires routes + APScheduler lifespan."""
 from __future__ import annotations
 
+import base64
+import binascii
+import hmac
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from app.api import router
-from app.auth import auth_guard, auth_router
 from app.config import get_settings
 from app.exchange.filters import filters
-from app.exchange.ws_stream import live_prices
-from app.llm import LLMReasoner
 from app.logging_setup import configure_logging, get_logger
 from app.scheduler import build_scheduler
-from app.storage import storage
 from app.trading.paper import paper_exchange
-from app.trading.health import startup_report
-from app.trading import risk_loop
-from app.trading.watchdog import start_health_monitor, stop_health_monitor
-from app.trading.startup import verify_before_trading
 
 log = get_logger(__name__)
 
@@ -26,99 +22,62 @@ log = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
-    settings = get_settings()
-    # Fail loud if the LLM is wired into the trading loop but disabled (e.g. the
-    # configured provider has no API key/token on this host). Without this guard
-    # a missing GITHUB_TOKEN/DEEPSEEK_API_KEY silently turns every LLM vote into
-    # HOLD/0.0 while the operator believes LLM reasoning is active.
-    if settings.llm_in_trading_loop:
-        reasoner = LLMReasoner()
-        if not reasoner.enabled:
-            log.warning(
-                "LLM_IN_TRADING_LOOP is true but the LLM reasoner is DISABLED "
-                "(provider=%s has no API key/token). LLM votes will be HOLD/0.0. "
-                "Set a key for this provider or unset LLM_IN_TRADING_LOOP.",
-                reasoner.provider,
-            )
-        else:
-            log.info("LLM reasoner active in trading loop; provider=%s", reasoner.provider)
-    # Drop expired sessions/tokens on boot.
-    try:
-        storage.purge_expired_sessions()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("purge expired sessions failed: %s", exc)
     # Load Binance.US filters (public endpoint, no auth needed).
     try:
         await filters.load()
     except Exception as exc:  # noqa: BLE001
         log.warning("filter preload failed: %s", exc)
-
-    try:
-        await verify_before_trading()
-    except Exception as exc:  # noqa: BLE001
-        log.critical("startup safety verification failed: %s", exc)
     # Seed paper account on first run.
-    try:
-        paper_exchange.ensure_seeded()
-    except Exception as exc:  # noqa: BLE001
-        log.exception("paper account seed failed: %s", exc)
-
-    # Start the live price websocket cache (best-effort; falls back to REST).
-    try:
-        live_prices.start()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("live price stream start failed: %s", exc)
-
-    # Independent risk-management loop (stop-loss/take-profit/trailing), fully
-    # decoupled from the scheduler/strategy tick — see app/trading/risk_loop.py
-    # for why. Must start before/independent of the scheduler so a stuck
-    # scheduler job can never block stop-losses from firing.
-    try:
-        risk_loop.start()
-    except Exception as exc:  # noqa: BLE001
-        log.exception("independent risk loop start failed: %s", exc)
-
-    scheduler = None
-    try:
-        scheduler = build_scheduler()
-        scheduler.start()
-        log.info("scheduler started; jobs=%s", [j.id for j in scheduler.get_jobs()])
-        start_health_monitor(scheduler)
-    except Exception as exc:  # noqa: BLE001
-        log.exception("scheduler start failed: %s", exc)
-
-    try:
-        await startup_report()
-    except Exception as exc:  # noqa: BLE001
-        log.exception("startup report failed: %s", exc)
-
+    paper_exchange.ensure_seeded()
+    scheduler = build_scheduler()
+    scheduler.start()
+    log.info("scheduler started; jobs=%s", [j.id for j in scheduler.get_jobs()])
     try:
         yield
     finally:
-        try:
-            await stop_health_monitor()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("health monitor stop failed: %s", exc)
-        try:
-            await risk_loop.stop()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("independent risk loop stop failed: %s", exc)
-        try:
-            await live_prices.stop()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("live price stream stop failed: %s", exc)
-        if scheduler is not None and scheduler.running:
-            try:
-                scheduler.shutdown(wait=False)
-                log.info("scheduler stopped")
-            except Exception as exc:  # noqa: BLE001
-                log.warning("scheduler shutdown failed: %s", exc)
+        scheduler.shutdown(wait=False)
+        log.info("scheduler stopped")
 
 
 app = FastAPI(title="AI Crypto Trading Machine", lifespan=lifespan)
 
-# Session-based auth guard. Replaces the previous HTTP Basic middleware.
-app.middleware("http")(auth_guard)
+
+def _auth_enabled() -> bool:
+    s = get_settings()
+    return bool(s.app_basic_auth_user and s.app_basic_auth_password.get_secret_value())
+
+
+def _check_basic_auth(header_value: str) -> bool:
+    if not header_value.lower().startswith("basic "):
+        return False
+    token = header_value.split(" ", 1)[1].strip()
+    try:
+        raw = base64.b64decode(token).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return False
+    if ":" not in raw:
+        return False
+    user, password = raw.split(":", 1)
+    s = get_settings()
+    exp_user = s.app_basic_auth_user
+    exp_pass = s.app_basic_auth_password.get_secret_value()
+    return hmac.compare_digest(user, exp_user) and hmac.compare_digest(password, exp_pass)
+
+
+@app.middleware("http")
+async def basic_auth_guard(request: Request, call_next):
+    if not _auth_enabled() or request.url.path == "/healthz":
+        return await call_next(request)
+
+    auth = request.headers.get("authorization", "")
+    if _check_basic_auth(auth):
+        return await call_next(request)
+
+    return JSONResponse(
+        status_code=401,
+        content={"detail": "Unauthorized"},
+        headers={"WWW-Authenticate": "Basic realm=crypto-bot"},
+    )
 
 
 @app.get("/healthz", include_in_schema=False)
@@ -126,5 +85,4 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-app.include_router(auth_router)
 app.include_router(router)

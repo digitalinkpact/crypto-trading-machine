@@ -1,7 +1,6 @@
 """Scheduler wiring. Single AsyncIOScheduler shared by the FastAPI app."""
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -9,16 +8,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.agents import run_all_agents
-from app.config import TIMEFRAMES, get_settings
+from app.config import SYMBOLS, TIMEFRAMES, get_settings
 from app.data import OHLCVRepository
-from app.exchange.symbol_source import get_symbols
 from app.llm import LLMReasoner
 from app.logging_setup import get_logger
 from app.regime import run_learning_cycle
 from app.storage import storage
 from app.trading.autopilot import autopilot
-from app.trading.performance_analytics import run_and_log_snapshot
-from app.trading.reconcile import reconcile_positions
 from app.trading.portfolio import portfolio_snapshot
 
 log = get_logger(__name__)
@@ -29,8 +25,7 @@ _LLM_META_KEY = "llm_meta"
 
 async def refresh_market_data() -> None:
     repo = OHLCVRepository()
-    symbols = await get_symbols()
-    for symbol in symbols:
+    for symbol in SYMBOLS:
         for tf in TIMEFRAMES:
             try:
                 await repo.get(symbol, tf, refresh=True)
@@ -40,12 +35,7 @@ async def refresh_market_data() -> None:
 
 async def autopilot_tick() -> None:
     """Run agents and execute signals only when the user has hit Start."""
-    timeout_s = max(5, int(get_settings().autopilot_tick_timeout_seconds))
-    try:
-        await asyncio.wait_for(autopilot.tick(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        autopilot.state.last_error = f"autopilot tick timed out after {timeout_s}s"
-        log.critical("autopilot tick timed out after %ss", timeout_s)
+    await autopilot.tick()
 
 
 async def equity_snapshot() -> None:
@@ -122,29 +112,6 @@ async def ml_learning_pass() -> None:
     log.info("ml learning pass: %s", result)
 
 
-async def reconcile_portfolio() -> None:
-    """Reconcile stored positions with actual balances every 5 minutes."""
-    mode = autopilot.state.mode
-    try:
-        result = await reconcile_positions(mode=mode)
-        log.info("portfolio reconcile mode=%s result=%s", mode, result)
-    except Exception as e:  # noqa: BLE001
-        # Log and return — this is a scheduled job that reruns every 5 minutes;
-        # re-raising just duplicates the traceback in apscheduler's executor
-        # log without adding any recovery, and one failed cycle shouldn't be
-        # treated as fatal for a self-healing background reconciliation job.
-        log.exception("portfolio reconcile failed mode=%s: %s", mode, e)
-
-
-async def performance_analytics_pass() -> None:
-    """Refresh profitability analytics snapshots for dashboards and tuning."""
-    mode = autopilot.state.mode
-    try:
-        run_and_log_snapshot(mode=mode, lookback_days=180)
-    except Exception as exc:  # noqa: BLE001
-        log.exception("performance analytics pass failed mode=%s: %s", mode, exc)
-
-
 def build_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(refresh_market_data, CronTrigger(minute="*/15"), id="market_data")
@@ -152,7 +119,5 @@ def build_scheduler() -> AsyncIOScheduler:
     scheduler.add_job(llm_signal_pass, CronTrigger(minute="7"), id="llm_pass")
     scheduler.add_job(ml_learning_pass, CronTrigger(minute="12", hour="*/6"), id="ml_learning")
     scheduler.add_job(equity_snapshot, CronTrigger(minute="55"), id="equity_curve")
-    scheduler.add_job(reconcile_portfolio, CronTrigger(minute="*/5"), id="portfolio_reconcile")
-    scheduler.add_job(performance_analytics_pass, CronTrigger(minute="20", hour="*/1"), id="performance_analytics")
     return scheduler
 
