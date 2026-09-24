@@ -359,6 +359,27 @@ def volatility_scaled_pct(
     return base_pct * mult
 
 
+def confidence_scaled_pct(
+    base_pct: float,
+    confidence: float,
+    min_confidence: float,
+    *,
+    floor: float = 0.5,
+) -> float:
+    """Scale position size up with signal conviction.
+
+    Multiplier ramps linearly from `floor` (at the entry confidence bar) to 1.0
+    (at confidence == 1.0), so higher-confidence signals get a bigger slice.
+    """
+    span = 1.0 - min_confidence
+    if span <= 0:
+        return base_pct
+    frac = (confidence - min_confidence) / span
+    frac = max(0.0, min(1.0, frac))
+    mult = floor + (1.0 - floor) * frac
+    return base_pct * mult
+
+
 def can_open_new_position(
     *,
     open_positions: int,

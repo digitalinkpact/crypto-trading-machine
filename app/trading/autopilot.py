@@ -535,11 +535,18 @@ class Autopilot:
                     # Volatility-scaled sizing.
                     atr_pct = await self._atr_pct(symbol)
                     eff_pct = risk.volatility_scaled_pct(s.max_position_pct, atr_pct)
+                    # Conviction-scaled sizing — trade bigger when more confident.
+                    if s.confidence_sizing_enabled:
+                        eff_pct = risk.confidence_scaled_pct(
+                            eff_pct, sig.confidence, min_conf,
+                            floor=s.confidence_sizing_floor,
+                        )
                     per_trade_usdt = usdt_free * Decimal(str(eff_pct))
-                    # Enforce $10 minimum per trade
-                    if per_trade_usdt < 10:
-                        if usdt_free >= 10:
-                            per_trade_usdt = Decimal("10")
+                    # Enforce the configured minimum order notional.
+                    min_order = Decimal(str(s.min_order_usdt))
+                    if per_trade_usdt < min_order:
+                        if usdt_free >= min_order:
+                            per_trade_usdt = min_order
                         else:
                             _bump("insufficient_usdt", symbol,
                                   f"per_trade={per_trade_usdt:.4f} cash={usdt_free:.2f} eff={eff_pct:.4f}")

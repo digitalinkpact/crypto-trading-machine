@@ -105,7 +105,7 @@ _RISK_KEYS = {
     "drawdown_circuit_breaker_pct":   ("DRAWDOWN_CIRCUIT_BREAKER_PCT",   float,   (0.01, 0.50)),
     "min_signal_confidence":          ("MIN_SIGNAL_CONFIDENCE",          float,   (0.0, 1.0)),
     "max_position_pct":               ("MAX_POSITION_PCT",               float,   (0.005, 1.0)),
-    "max_open_positions":             ("MAX_OPEN_POSITIONS",             _to_int, (1, 25)),
+    "max_open_positions":             ("MAX_OPEN_POSITIONS",             _to_int, (1, 50)),
     "ml_gate_threshold":              ("ML_GATE_THRESHOLD",              float,   (0.0, 1.0)),
 }
 

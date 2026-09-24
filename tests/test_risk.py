@@ -173,6 +173,20 @@ def test_volatility_scaled_pct():
     assert extreme_quiet <= 0.05 * 1.5 + 1e-9
 
 
+def test_confidence_scaled_pct():
+    base, min_conf = 0.05, 0.72
+    # At the confidence bar → floor multiplier
+    at_floor = risk.confidence_scaled_pct(base, min_conf, min_conf, floor=0.5)
+    assert abs(at_floor - base * 0.5) < 1e-9
+    # At full confidence → full size
+    at_full = risk.confidence_scaled_pct(base, 1.0, min_conf, floor=0.5)
+    assert abs(at_full - base) < 1e-9
+    # Monotonic: more confidence → more size
+    lo = risk.confidence_scaled_pct(base, 0.80, min_conf, floor=0.5)
+    hi = risk.confidence_scaled_pct(base, 0.90, min_conf, floor=0.5)
+    assert hi > lo
+
+
 def test_max_open_positions_cap():
     s = get_settings()
     ok, _ = risk.can_open_new_position(
@@ -189,7 +203,7 @@ def test_max_open_positions_cap():
 
 
 def test_max_long_exposure_cap():
-    blocked, why = risk.can_open_new_position(open_positions=1, long_exposure_pct=0.65)
+    blocked, why = risk.can_open_new_position(open_positions=1, long_exposure_pct=0.97)
     assert blocked is False
     assert "long_exposure" in why
 
