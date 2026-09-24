@@ -221,6 +221,11 @@ class Settings(BaseSettings):
     trailing_stop_pct: float = Field(0.025, ge=0.005, le=0.20)   # 2.5% trail from HWM
     max_hold_hours: int = Field(96, ge=1, le=10000)              # force-exit after 4 days
     drawdown_circuit_breaker_pct: float = Field(0.10, ge=0.01, le=0.50)  # halt new BUYs after -10%
+    # Daily realized-loss guard — halts new BUYs once today's realized PnL drops
+    # below -daily_loss_limit_pct of starting equity. Resets at UTC midnight.
+    # Fail-open: disabled, or no starting balance known, never trips.
+    daily_loss_limit_enabled: bool = True
+    daily_loss_limit_pct: float = Field(0.05, ge=0.005, le=0.50)
 
     # Entry gates
     min_signal_confidence: float = Field(0.72, ge=0.0, le=1.0)   # raised 0.65->0.72: only high-conviction entries
