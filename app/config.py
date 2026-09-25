@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     use_dynamic_symbols: bool = True
     symbols_cache_minutes: int = Field(60, ge=1, le=1440)
     static_symbols: tuple[str, ...] = STATIC_SYMBOLS
+    # Universe-level hard blocklist — symbols dropped from every pairlist
+    # (static or dynamic), case-insensitive. Empty = block nothing.
+    blocked_symbols: tuple[str, ...] = ()
     # Universe filters (applied when use_dynamic_symbols=True). Trade every
     # USDT pair on Binance.US except the ones below.
     #  - Leveraged ETF tokens (…UP/DOWN/BULL/BEAR-USDT) are excluded: they decay
@@ -105,6 +108,9 @@ class Settings(BaseSettings):
     # API rate limit/backoff
     api_retry_attempts: int = Field(3, ge=1, le=10)
     api_retry_backoff_base: int = Field(2, ge=1, le=10)
+    # Watchdog: consecutive fully-healthy iterations required before an
+    # emergency halt auto-clears (a real verify-safe check still follows).
+    emergency_halt_auto_clear_cycles: int = Field(3, ge=1, le=100)
 
     model_config = SettingsConfigDict(
         env_file=_ENV_PATH,

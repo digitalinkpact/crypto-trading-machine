@@ -339,7 +339,22 @@ class Autopilot:
                 f"DRAWDOWN BREAKER TRIPPED at {dd:.1%} — new BUYs halted"
             )
             log.warning(self.state.last_error)
-        return tripped
+            return True
+
+        # Daily realized-loss guard — halts new BUYs once today's realized PnL
+        # breaches the configured fraction of starting equity. Exits untouched.
+        day_tripped, day_pnl = risk.is_daily_loss_limit_tripped(
+            mode=self.state.mode,
+            starting_balance=self.state.starting_balance_usdt,
+        )
+        if day_tripped:
+            self.state.last_error = (
+                f"DAILY LOSS LIMIT TRIPPED at {day_pnl:.2f} USDT today — new BUYs halted"
+            )
+            log.warning(self.state.last_error)
+            return True
+
+        return False
 
     # ── execution ──────────────────────────────────────────────────────
     async def _execute(self, signals, *, allow_buys: bool = True) -> None:
