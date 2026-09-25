@@ -2,12 +2,6 @@ from __future__ import annotations
 
 import pytest
 
-pytest.skip(
-    "Legacy runner fallback + ProfitStream integration was removed in the "
-    "simplification; re-enable when those modules are restored.",
-    allow_module_level=True,
-)
-
 from types import SimpleNamespace
 
 import pytest
@@ -88,6 +82,7 @@ def _build_profitstream_fallback_fixture(monkeypatch, *, use_legacy_agents: bool
     class _Settings:
         profitstream_enabled = True
         profitstream_use_legacy_agents = use_legacy_agents
+        profitstream_score_threshold = 80
         ml_gate_threshold = 0.5
         paper_trading = True
 

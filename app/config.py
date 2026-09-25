@@ -260,6 +260,8 @@ class Settings(BaseSettings):
     oversold_bounce_bb_multiplier: float = Field(1.02, ge=1.0, le=1.20)
     oversold_bounce_min_bounce_pct: float = Field(0.05, ge=0.0, le=0.50)
     max_dip_extension_pct: float = Field(0.15, ge=0.01, le=0.60)
+    profitstream_enabled: bool = True
+    profitstream_use_legacy_agents: bool = False
     profitstream_score_threshold: int = Field(80, ge=0, le=100)
     profitstream_low_volume_quote_min: float = Field(50.0, ge=0.0, le=1_000_000.0)
     profitstream_news_buffer_minutes: int = Field(30, ge=0, le=240)
