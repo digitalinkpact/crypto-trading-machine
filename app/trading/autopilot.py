@@ -238,7 +238,14 @@ class Autopilot:
                     log.warning("circuit breaker check failed: %s", exc)
                     breaker_tripped = False
 
-                # 3. Agent signals → execute (skip BUYs if breaker tripped).
+                # 2b. Watchdog emergency-halt / tick-protection — block NEW BUYs
+                #     while the supervisor has escalated (exits stay enabled).
+                halt_reason = self._entry_halt_reason()
+                if halt_reason:
+                    self.state.last_error = f"new BUYs blocked: {halt_reason}"
+                    log.warning(self.state.last_error)
+
+                # 3. Agent signals → execute (skip BUYs if breaker tripped/halted).
                 try:
                     signals = await run_all_agents(use_llm=get_settings().llm_in_trading_loop)
                 except Exception as exc:  # noqa: BLE001
@@ -247,7 +254,9 @@ class Autopilot:
                     self._save()
                     return
                 try:
-                    await self._execute(signals, allow_buys=not breaker_tripped)
+                    await self._execute(
+                        signals, allow_buys=(not breaker_tripped) and halt_reason is None
+                    )
                 finally:
                     self._save()
             finally:
@@ -323,6 +332,22 @@ class Autopilot:
                 risk.clear_hwm(ex.symbol)
             except Exception as exc:  # noqa: BLE001
                 log.exception("risk-exit failed for %s: %s", ex.symbol, exc)
+
+    def _entry_halt_reason(self) -> Optional[str]:
+        """Block NEW BUYs while the watchdog has escalated an emergency-halt or
+        tick-protection flag. Exits/monitoring are never gated by this."""
+        if not getattr(get_settings(), "emergency_halt_enabled", True):
+            return None
+        halt = storage.kv_get("emergency_halt") or {}
+        if isinstance(halt, dict) and halt.get("active"):
+            level = halt.get("level") or "new_entries_blocked"
+            reason = halt.get("reason") or "watchdog emergency halt"
+            return f"emergency_halt:{level}:{reason}"
+        tick_protection = storage.kv_get("tick_protection") or {}
+        if isinstance(tick_protection, dict) and tick_protection.get("active"):
+            reason = tick_protection.get("reason") or "stale_tick_protection"
+            return f"tick_protection:{reason}"
+        return None
 
     async def _check_circuit_breaker(self) -> bool:
         try:

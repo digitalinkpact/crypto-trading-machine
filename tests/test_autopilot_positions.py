@@ -61,6 +61,43 @@ async def test_trend_gate_disabled_fail_open(monkeypatch):
     assert why == "trend_disabled"
 
 
+def _halt_settings(enabled: bool = True):
+    class _S:
+        emergency_halt_enabled = enabled
+
+    return _S()
+
+
+def test_entry_halt_reason_blocks_on_emergency_halt(monkeypatch):
+    """A watchdog emergency_halt flag must block new BUYs."""
+    ap = Autopilot()
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _halt_settings(True))
+    kv = {"emergency_halt": {"active": True, "level": "new_entries_blocked", "reason": "binance_alive down"}}
+    monkeypatch.setattr(autopilot_module.storage, "kv_get", lambda k, default=None: kv.get(k, default))
+    reason = ap._entry_halt_reason()
+    assert reason is not None
+    assert "emergency_halt" in reason and "binance_alive down" in reason
+
+
+def test_entry_halt_reason_blocks_on_tick_protection(monkeypatch):
+    """A stale-tick tick_protection flag must block new BUYs."""
+    ap = Autopilot()
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _halt_settings(True))
+    kv = {"tick_protection": {"active": True, "reason": "trade_loop_stale"}}
+    monkeypatch.setattr(autopilot_module.storage, "kv_get", lambda k, default=None: kv.get(k, default))
+    reason = ap._entry_halt_reason()
+    assert reason is not None
+    assert "tick_protection" in reason
+
+
+def test_entry_halt_reason_none_when_clear(monkeypatch):
+    """No halt flags → new BUYs allowed."""
+    ap = Autopilot()
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _halt_settings(True))
+    monkeypatch.setattr(autopilot_module.storage, "kv_get", lambda k, default=None: {})
+    assert ap._entry_halt_reason() is None
+
+
 def _market_settings(enabled: bool = True):
     class _S:
         market_regime_gate_enabled = enabled
