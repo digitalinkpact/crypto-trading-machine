@@ -233,6 +233,63 @@ class Settings(BaseSettings):
     daily_loss_limit_enabled: bool = True
     daily_loss_limit_pct: float = Field(0.05, ge=0.005, le=0.50)
 
+    # ── Restored fields (live code contract) ─────────────────────────────
+    # These are read directly by strategy.py / health.py / watchdog.py /
+    # risk_loop.py / risk.py / reconcile.py / trainer.py. A prior "simplify
+    # config" refactor dropped them from Settings while leaving the consumers
+    # in place, which made the live strategy raise AttributeError. Restored
+    # verbatim from the last known-good config. Do NOT remove without also
+    # removing every consumer.
+    # Exit ladder (ATR stop, tiered take-profit, trailing, stale exit)
+    atr_stop_enabled: bool = True
+    atr_stop_max_pct: float = Field(0.08, ge=0.01, le=0.50)      # never wider than 8%
+    atr_stop_min_pct: float = Field(0.03, ge=0.005, le=0.20)     # never tighter than 3%
+    atr_stop_multiple: float = Field(2.0, ge=0.5, le=6.0)        # stop distance = N x daily ATR%
+    take_profit_1_pct: float = Field(0.08, ge=0.005, le=0.50)     # scale out at +8%
+    take_profit_1_fraction: float = Field(0.50, ge=0.05, le=1.0)  # sell 50% of the position
+    take_profit_2_pct: float = Field(0.15, ge=0.005, le=1.0)      # scale out at +15%
+    take_profit_2_fraction: float = Field(0.25, ge=0.05, le=1.0)  # sell 25% of the ORIGINAL stake
+    trailing_activation_pct: float = Field(0.05, ge=0.005, le=0.50)  # arm trailing after +5%
+    trailing_requires_tp1: bool = False
+    stale_exit_enabled: bool = True
+    stale_exit_hours: int = Field(48, ge=1, le=10000)
+    stale_exit_max_pnl_pct: float = Field(0.02, ge=0.0, le=0.50)
+    # Entry strategy (ProfitStream dip-buy vs oversold-bounce) + guards
+    entry_strategy: str = Field("oversold_bounce", pattern="^(dip_buy|oversold_bounce)$")
+    oversold_bounce_rsi_max: float = Field(40.0, ge=1.0, le=99.0)
+    oversold_bounce_bb_multiplier: float = Field(1.02, ge=1.0, le=1.20)
+    oversold_bounce_min_bounce_pct: float = Field(0.05, ge=0.0, le=0.50)
+    max_dip_extension_pct: float = Field(0.15, ge=0.01, le=0.60)
+    profitstream_score_threshold: int = Field(80, ge=0, le=100)
+    profitstream_low_volume_quote_min: float = Field(50.0, ge=0.0, le=1_000_000.0)
+    profitstream_news_buffer_minutes: int = Field(30, ge=0, le=240)
+    profitstream_news_events_utc: str = ""
+    # Signal-driven mean-reversion exit
+    mean_reversion_exit_enabled: bool = False
+    mean_reversion_exit_rsi: float = Field(55.0, ge=1.0, le=99.0)
+    mean_reversion_exit_min_pnl_pct: float = Field(0.003, ge=-0.20, le=0.20)
+    mean_reversion_exit_require_momentum_confirmation: bool = True
+    mean_reversion_exit_require_price_confirmation: bool = True
+    mean_reversion_exit_defer_to_risk_ladder: bool = True
+    # Watchdog / health-monitor thresholds
+    emergency_halt_enabled: bool = True
+    emergency_halt_max_failures: int = Field(3, ge=1, le=100)
+    health_cpu_warn_pct: float = Field(90.0, ge=1.0, le=4_000.0)
+    health_latency_warn_seconds: float = Field(3.0, ge=0.1, le=120.0)
+    health_memory_rss_warn_mb: float = Field(1_024.0, ge=128.0, le=65_536.0)
+    health_tick_stale_seconds: int = Field(180, ge=30, le=86_400)
+    health_order_failure_lookback_minutes: int = Field(30, ge=1, le=1_440)
+    health_order_failure_max: int = Field(3, ge=1, le=1_000)
+    health_duplicate_order_lookback_minutes: int = Field(15, ge=1, le=1_440)
+    health_duplicate_order_window_seconds: int = Field(45, ge=1, le=600)
+    # Independent risk loop + reconciliation
+    risk_loop_in_process_enabled: bool = True
+    risk_manager_loop_seconds: int = Field(15, ge=5, le=300)
+    reconcile_auto_close_stale: bool = True
+    reconcile_qty_shortfall_tolerance_pct: float = Field(0.01, ge=0.0, le=0.10)
+    # ML labeling
+    ml_label_slippage_pct: float = Field(0.0010, ge=0.0, le=0.05)
+
     # Entry gates
     min_signal_confidence: float = Field(0.72, ge=0.0, le=1.0)   # raised 0.65->0.72: only high-conviction entries
     buy_cooldown_minutes: int = Field(30, ge=0, le=1440)         # was 60
