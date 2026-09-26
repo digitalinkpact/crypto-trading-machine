@@ -64,12 +64,13 @@ class Settings(BaseSettings):
     #  - min_quote_volume_usdt is a 24h liquidity floor; 0 = no floor (all coins).
     #    Raise it (e.g. 1_000_000) to skip thin coins with high slippage risk.
     #  - max_symbols caps the universe to the top-N USDT pairs ranked by 24h
-    #    quote volume (the most-liquid coins). 0 = no cap. Applied AFTER the
-    #    min_quote_volume_usdt floor. The top-N are inherently liquid, so this
-    #    doubles as a slippage guard while widening the tradeable universe.
+    #    quote volume (the most-liquid coins). 0 = no cap — scan every pair.
+    #    Applied AFTER the min_quote_volume_usdt floor. Default 0 so the
+    #    non-liquidity-pairlist path never truncates the universe either (the
+    #    liquidity pairlist below is the primary path and has its own gates).
     exclude_leveraged_tokens: bool = True
     min_quote_volume_usdt: float = Field(0.0, ge=0.0)
-    max_symbols: int = Field(100, ge=0, le=1000)
+    max_symbols: int = Field(0, ge=0, le=1000)
 
     # ── Liquidity-ranked pairlist (multi-stage universe filter) ──────────
     # When `liquidity_pairlist_enabled` is True, the tradable universe is built
@@ -93,22 +94,53 @@ class Settings(BaseSettings):
     # `min_24h_volume` is therefore intentionally low; the spread cap plus the
     # execution-time order-book gate do the real liquidity protection.
     liquidity_pairlist_enabled: bool = True
-    universe_size: int = Field(75, ge=1, le=1000)
+    # universe_size is the stage-1 candidate cap by 24h volume. Binance.US has
+    # only ~198 tradable USDT pairs (202 TRADING - 1 leveraged-suffix - 3
+    # stablecoin pairs, measured 2026-09-26), so 1000 means "take every pair"
+    # and is future-proofed against new listings (hard-capped at 1000 by the
+    # Field bound). The volume/age/spread gates below - not this cap - are what
+    # filter out thin/new/wide-spread coins.
+    universe_size: int = Field(1000, ge=1, le=1000)
     min_24h_volume: float = Field(1_000.0, ge=0.0)
     max_spread_percent: float = Field(0.50, ge=0.0, le=100.0)
     min_days_listed: int = Field(15, ge=0, le=10_000)
-    final_pairlist_size: int = Field(50, ge=1, le=1000)
+    # final_pairlist_size is the post-filter cap on survivors. 1000 keeps every
+    # coin that clears the volume/age/spread gates (Binance.US never has that
+    # many liquid USDT pairs, so this is effectively "no post-filter cap").
+    final_pairlist_size: int = Field(1000, ge=1, le=1000)
     volume_sort_key: str = "quoteVolume"
     volume_refresh_seconds: int = Field(1800, ge=30, le=86_400)
     # Max concurrent per-symbol liquidity probes (depth + listing age).
     liquidity_probe_concurrency: int = Field(8, ge=1, le=50)
     # Hard blocklist — never opened as a NEW entry regardless of how the
     # universe is sourced (static/dynamic/liquidity-ranked); wired via
-    # app/exchange/symbol_source.py's `_apply_blocklist`. Existing risk gates
-    # still close any position already open in these symbols; only NEW BUYs
-    # are blocked. Empty by default — populate via .env (BLOCKED_SYMBOLS) if a
-    # specific coin proves to be a chronic tail-loss producer.
-    blocked_symbols: tuple[str, ...] = ()
+    # app/exchange/symbol_source.py's `_apply_blocklist` and a second hard stop
+    # in autopilot._execute. Existing risk gates still CLOSE any position
+    # already open in these symbols; only NEW BUYs are blocked. Override via
+    # .env (BLOCKED_SYMBOLS) if needed.
+    #
+    # Populated from evidence, not hunches (measured 2026-09-26):
+    #  A) Proven money-losers — this bot's own LIVE closed_trades (460 trades,
+    #     2026-06-13..2026-09-26). Criterion: >=10 trades AND a clearly-negative
+    #     aggregate PnL. (ETHUSDT -$1.76/37% wr, LTCUSDT -$0.61/80% wr, UNIUSDT
+    #     -$2.43/53% wr were negative too, but within fee-noise / with healthy
+    #     win rates, so deliberately NOT blocked.)
+    #  B) Structurally thin order books — top-of-book spread measured twice,
+    #     identical, on Binance.US; each is >=15x the 0.45% universe spread cap.
+    #     The universe spread probe FAILS OPEN on error, so these are a hard
+    #     backstop against that path. (ONE 5.4%, PROM 5.4%, BTRST 4.9%, DGB 4.4%
+    #     also trip the gate but are left to the dynamic spread filter.)
+    blocked_symbols: tuple[str, ...] = (
+        # A) proven live losers (trades / realized PnL / win-rate):
+        "ZECUSDT",       # 75 trades, -$12.17, 18.7% win — worst by a wide margin
+        "PUMPUSDT",      # 38 trades, -$5.46, 31.6% win
+        "HYPEUSDT",      # 55 trades, -$5.23, 21.8% win
+        # B) structurally thin / un-tradeable spreads (2026-09-26):
+        "TOSHIUSDT",     # top-of-book spread 25.3%
+        "FARTCOINUSDT",  # 13.7%
+        "XECUSDT",       # 8.5%
+        "VIRTUALUSDT",   # 7.4%
+    )
     # API rate limit/backoff
     api_retry_attempts: int = Field(3, ge=1, le=10)
     api_retry_backoff_base: int = Field(2, ge=1, le=10)

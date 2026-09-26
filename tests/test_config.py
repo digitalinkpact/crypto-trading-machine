@@ -70,9 +70,10 @@ def test_execution_defaults_are_more_permissive():
     s = Settings(_env_file=None)
     assert s.ml_gate_enabled is True
     assert s.live_buys_enabled is False
-    assert s.max_open_positions == 10
-    assert s.rollback_max_open_positions == 10
-    assert s.aggressive_max_open_positions == 10
+    # Position caps were raised 10->50 in eaf0a39 ("live at 50"); Field le=50.
+    assert s.max_open_positions == 50
+    assert s.rollback_max_open_positions == 50
+    assert s.aggressive_max_open_positions == 50
 
 
 def test_live_mode_forces_live_flags():
@@ -103,16 +104,21 @@ def test_live_mode_does_not_disable_ml_gate(monkeypatch):
 
 
 def test_live_mode_does_not_relax_risk_caps(monkeypatch):
-    # LIVE_MODE must not widen max_open_positions/max_long_exposure_pct either
-    # — those are controlled solely by their own settings, live or not.
+    # LIVE_MODE must not widen any position/exposure cap — each is controlled
+    # solely by its own setting, live or not. Every cap is set to an explicit
+    # non-default value so this guards the invariant independently of whatever
+    # the code defaults happen to be (they were silently coupled before, and a
+    # later default bump 10->50 broke this test without any behavior change).
     monkeypatch.setenv("LIVE_MODE", "true")
     monkeypatch.setenv("MAX_OPEN_POSITIONS", "5")
+    monkeypatch.setenv("AGGRESSIVE_MAX_OPEN_POSITIONS", "7")
+    monkeypatch.setenv("ROLLBACK_MAX_OPEN_POSITIONS", "6")
     monkeypatch.setenv("MAX_LONG_EXPOSURE_PCT", "0.60")
     s = Settings(_env_file=None)
     assert s.live_mode is True
     assert s.max_open_positions == 5
-    assert s.aggressive_max_open_positions == 10
-    assert s.rollback_max_open_positions == 10
+    assert s.aggressive_max_open_positions == 7
+    assert s.rollback_max_open_positions == 6
     assert s.max_long_exposure_pct == 0.60
 
 

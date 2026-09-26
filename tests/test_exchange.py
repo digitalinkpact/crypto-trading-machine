@@ -380,6 +380,62 @@ async def test_fetch_liquid_universe_filters_and_caps(monkeypatch):
     assert result == ["BBBUSDT", "CCCUSDT"]
 
 
+@pytest.mark.asyncio
+async def test_fetch_liquid_universe_at_full_size_does_not_collapse_to_fallback(monkeypatch):
+    """Widening universe_size/final_pairlist_size to the full 1000 cap must
+    still return a non-empty, correctly-filtered list — never silently fall
+    back to fetch_dynamic_symbols / the static list."""
+    import pandas as pd
+    from app.exchange import symbols as sym_mod
+
+    # 30 candidates: C00-C04 are below the volume floor; C05/C06 have a wide
+    # spread; the remaining 23 are liquid and must survive at the new size.
+    bases = [f"C{i:02d}" for i in range(30)]
+    exchange_info = {"symbols": [{"symbol": f"{b}USDT", "status": "TRADING"} for b in bases]}
+    ticker_24hr = [
+        {"symbol": f"{b}USDT", "quoteVolume": ("500" if i < 5 else str(1_000_000 + i))}
+        for i, b in enumerate(bases)
+    ]
+
+    def _factory(*a, **k):
+        return _FakeAsyncClient(exchange_info, ticker_24hr, *a, **k)
+
+    monkeypatch.setattr(sym_mod.httpx, "AsyncClient", _factory)
+
+    class _FakeClient:
+        wide = {"C05USDT", "C06USDT"}  # ~1.0% spread > 0.50% cap
+
+        async def order_book(self, symbol, limit=5):
+            ask = "101.0" if symbol in self.wide else "100.01"
+            return {"bids": [["100.0", "10"]], "asks": [[ask, "10"]]}
+
+        async def klines(self, symbol, timeframe, limit=500):
+            return pd.DataFrame({"close": list(range(min(30, limit)))})  # 30 >= min_days
+
+    # The fallback path must NOT be taken — make it raise if it ever is.
+    async def _boom():
+        raise AssertionError("collapsed to fetch_dynamic_symbols at full universe_size")
+
+    monkeypatch.setattr(sym_mod, "fetch_dynamic_symbols", _boom)
+
+    sym_mod._LIQUID_CACHE = {"symbols": None, "timestamp": 0.0}
+    monkeypatch.setattr(
+        sym_mod, "get_settings",
+        lambda: Settings(
+            _env_file=None, liquidity_pairlist_enabled=True, universe_size=1000,
+            min_24h_volume=1000.0, max_spread_percent=0.50, min_days_listed=15,
+            final_pairlist_size=1000,
+        ),
+    )
+
+    result = await sym_mod.fetch_liquid_universe(client=_FakeClient())
+    assert len(result) == 23              # non-empty AND correctly filtered
+    assert result == sorted(result)       # alphabetical output, not a fallback
+    assert "C00USDT" not in result        # dropped: below the volume floor
+    assert "C05USDT" not in result        # dropped: spread too wide
+    assert "C07USDT" in result and "C29USDT" in result
+
+
 @pytest.mark.parametrize(
     "symbol",
     [
