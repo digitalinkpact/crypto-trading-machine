@@ -94,20 +94,19 @@ class Settings(BaseSettings):
     # `min_24h_volume` is therefore intentionally low; the spread cap plus the
     # execution-time order-book gate do the real liquidity protection.
     liquidity_pairlist_enabled: bool = True
-    # universe_size is the stage-1 candidate cap by 24h volume. Binance.US has
-    # only ~198 tradable USDT pairs (202 TRADING - 1 leveraged-suffix - 3
-    # stablecoin pairs, measured 2026-09-26), so 1000 means "take every pair"
-    # and is future-proofed against new listings (hard-capped at 1000 by the
-    # Field bound). The volume/age/spread gates below - not this cap - are what
-    # filter out thin/new/wide-spread coins.
-    universe_size: int = Field(1000, ge=1, le=1000)
+    # universe_size is the stage-1 candidate cap by 24h volume. Kept at the
+    # top-75 by 24h volume: widening to the full ~198-pair universe (2026-09-26)
+    # let the bot reach into thin/volatile coins that dropped live win-rate from
+    # ~95% to ~69% (2026-09-29 regression); the top-75-by-volume cap keeps entries
+    # in liquid names. The volume/age/spread gates below filter further.
+    universe_size: int = Field(75, ge=1, le=1000)
     min_24h_volume: float = Field(1_000.0, ge=0.0)
     max_spread_percent: float = Field(0.50, ge=0.0, le=100.0)
     min_days_listed: int = Field(15, ge=0, le=10_000)
-    # final_pairlist_size is the post-filter cap on survivors. 1000 keeps every
-    # coin that clears the volume/age/spread gates (Binance.US never has that
-    # many liquid USDT pairs, so this is effectively "no post-filter cap").
-    final_pairlist_size: int = Field(1000, ge=1, le=1000)
+    # final_pairlist_size is the post-filter cap on survivors. 50 keeps the most
+    # liquid survivors after the volume/age/spread gates (paired with the top-75
+    # universe_size above to hold entry quality; see 2026-09-29 win-rate revert).
+    final_pairlist_size: int = Field(50, ge=1, le=1000)
     volume_sort_key: str = "quoteVolume"
     volume_refresh_seconds: int = Field(1800, ge=30, le=86_400)
     # Max concurrent per-symbol liquidity probes (depth + listing age).
@@ -270,7 +269,7 @@ class Settings(BaseSettings):
     max_position_pct: float = Field(0.05, ge=0.005, le=1.0)      # per-position sizing cap
     max_portfolio_risk_pct: float = Field(0.25, ge=0.0, le=1.0)
     kelly_fraction_cap: float = Field(0.25, ge=0.005, le=1.0)
-    max_open_positions: int = Field(50, ge=1, le=50)              # cap concurrent positions
+    max_open_positions: int = Field(12, ge=1, le=50)             # cap concurrent positions
     max_long_exposure_pct: float = Field(0.60, ge=0.0, le=1.0)   # ≤ 60% of equity in non-USDT
     aggressive_mode_enabled: bool = True
     aggressive_rollback_min_trades: int = Field(30, ge=1, le=10_000)
@@ -279,8 +278,10 @@ class Settings(BaseSettings):
     rollback_max_spread_pct: float = Field(0.0015, ge=0.0, le=0.05)
     aggressive_position_pct: float = Field(0.06, ge=0.005, le=1.0)
     rollback_position_pct: float = Field(0.03, ge=0.005, le=1.0)
-    aggressive_max_open_positions: int = Field(50, ge=1, le=50)
-    rollback_max_open_positions: int = Field(50, ge=1, le=50)
+    # aggressive_max_open_positions is the BINDING cap while aggressive_mode_enabled
+    # (max_open_positions alone does nothing then). 12 = 2026-09-29 win-rate revert.
+    aggressive_max_open_positions: int = Field(12, ge=1, le=50)
+    rollback_max_open_positions: int = Field(12, ge=1, le=50)
     trend_gate_bypass_confidence: float = Field(0.85, ge=0.0, le=1.0)
     trend_gate_bypass_ml_proba: float = Field(0.55, ge=0.0, le=1.0)
     pyramid_confidence_threshold: float = Field(0.85, ge=0.0, le=1.0)

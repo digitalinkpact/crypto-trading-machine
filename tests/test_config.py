@@ -70,10 +70,12 @@ def test_execution_defaults_are_more_permissive():
     s = Settings(_env_file=None)
     assert s.ml_gate_enabled is True
     assert s.live_buys_enabled is False
-    # Position caps were raised 10->50 in eaf0a39 ("live at 50"); Field le=50.
-    assert s.max_open_positions == 50
-    assert s.rollback_max_open_positions == 50
-    assert s.aggressive_max_open_positions == 50
+    # Position caps reverted 50->12 (2026-09-29): the 50-cap widening dropped
+    # live win-rate ~95%->~69% by filling low-quality slots past the top ~12;
+    # locked in code so an env reset can't silently re-widen. Field le=50.
+    assert s.max_open_positions == 12
+    assert s.rollback_max_open_positions == 12
+    assert s.aggressive_max_open_positions == 12
 
 
 def test_live_mode_forces_live_flags():
