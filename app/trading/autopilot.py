@@ -2475,19 +2475,33 @@ class Autopilot:
         """The exchange stop already sold the position — record the exit at its
         ACTUAL fill price/fee and close the book row (never a second SELL)."""
         try:
+            fill_price = fill.get("fill_price")
+            try:
+                priced = Decimal(str(fill_price)) if fill_price is not None else Decimal("0")
+            except (ArithmeticError, ValueError, TypeError):
+                priced = Decimal("0")
+            if priced <= 0:
+                # A 0/None fill price would corrupt realized PnL. detect_fill
+                # should already have returned None here; refuse as a backstop
+                # so close_position is NEVER called with a non-positive price.
+                log.error(
+                    "exchange_stop fill for %s had non-positive price %r — NOT recording exit",
+                    symbol, fill_price,
+                )
+                return
             pos = storage.get_position(symbol)
             entry_price = Decimal(str((pos or {}).get("entry_price") or 0))
             mfe_pct, mae_pct = risk.mfe_mae_pct(symbol, entry_price)
             fee = fill.get("fee")
             actual_fee = float(fee) if fee is not None and fill.get("fee_asset") == "USDT" else None
             storage.close_position(
-                symbol=symbol, mode=self.state.mode, exit_price=fill["fill_price"],
+                symbol=symbol, mode=self.state.mode, exit_price=priced,
                 exit_reason="exchange_stop", mfe_pct=mfe_pct, mae_pct=mae_pct,
                 actual_fee_usdt=actual_fee,
             )
             risk.clear_hwm(symbol); risk.clear_tp1(symbol); risk.clear_tp2(symbol)
             log.warning("EXCHANGE STOP filled %s at %s — recorded exit (no double-sell)",
-                        symbol, fill["fill_price"])
+                        symbol, priced)
         except Exception as exc:  # noqa: BLE001
             log.error("failed to record exchange_stop exit for %s: %s", symbol, exc)
 

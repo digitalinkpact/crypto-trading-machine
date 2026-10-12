@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from app.config import get_settings
@@ -143,12 +143,61 @@ class ProtectiveStopManager:
             return None
         if not raw or str(raw.get("status")) != "FILLED":
             return None
-        price = raw.get("fillPrice") or raw.get("avgPrice") or raw.get("price") or raw.get("stopPrice")
+        # A market STOP_LOSS reports price="0.00000000"; the ONLY honest fill
+        # price is the executed average = cummulativeQuoteQty / executedQty
+        # (note Binance's real field spelling). Never fall back to the price/
+        # stopPrice fields — that records a bogus (often 0) exit.
+        try:
+            executed_qty = Decimal(str(raw.get("executedQty") or "0"))
+            cum_quote = Decimal(str(raw.get("cummulativeQuoteQty") or "0"))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+        if executed_qty <= 0:
+            return None  # nothing actually filled — inconclusive, don't record a 0 exit
+        fill_price = cum_quote / executed_qty
+        if fill_price <= 0:
+            return None
+        fee, fee_asset = await self._fill_commission(symbol, raw)
         return {
-            "fill_price": Decimal(str(price or 0)),
-            "fee": Decimal(str(raw.get("commission") or 0)),
-            "fee_asset": raw.get("commissionAsset"),
+            "fill_price": fill_price,
+            "fee": fee,
+            "fee_asset": fee_asset,
         }
+
+    async def _fill_commission(
+        self, symbol: str, raw: dict
+    ) -> tuple[Optional[Decimal], Optional[str]]:
+        """Recover the stop's REAL commission from myTrades by orderId. Returns
+        (total, asset) only when every trade for the order paid commission in the
+        SAME asset; otherwise (None, None) so the caller models the fee rather
+        than fabricate one. A failed/empty lookup also yields (None, None)."""
+        order_id = raw.get("orderId")
+        if order_id is None:
+            return None, None
+        try:
+            trades = await self._client.my_trades(symbol, order_id)
+        except Exception:  # noqa: BLE001
+            return None, None
+        total = Decimal("0")
+        asset: Optional[str] = None
+        matched = False
+        for t in trades or []:
+            if str(t.get("orderId")) != str(order_id):
+                continue
+            try:
+                commission = Decimal(str(t.get("commission") or "0"))
+            except (InvalidOperation, ValueError, TypeError):
+                return None, None
+            fill_asset = t.get("commissionAsset")
+            if asset is None:
+                asset = fill_asset
+            elif fill_asset != asset:
+                return None, None  # mixed commission assets — don't guess
+            total += commission
+            matched = True
+        if not matched or asset is None:
+            return None, None
+        return total, asset
 
     async def ratchet(self, symbol: str, qty, software_stop_price, entry_ts: str) -> Optional[Order]:
         """Move the exchange stop UP only (never down), and only by at least

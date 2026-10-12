@@ -437,3 +437,96 @@ def test_canary_validator_requires_allowlist_when_enabled():
     assert s3.exchange_stop_allowed("BTCUSDT") is False
 
 
+
+
+# ── detect_fill: honest market-stop fill price + commission ──────────────────
+@pytest.mark.asyncio
+async def test_detect_fill_uses_cumquote_not_zero_price_field():
+    """A market STOP_LOSS reports price=0; detect_fill must price it at
+    cummulativeQuoteQty/executedQty and recover the fee from myTrades."""
+    fake = FakeExchange()
+    coid = stop_coid("pstop-", "ADAUSDT", "t1")
+    fake.seed_fill(
+        coid, "ADAUSDT", executed_qty="1.5", cum_quote="45000.0", order_id=7777,
+        trades=[{"orderId": 7777, "commission": "0.07", "commissionAsset": "USDT"}],
+    )
+    fill = await _mgr(fake).detect_fill("ADAUSDT", "t1")
+    assert fill is not None
+    assert fill["fill_price"] == Decimal("30000")      # 45000 / 1.5, not the 0 price field
+    assert fill["fill_price"] > 0
+    assert fill["fee"] == Decimal("0.07") and fill["fee_asset"] == "USDT"
+
+
+@pytest.mark.asyncio
+async def test_detect_fill_returns_none_when_executed_qty_zero():
+    fake = FakeExchange()
+    coid = stop_coid("pstop-", "ADAUSDT", "t1")
+    fake.seed_fill(coid, "ADAUSDT", executed_qty="0", cum_quote="0", order_id=7778)
+    assert await _mgr(fake).detect_fill("ADAUSDT", "t1") is None
+
+
+@pytest.mark.asyncio
+async def test_detect_fill_models_fee_when_mytrades_fails():
+    """If the myTrades fee lookup fails, detect_fill still returns a valid price
+    with fee=None so the caller records the exit with a MODELED fee."""
+    fake = FakeExchange()
+    fake.fail_my_trades = True
+    coid = stop_coid("pstop-", "ADAUSDT", "t1")
+    fake.seed_fill(coid, "ADAUSDT", executed_qty="2", cum_quote="60.0", order_id=7779)
+    fill = await _mgr(fake).detect_fill("ADAUSDT", "t1")
+    assert fill is not None
+    assert fill["fill_price"] == Decimal("30")
+    assert fill["fee"] is None and fill["fee_asset"] is None
+
+
+@pytest.mark.asyncio
+async def test_detect_fill_mixed_commission_assets_fall_back_to_modeled():
+    fake = FakeExchange()
+    coid = stop_coid("pstop-", "ADAUSDT", "t1")
+    fake.seed_fill(
+        coid, "ADAUSDT", executed_qty="2", cum_quote="60.0", order_id=7780,
+        trades=[
+            {"orderId": 7780, "commission": "0.01", "commissionAsset": "USDT"},
+            {"orderId": 7780, "commission": "0.5", "commissionAsset": "BNB"},
+        ],
+    )
+    fill = await _mgr(fake).detect_fill("ADAUSDT", "t1")
+    assert fill is not None and fill["fill_price"] == Decimal("30")
+    assert fill["fee"] is None          # mixed assets -> don't guess -> modeled downstream
+
+
+@pytest.mark.asyncio
+async def test_record_exit_never_closes_position_at_zero_price(monkeypatch):
+    """Backstop: even a malformed fill with price 0 must NOT reach close_position."""
+    import app.trading.autopilot as ap_mod
+    from app.trading.autopilot import Autopilot
+    ap = Autopilot()
+    ap.state.mode = "live"
+    closes: list = []
+    monkeypatch.setattr(ap_mod.storage, "get_position", lambda s: {"entry_price": 1.0})
+    monkeypatch.setattr(ap_mod.risk, "mfe_mae_pct", lambda s, e: (None, None))
+    for fn in ("clear_hwm", "clear_tp1", "clear_tp2"):
+        monkeypatch.setattr(ap_mod.risk, fn, lambda *a, **k: None)
+    monkeypatch.setattr(ap_mod.storage, "close_position", lambda **k: closes.append(k))
+    await ap._record_exchange_stop_exit("ADAUSDT", {"fill_price": Decimal("0"), "fee": None})
+    await ap._record_exchange_stop_exit("ADAUSDT", {"fill_price": None, "fee": None})
+    assert closes == []                 # never recorded a 0/None-price exit
+
+
+@pytest.mark.asyncio
+async def test_record_exit_closes_at_real_price_with_actual_fee(monkeypatch):
+    import app.trading.autopilot as ap_mod
+    from app.trading.autopilot import Autopilot
+    ap = Autopilot()
+    ap.state.mode = "live"
+    closes: list = []
+    monkeypatch.setattr(ap_mod.storage, "get_position", lambda s: {"entry_price": 1.0})
+    monkeypatch.setattr(ap_mod.risk, "mfe_mae_pct", lambda s, e: (None, None))
+    for fn in ("clear_hwm", "clear_tp1", "clear_tp2"):
+        monkeypatch.setattr(ap_mod.risk, fn, lambda *a, **k: None)
+    monkeypatch.setattr(ap_mod.storage, "close_position", lambda **k: closes.append(k))
+    await ap._record_exchange_stop_exit(
+        "ADAUSDT", {"fill_price": Decimal("0.95"), "fee": Decimal("0.07"), "fee_asset": "USDT"})
+    assert len(closes) == 1
+    assert closes[0]["exit_price"] == Decimal("0.95")
+    assert closes[0]["actual_fee_usdt"] == 0.07

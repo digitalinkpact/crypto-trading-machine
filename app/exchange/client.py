@@ -390,6 +390,24 @@ class BinanceUSClient:
         kwargs = {"symbol": symbol} if symbol else {}
         return await self._api_call("open_orders", self._spot.get_open_orders, **kwargs)
 
+    async def my_trades(
+        self, symbol: str, order_id: int | str
+    ) -> list[dict[str, Any]]:
+        """Read-only account trades for a single order (REST /api/v3/myTrades).
+
+        Returns the raw trade dicts so callers can recover the REAL commission
+        a market order paid (the order payload for a market STOP_LOSS carries no
+        usable price/fee). Signed + rate-limited through `_api_call`. Returns an
+        empty list in paper/dry_run — there is no live account to query — which
+        makes the caller fall back to a modeled fee rather than fabricate one.
+        """
+        if self._settings.dry_run or self._settings.paper_trading:
+            return []
+        raw = await self._api_call(
+            "my_trades", self._spot.my_trades, symbol=symbol, orderId=order_id,
+        )
+        return raw if isinstance(raw, list) else []
+
     # ── Liquidation ──────────────────────────────────────────────────────
     async def liquidate_all(self, quote: str = "USDT") -> list[Order]:
         """Market-sell every non-quote balance into `quote`.
