@@ -832,6 +832,31 @@ class Storage:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def closed_positions(self, limit: int = 100, mode: Optional[str] = None) -> list[dict]:
+        """Return the most recent closed POSITIONS (not partial-exit rows).
+
+        A position is the set of ``closed_trades`` rows sharing the same
+        ``(symbol, entry_ts)`` — a single entry that may have been scaled out in
+        several TP1/TP2/trailing legs, each of which is its own row. Rows are
+        grouped and their pnl summed; a position wins when the summed pnl > 0.
+        Ordered most-recent-first by the last leg's id. Used for win-rate
+        decisions so partial winners aren't counted multiple times.
+        """
+        sql = (
+            "SELECT symbol, entry_ts, SUM(pnl) AS pnl, "
+            "SUM(COALESCE(pnl_pct, 0)) AS pnl_pct, MAX(exit_ts) AS exit_ts, "
+            "MAX(id) AS last_id, COUNT(*) AS rows FROM closed_trades "
+        )
+        params: list = []
+        if mode is not None:
+            sql += "WHERE mode=? "
+            params.append(mode)
+        sql += "GROUP BY symbol, entry_ts ORDER BY last_id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock, self._conn() as c:
+            rows = c.execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
     # ── Paper balances ───────────────────────────────────────────────
     def paper_balance_set(self, asset: str, qty: Decimal | float) -> None:
         with self._lock, self._conn() as c:

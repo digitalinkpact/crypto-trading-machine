@@ -274,6 +274,13 @@ class Settings(BaseSettings):
     aggressive_mode_enabled: bool = True
     aggressive_rollback_min_trades: int = Field(30, ge=1, le=10_000)
     aggressive_rollback_min_win_rate: float = Field(0.50, ge=0.0, le=1.0)
+    # Win rate is measured per POSITION (rows grouped by symbol+entry_ts, a
+    # position wins if its summed pnl > 0), not per partial-exit row. Winners
+    # exit in several rows (TP1/TP2/trailing) while losers exit in one, so a
+    # row-level win rate reads several points too high and kept the aggressive
+    # sizing engaged through losing regimes. Position-level is the safer default;
+    # set WIN_RATE_POSITION_LEVEL=false to restore the legacy per-row behaviour.
+    win_rate_position_level: bool = True
     aggressive_max_spread_pct: float = Field(0.0025, ge=0.0, le=0.05)
     rollback_max_spread_pct: float = Field(0.0015, ge=0.0, le=0.05)
     aggressive_position_pct: float = Field(0.06, ge=0.005, le=1.0)

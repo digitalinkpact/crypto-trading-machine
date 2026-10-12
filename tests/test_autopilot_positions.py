@@ -407,18 +407,72 @@ def test_aggressive_mode_rolls_back_below_min_win_rate(monkeypatch):
         aggressive_mode_enabled = True
         aggressive_rollback_min_trades = 30
         aggressive_rollback_min_win_rate = 0.50
+        win_rate_position_level = True
 
     monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    # Position-level: 14 winning positions + 16 losing positions -> 46.7% < 50%.
     monkeypatch.setattr(
         autopilot_module.storage,
-        "closed_trades",
-        lambda limit=30: [{"mode": "live", "pnl": 1}] * 14 + [{"mode": "live", "pnl": -1}] * 16,
+        "closed_positions",
+        lambda limit=30, mode=None: [{"pnl": 1}] * 14 + [{"pnl": -1}] * 16,
         raising=True,
     )
 
     active, reason = ap._aggressive_mode_active()
     assert active is False
     assert "rollback" in reason
+
+
+def test_aggressive_mode_win_rate_counts_positions_not_partial_rows(monkeypatch):
+    """A winner scaled out in 3 TP/trailing rows must count as ONE win.
+
+    Row-level counting (3 winning rows + 16 losing rows = 16% ... inverted) is
+    exactly the inflation this fix removes: the guard must see the true
+    position-level win rate, not the partial-exit-padded row count.
+    """
+    ap = Autopilot()
+    ap.state.mode = "live"
+
+    class _S:
+        aggressive_mode_enabled = True
+        aggressive_rollback_min_trades = 3
+        aggressive_rollback_min_win_rate = 0.50
+        win_rate_position_level = True
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    # closed_positions already collapses the 3 partial rows into 1 winning
+    # position; here 1 win + 2 losses = 33% < 50% -> rollback.
+    monkeypatch.setattr(
+        autopilot_module.storage,
+        "closed_positions",
+        lambda limit=3, mode=None: [{"pnl": 30}, {"pnl": -1}, {"pnl": -1}],
+        raising=True,
+    )
+    active, reason = ap._aggressive_mode_active()
+    assert active is False
+    assert "rollback:win_rate=0.33" in reason
+
+
+def test_aggressive_mode_row_level_when_flag_disabled(monkeypatch):
+    ap = Autopilot()
+    ap.state.mode = "live"
+
+    class _S:
+        aggressive_mode_enabled = True
+        aggressive_rollback_min_trades = 30
+        aggressive_rollback_min_win_rate = 0.50
+        win_rate_position_level = False
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    monkeypatch.setattr(
+        autopilot_module.storage,
+        "closed_trades",
+        lambda limit=30: [{"mode": "live", "pnl": 1}] * 20 + [{"mode": "live", "pnl": -1}] * 10,
+        raising=True,
+    )
+    active, reason = ap._aggressive_mode_active()
+    assert active is True
+    assert "active:win_rate=0.67" in reason
 
 
 def test_aggressive_mode_stays_active_during_warmup(monkeypatch):
@@ -429,12 +483,13 @@ def test_aggressive_mode_stays_active_during_warmup(monkeypatch):
         aggressive_mode_enabled = True
         aggressive_rollback_min_trades = 30
         aggressive_rollback_min_win_rate = 0.50
+        win_rate_position_level = True
 
     monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
     monkeypatch.setattr(
         autopilot_module.storage,
-        "closed_trades",
-        lambda limit=30: [{"mode": "live", "pnl": 1}] * 10,
+        "closed_positions",
+        lambda limit=30, mode=None: [{"pnl": 1}] * 10,
         raising=True,
     )
 

@@ -90,6 +90,39 @@ def test_positions_are_isolated_by_mode(tmp_path):
     assert remaining[0]["mode"] == "paper"
 
 
+def test_closed_positions_groups_partial_exit_rows(tmp_path):
+    s = _fresh_storage(tmp_path)
+
+    def _ins(mode, symbol, entry_ts, pnl, exit_ts):
+        with s._lock, s._conn() as c:
+            c.execute(
+                "INSERT INTO closed_trades(mode,symbol,qty,entry_price,exit_price,"
+                "pnl,pnl_pct,entry_ts,exit_ts,agents) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (mode, symbol, 1.0, 100.0, 100.0, pnl, 0.0, entry_ts, exit_ts, "[]"),
+            )
+
+    # ONE winning position scaled out across 3 legs (TP1 + TP2 + trailing),
+    # all sharing the same entry_ts — must count as a single winning position.
+    _ins("live", "BTCUSDT", "2026-10-01T00:00:00+00:00", 5.0, "2026-10-01T05:00:00+00:00")
+    _ins("live", "BTCUSDT", "2026-10-01T00:00:00+00:00", 3.0, "2026-10-01T06:00:00+00:00")
+    _ins("live", "BTCUSDT", "2026-10-01T00:00:00+00:00", 2.0, "2026-10-01T07:00:00+00:00")
+    # ONE losing position, single row.
+    _ins("live", "ETHUSDT", "2026-10-02T00:00:00+00:00", -4.0, "2026-10-02T03:00:00+00:00")
+    # A paper row that the mode filter must exclude.
+    _ins("paper", "SOLUSDT", "2026-10-02T00:00:00+00:00", 9.0, "2026-10-02T04:00:00+00:00")
+
+    positions = s.closed_positions(limit=10, mode="live")
+    assert len(positions) == 2  # 4 live rows -> 2 live positions; paper excluded
+    by_sym = {p["symbol"]: p for p in positions}
+    assert by_sym["BTCUSDT"]["pnl"] == 10.0  # 3 partial-exit rows summed
+    assert by_sym["BTCUSDT"]["rows"] == 3
+    assert by_sym["ETHUSDT"]["pnl"] == -4.0
+    # ONE winning position, not three winning rows.
+    assert sum(1 for p in positions if p["pnl"] > 0) == 1
+    # Most-recent-first by the last leg's id (ETH rows inserted after BTC).
+    assert positions[0]["symbol"] == "ETHUSDT"
+
+
 def test_component_heartbeat_upsert_and_readback(tmp_path):
     s = _fresh_storage(tmp_path)
 

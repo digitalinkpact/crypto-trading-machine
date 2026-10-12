@@ -1797,14 +1797,19 @@ class Autopilot:
             return False, "disabled"
         min_trades = int(getattr(s, "aggressive_rollback_min_trades", 30))
         min_win_rate = float(getattr(s, "aggressive_rollback_min_win_rate", 0.50))
-        trades = [
-            t for t in storage.closed_trades(limit=min_trades)
-            if t.get("mode") == self.state.mode
-        ]
-        if len(trades) < min_trades:
-            return True, f"warmup:{len(trades)}/{min_trades}"
-        wins = sum(1 for t in trades if Decimal(str(t.get("pnl", 0))) > 0)
-        win_rate = wins / len(trades) if trades else 0.0
+        if getattr(s, "win_rate_position_level", True):
+            # Group partial-exit rows into positions so a winner that scaled out
+            # in several TP1/TP2/trailing legs counts once, not several times.
+            units = storage.closed_positions(limit=min_trades, mode=self.state.mode)
+        else:
+            units = [
+                t for t in storage.closed_trades(limit=min_trades)
+                if t.get("mode") == self.state.mode
+            ]
+        if len(units) < min_trades:
+            return True, f"warmup:{len(units)}/{min_trades}"
+        wins = sum(1 for t in units if Decimal(str(t.get("pnl", 0))) > 0)
+        win_rate = wins / len(units) if units else 0.0
         if win_rate < min_win_rate:
             return False, f"rollback:win_rate={win_rate:.2f}<{min_win_rate:.2f}"
         return True, f"active:win_rate={win_rate:.2f}"

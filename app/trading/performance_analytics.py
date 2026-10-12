@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from statistics import mean, pstdev
 
+from app.config import get_settings
 from app.logging_setup import get_logger
 from app.storage import storage
 
@@ -83,7 +84,17 @@ def build_performance_snapshot(*, mode: str, lookback_days: int = 180) -> dict:
     closed = [r for r in storage.closed_trades(limit=5000) if r.get("mode") == mode]
     closed = [r for r in closed if (_parse_dt(str(r.get("exit_ts") or "")) or cutoff) >= cutoff]
 
-    pnls = [_to_float(r.get("pnl", 0.0)) for r in closed]
+    # Win-rate KPIs are measured per POSITION (rows grouped by symbol+entry_ts)
+    # so a winner scaled out across TP1/TP2/trailing legs counts once, not
+    # several times (see Settings.win_rate_position_level).
+    if getattr(get_settings(), "win_rate_position_level", True):
+        _grouped: dict[tuple[str, str], float] = defaultdict(float)
+        for r in closed:
+            key = (str(r.get("symbol") or ""), str(r.get("entry_ts") or ""))
+            _grouped[key] += _to_float(r.get("pnl", 0.0))
+        pnls = list(_grouped.values())
+    else:
+        pnls = [_to_float(r.get("pnl", 0.0)) for r in closed]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
     trade_count = len(pnls)
@@ -165,6 +176,7 @@ def build_performance_snapshot(*, mode: str, lookback_days: int = 180) -> dict:
         "mode": mode,
         "lookback_days": lookback_days,
         "trade_count": trade_count,
+        "closed_row_count": len(closed),
         "win_rate": win_rate,
         "profit_factor": profit_factor,
         "expectancy": expectancy,
