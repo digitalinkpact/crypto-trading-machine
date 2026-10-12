@@ -66,10 +66,16 @@ class ProtectiveStopManager:
 
     # ── planning / feasibility ───────────────────────────────────────────
     def plan(self, symbol: str, qty, software_stop_price, entry_ts: str) -> StopPlan:
+        raw_stop = backstop_price(software_stop_price, self._buffer)
+        try:
+            from app.exchange.filters import filters as _filters
+            stop_price = _filters.round_price(symbol, raw_stop) if _filters.loaded else raw_stop
+        except Exception:  # noqa: BLE001
+            stop_price = raw_stop
         return StopPlan(
             symbol=symbol,
             qty=Decimal(str(qty)),
-            stop_price=backstop_price(software_stop_price, self._buffer),
+            stop_price=stop_price,
             coid=stop_coid(self._prefix, symbol, entry_ts),
         )
 
@@ -125,15 +131,38 @@ class ProtectiveStopManager:
         await self.cancel(symbol, entry_ts)
         return await self.place(self.plan(symbol, qty, software_stop_price, entry_ts))
 
+    async def detect_fill(self, symbol: str, entry_ts: str) -> Optional[dict]:
+        """If this position's stop has FILLED on the exchange, return its actual
+        fill price + commission so a software exit records exit_reason=
+        exchange_stop at the REAL price/fee instead of double-selling. None if
+        the stop is still resting, absent, or the lookup is inconclusive."""
+        coid = stop_coid(self._prefix, symbol, entry_ts)
+        try:
+            raw = await self._client.get_order(symbol, coid)
+        except Exception:  # noqa: BLE001
+            return None
+        if not raw or str(raw.get("status")) != "FILLED":
+            return None
+        price = raw.get("fillPrice") or raw.get("avgPrice") or raw.get("price") or raw.get("stopPrice")
+        return {
+            "fill_price": Decimal(str(price or 0)),
+            "fee": Decimal(str(raw.get("commission") or 0)),
+            "fee_asset": raw.get("commissionAsset"),
+        }
+
     async def ratchet(self, symbol: str, qty, software_stop_price, entry_ts: str) -> Optional[Order]:
-        """Move the exchange stop UP only (never down). No-op if the resting
-        stop is already at/above the new backstop (avoids cancel/replace churn)."""
+        """Move the exchange stop UP only (never down), and only by at least
+        exchange_stop_ratchet_min_step_pct of the resting stop (avoids churn).
+        No-op otherwise."""
         new_stop = backstop_price(software_stop_price, self._buffer)
         coid = stop_coid(self._prefix, symbol, entry_ts)
         cur = next((o for o in await self.list_bot_stops(symbol)
                     if o.get("clientOrderId") == coid), None)
-        if cur is not None and Decimal(str(cur.get("stopPrice", "0"))) >= new_stop:
-            return None
+        if cur is not None:
+            cur_stop = Decimal(str(cur.get("stopPrice", "0")))
+            min_step = Decimal(str(getattr(self._s, "exchange_stop_ratchet_min_step_pct", 0.01)))
+            if new_stop < cur_stop * (Decimal("1") + min_step):
+                return None  # not a big enough upward move — don't churn
         return await self.replace(symbol, qty, software_stop_price, entry_ts)
 
     # ── fleet reconciliation ─────────────────────────────────────────────

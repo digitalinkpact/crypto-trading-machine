@@ -290,6 +290,24 @@ def test_round_qty_never_scientific(step, raw, expected):
     assert "E" not in str(q) and "e" not in str(q)
 
 
+@pytest.mark.parametrize(
+    "tick, min_price, raw, expected",
+    [
+        ("0.01", "0.01", "61234.5678", "61234.56"),   # round DOWN to tick
+        ("0.00001", "0.00001", "0.0000089", "0.00001"),  # clamp up to minPrice
+        ("0.0001", "0", "2.34567", "2.3456"),
+    ],
+)
+def test_round_price_tick_and_min(tick, min_price, raw, expected):
+    from app.exchange.filters import SymbolFilters
+
+    f = SymbolFilters()
+    f._info = {"X": {"status": "TRADING", "tick_size": Decimal(tick), "min_price": Decimal(min_price)}}
+    p = f.round_price("X", Decimal(raw))
+    assert p == Decimal(expected)
+    assert "E" not in str(p) and "e" not in str(p)
+
+
 class _FakeResp:
     def __init__(self, payload):
         self._payload = payload

@@ -191,6 +191,12 @@ class BinanceUSClient:
                 return "confirmed_absent", None
             return "inconclusive", None
 
+    async def get_order(self, symbol: str, client_order_id: str) -> Optional[dict[str, Any]]:
+        """Raw order payload for a client-order-id, or None if absent/unknown.
+        Thin wrapper over get_order_by_client_id for the protective-stop manager."""
+        outcome, raw = await self.get_order_by_client_id(symbol, client_order_id)
+        return raw if outcome == "found" else None
+
     # ── Market data ──────────────────────────────────────────────────────
     async def klines(
         self,

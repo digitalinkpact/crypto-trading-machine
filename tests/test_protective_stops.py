@@ -2,6 +2,7 @@
 All deterministic — FakeExchange, no network."""
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 
 import pytest
@@ -19,6 +20,11 @@ class _S:
     exchange_native_stops_enabled = True
     exchange_stop_coid_prefix = "pstop-"
     exchange_stop_buffer_pct = 0.01
+    exchange_stop_ratchet_min_step_pct = 0.01
+    exchange_native_stops_canary_symbols = "all"
+    trailing_activation_pct = 0.05
+    trailing_stop_pct = 0.03
+    paper_trading = False
 
 
 def _mgr(client):
@@ -213,4 +219,205 @@ async def test_autopilot_place_protective_stop_halts_on_failure(monkeypatch):
 
     ok = await ap._place_protective_stop("BTCUSDT", Decimal("0.01"), Decimal("100"), "t1")
     assert ok is False and halts == [1]  # unprotected -> halted new entries
+
+
+# ── locked-balance scenarios (i)-(viii): fail on the old behaviour ───────────
+
+def _wire_risk_gates(monkeypatch, fake, *, position, exits, order_status="FILLED"):
+    """Mock everything _run_risk_gates needs; protective-stop ops run for real
+    against the FakeExchange (that's what we're testing)."""
+    import app.trading.autopilot as ap_mod
+    from app.exchange.models import Order, OrderStatus, OrderType
+    from app.trading.autopilot import Autopilot
+
+    ap = Autopilot()
+    ap.state.mode = "live"
+    base = position["symbol"][:-4]
+    monkeypatch.setattr(ap_mod, "get_settings", lambda: _S())
+    monkeypatch.setattr(Autopilot, "_protective_stop_manager",
+                        lambda self: ProtectiveStopManager(fake, settings=_S()), raising=True)
+    monkeypatch.setattr(ap_mod.storage, "all_positions", lambda: [position])
+    monkeypatch.setattr(ap_mod.storage, "get_position", lambda s: position)
+
+    async def _snap(*, mode):
+        return {"free_balances": {base: fake.free(base)},
+                "all_balances": {base: fake.free(base) + fake.locked(base)}}
+
+    monkeypatch.setattr(ap_mod, "portfolio_snapshot", _snap)
+    monkeypatch.setattr(Autopilot, "_price", lambda self, s: asyncio.sleep(0, result=Decimal("100")), raising=True)
+    monkeypatch.setattr(Autopilot, "_atr_pct", lambda self, s: asyncio.sleep(0, result=0.04), raising=True)
+    monkeypatch.setattr(ap_mod.risk, "evaluate_exits", lambda **k: exits)
+    monkeypatch.setattr(ap_mod.risk, "get_hwm", lambda s: None)
+    monkeypatch.setattr(ap_mod.risk, "mfe_mae_pct", lambda s, e: (None, None))
+    for fn in ("mark_tp1_taken", "mark_tp2_taken", "clear_hwm", "clear_tp1", "clear_tp2"):
+        monkeypatch.setattr(ap_mod.risk, fn, lambda *a, **k: None)
+    monkeypatch.setattr(ap_mod.filters, "round_qty", lambda sym, q: q)
+    monkeypatch.setattr(ap_mod.filters, "meets_min", lambda sym, q, p: True)
+    monkeypatch.setattr(ap_mod.storage, "record_tick_audit", lambda **k: None)
+
+    sells: list = []
+    closes: list = []
+
+    async def _submit(self, symbol, side, qty, agents, **k):
+        sells.append((symbol, side, qty))
+        return Order(symbol=symbol, side=side, type=OrderType.MARKET, quantity=qty,
+                     client_order_id="x", status=OrderStatus(order_status), filled_quantity=qty)
+
+    monkeypatch.setattr(Autopilot, "_submit", _submit, raising=True)
+    monkeypatch.setattr(ap_mod.storage, "close_position", lambda **k: closes.append(k) or {"pnl": 0})
+    monkeypatch.setattr(ap_mod.storage, "reduce_position", lambda **k: None)
+    return ap, sells, closes
+
+
+@pytest.mark.asyncio
+async def test_i_resting_stop_not_stale_closed_and_ii_cancel_then_sell(monkeypatch):
+    fake = FakeExchange()
+    fake.seed_balance("ADA", 100)
+    mgr = ProtectiveStopManager(fake, settings=_S())
+    await mgr.place(mgr.plan("ADAUSDT", Decimal("100"), Decimal("0.96"), "t1"))
+    assert fake.free("ADA") == 0 and fake.locked("ADA") == 100   # stop locks the balance
+    coid = stop_coid("pstop-", "ADAUSDT", "t1")
+    from app.trading.risk import ExitDecision
+    pos = {"symbol": "ADAUSDT", "mode": "live", "qty": 100, "entry_price": 1.0, "entry_ts": "t1"}
+    ap, sells, closes = _wire_risk_gates(
+        monkeypatch, fake, position=pos, exits=[ExitDecision("ADAUSDT", Decimal("100"), "stop_loss")])
+    await ap._run_risk_gates()
+    assert coid in fake.canceled                      # (ii) stop cancelled first
+    assert len(sells) == 1 and sells[0][2] == Decimal("100")  # sold the freed full qty
+    assert not any("stale" in (c.get("exit_reason") or "") for c in closes)  # (i) NOT stale-closed
+
+
+@pytest.mark.asyncio
+async def test_iii_exchange_stop_fill_mid_flight_no_double_sell(monkeypatch):
+    fake = FakeExchange()
+    fake.seed_balance("ADA", 100)
+    mgr = ProtectiveStopManager(fake, settings=_S())
+    await mgr.place(mgr.plan("ADAUSDT", Decimal("100"), Decimal("0.96"), "t1"))
+    fake.trigger(stop_coid("pstop-", "ADAUSDT", "t1"), Decimal("0.95"))  # stop fired on exchange
+    from app.trading.risk import ExitDecision
+    pos = {"symbol": "ADAUSDT", "mode": "live", "qty": 100, "entry_price": 1.0, "entry_ts": "t1"}
+    ap, sells, closes = _wire_risk_gates(
+        monkeypatch, fake, position=pos, exits=[ExitDecision("ADAUSDT", Decimal("100"), "stop_loss")])
+    await ap._run_risk_gates()
+    assert sells == []                                 # no double-sell
+    assert len(closes) == 1
+    assert closes[0]["exit_reason"] == "exchange_stop"
+    assert closes[0]["exit_price"] == Decimal("0.95")  # recorded at the ACTUAL fill price
+
+
+@pytest.mark.asyncio
+async def test_iv_tp1_partial_replaces_stop_for_remaining(monkeypatch):
+    fake = FakeExchange()
+    fake.seed_balance("ADA", 100)
+    mgr = ProtectiveStopManager(fake, settings=_S())
+    await mgr.place(mgr.plan("ADAUSDT", Decimal("100"), Decimal("0.96"), "t1"))
+    from app.trading.risk import ExitDecision
+    # after TP1 sells 50, get_position reports the remaining 50
+    pos = {"symbol": "ADAUSDT", "mode": "live", "qty": 50, "entry_price": 1.0, "entry_ts": "t1"}
+    ap, sells, closes = _wire_risk_gates(
+        monkeypatch, fake, position=pos, exits=[ExitDecision("ADAUSDT", Decimal("50"), "take_profit_1")])
+    await ap._run_risk_gates()
+    resting = list(fake.open.values())
+    assert len(resting) == 1 and resting[0]["origQty"] == "50"  # stop re-placed for remaining qty
+
+
+@pytest.mark.asyncio
+async def test_v_restart_does_not_duplicate_resting_stop(monkeypatch):
+    import app.trading.autopilot as ap_mod
+    from app.trading.autopilot import Autopilot
+    fake = FakeExchange()
+    fake.seed_balance("ADA", 100)
+    mgr = ProtectiveStopManager(fake, settings=_S())
+    await mgr.place(mgr.plan("ADAUSDT", Decimal("100"), Decimal("0.96"), "t1"))
+    assert len(fake.open) == 1
+    pos = {"symbol": "ADAUSDT", "mode": "live", "qty": 100, "entry_price": 1.0, "entry_ts": "t1"}
+    ap = Autopilot()
+    ap.state.mode = "live"
+    monkeypatch.setattr(ap_mod, "get_settings", lambda: _S())
+    monkeypatch.setattr(Autopilot, "_protective_stop_manager",
+                        lambda self: ProtectiveStopManager(fake, settings=_S()), raising=True)
+    monkeypatch.setattr(ap_mod.storage, "all_positions", lambda: [pos])
+    monkeypatch.setattr(Autopilot, "_atr_pct", lambda self, s: asyncio.sleep(0, result=0.04), raising=True)
+    monkeypatch.setattr(ap_mod.risk, "get_hwm", lambda s: None)
+    await ap.reconcile_protective_stops()
+    assert len(fake.open) == 1   # existing stop kept, not duplicated
+
+
+@pytest.mark.asyncio
+async def test_vi_drift_check_passes_with_locked_balance(monkeypatch):
+    import app.trading.reconcile as rec
+    pos = {"symbol": "ADAUSDT", "mode": "live", "qty": 100, "entry_price": 1.0, "entry_ts": "t1"}
+    monkeypatch.setattr(rec.storage, "all_positions", lambda: [pos])
+
+    async def _snap(*, mode):
+        # all_balances is free+locked (total); the 100 ADA are locked in a stop.
+        return {"all_balances": {"ADA": Decimal("100")}, "holdings": []}
+
+    monkeypatch.setattr(rec, "portfolio_snapshot", _snap)
+    monkeypatch.setattr(rec.storage, "close_position", lambda **k: pytest.fail("must not close a locked position"))
+    result = await rec.reconcile_positions(mode="live")
+    assert result.get("kept") == 1 and result.get("closed", 0) == 0
+
+
+def test_vii_prebuy_feasibility_blocks_infeasible_stop(monkeypatch):
+    import app.trading.autopilot as ap_mod
+    from app.trading.autopilot import Autopilot
+    ap = Autopilot()
+    ap.state.mode = "live"
+    monkeypatch.setattr(ap_mod, "get_settings", lambda: _S())
+    monkeypatch.setattr(ap_mod, "BinanceUSClient", lambda *a, **k: object())
+    ok, why = ap._protective_stop_feasible(
+        "ADAUSDT", Decimal("0.01"), Decimal("100"), "t1",
+        software_stop=Decimal("96"), min_notional=Decimal("10"))
+    assert ok is False and "min_notional" in why     # 0.01*~95 < 10 -> entry blocked
+    ok2, _ = ap._protective_stop_feasible(
+        "ADAUSDT", Decimal("1"), Decimal("100"), "t1",
+        software_stop=Decimal("96"), min_notional=Decimal("10"))
+    assert ok2 is True
+
+
+@pytest.mark.asyncio
+async def test_viii_place_failure_halts_but_exits_still_run(monkeypatch):
+    import app.trading.autopilot as ap_mod
+    import app.trading.watchdog as wd
+    from app.trading.autopilot import Autopilot
+    ap = Autopilot()
+    ap.state.mode = "live"
+    monkeypatch.setattr(ap_mod, "get_settings", lambda: _S())
+    fake = FakeExchange()
+    fake.fail_place = True
+    monkeypatch.setattr(Autopilot, "_protective_stop_manager",
+                        lambda self: ProtectiveStopManager(fake, settings=_S()), raising=True)
+    monkeypatch.setattr(Autopilot, "_software_stop_price",
+                        lambda self, s, p: asyncio.sleep(0, result=p * Decimal("0.96")), raising=True)
+    halts = []
+    monkeypatch.setattr(wd, "trigger_emergency_halt", lambda *a, **k: halts.append(1))
+    ok = await ap._place_protective_stop("ADAUSDT", Decimal("1"), Decimal("100"), "t1")
+    assert ok is False and halts == [1]               # unprotected -> halt new entries
+
+    # Exits still run even with the halt: a stop_loss on a plain (no-stop) holding sells.
+    fake2 = FakeExchange()
+    fake2.seed_balance("ADA", 100)
+    from app.trading.risk import ExitDecision
+    pos = {"symbol": "ADAUSDT", "mode": "live", "qty": 100, "entry_price": 1.0, "entry_ts": "t2"}
+    ap2, sells, closes = _wire_risk_gates(
+        monkeypatch, fake2, position=pos, exits=[ExitDecision("ADAUSDT", Decimal("100"), "stop_loss")])
+    await ap2._run_risk_gates()
+    assert len(sells) == 1                             # exits unaffected by the entry halt
+
+
+def test_canary_validator_requires_allowlist_when_enabled():
+    from app.config import Settings
+    with pytest.raises(Exception):
+        Settings(_env_file=None, exchange_native_stops_enabled=True,
+                 exchange_native_stops_canary_symbols="")
+    s = Settings(_env_file=None, exchange_native_stops_enabled=True,
+                 exchange_native_stops_canary_symbols="BTCUSDT")
+    assert s.exchange_stop_allowed("BTCUSDT") and not s.exchange_stop_allowed("ETHUSDT")
+    s2 = Settings(_env_file=None, exchange_native_stops_enabled=True,
+                  exchange_native_stops_canary_symbols="all")
+    assert s2.exchange_stop_allowed("ANYUSDT")
+    s3 = Settings(_env_file=None, exchange_native_stops_enabled=False)
+    assert s3.exchange_stop_allowed("BTCUSDT") is False
+
 

@@ -55,6 +55,9 @@ class SymbolFilters:
                 if t == "LOT_SIZE":
                     entry["step_size"] = Decimal(f["stepSize"])
                     entry["min_qty"] = Decimal(f["minQty"])
+                elif t == "PRICE_FILTER":
+                    entry["tick_size"] = Decimal(f["tickSize"])
+                    entry["min_price"] = Decimal(f.get("minPrice") or "0")
                 elif t in ("MIN_NOTIONAL", "NOTIONAL"):
                     entry["min_notional"] = Decimal(
                         f.get("minNotional") or f.get("notional") or "0"
@@ -79,6 +82,19 @@ class SymbolFilters:
             # Binance rejects scientific notation with -1100 "illegal characters".
             qty = qty.quantize(step) if step >= 1 else qty
         return _plain(qty)
+
+    def round_price(self, symbol: str, price: Decimal) -> Decimal:
+        """Round DOWN to the symbol's PRICE_FILTER tickSize (conservative for a
+        downside stop) and clamp to minPrice. Binance rejects sub-tick prices."""
+        info = self._info.get(symbol) or {}
+        tick: Optional[Decimal] = info.get("tick_size")
+        if tick and tick > 0:
+            price = (price / tick).quantize(Decimal("1"), rounding=ROUND_DOWN) * tick
+            price = price.quantize(tick) if tick >= 1 else price
+        min_price: Optional[Decimal] = info.get("min_price")
+        if min_price and price < min_price:
+            price = min_price
+        return _plain(price)
 
     def meets_min(self, symbol: str, qty: Decimal, price: Decimal) -> bool:
         if not self._loaded:

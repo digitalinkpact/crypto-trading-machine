@@ -416,6 +416,8 @@ class Autopilot:
         # book qty triggers a -2010 "insufficient balance" rejection on every
         # tick and a stop-loss/take-profit can never clear. Clamp to free.
         free_balances: dict[str, Decimal] = {}
+        total_balances: dict[str, Decimal] = {}
+        entry_ts_by_symbol = {p["symbol"]: str(p.get("entry_ts") or "") for p in positions}
         # Track whether the fetch actually succeeded. A missing key then means
         # "the exchange holds zero of this coin" (a zombie book position) rather
         # than "balance unknown" — the two require opposite handling below.
@@ -425,6 +427,9 @@ class Autopilot:
             balance_source = snap.get("free_balances") or snap.get("all_balances") or {}
             free_balances = {
                 a: Decimal(str(q)) for a, q in balance_source.items()
+            }
+            total_balances = {
+                a: Decimal(str(q)) for a, q in (snap.get("all_balances") or {}).items()
             }
             balances_known = True
         except Exception as exc:  # noqa: BLE001
@@ -456,6 +461,21 @@ class Autopilot:
             try:
                 price = prices.get(ex.symbol) or await self._price(ex.symbol)
                 base = ex.symbol.removesuffix("USDT")
+                # Protective stop (flag+canary gated): the resting stop LOCKS the
+                # base balance. If it already fired, record THAT exit (no double
+                # sell); else cancel it so the SELL has the balance, and treat the
+                # now-freed total as sellable (so a merely-locked position is
+                # never false-stale-closed).
+                if self._stop_allowed(ex.symbol) and balances_known:
+                    _ets = entry_ts_by_symbol.get(ex.symbol, "")
+                    fill = await self._detect_stop_fill(ex.symbol, _ets)
+                    if fill is not None:
+                        await self._record_exchange_stop_exit(ex.symbol, fill)
+                        continue
+                    await self._cancel_stop_before_exit(ex.symbol, _ets)
+                    free_balances[base] = total_balances.get(
+                        base, free_balances.get(base, Decimal("0"))
+                    )
                 # When the balance fetch succeeded, a missing asset means the
                 # exchange holds zero of it — a zombie book position. Use 0 so
                 # the cleanup branch below closes it instead of submitting a
@@ -557,8 +577,10 @@ class Autopilot:
                 if self._order_filled(order):
                     if ex.reason == "take_profit_1":
                         risk.mark_tp1_taken(ex.symbol)
+                        await self._replace_stop_remaining(ex.symbol, entry_ts_by_symbol.get(ex.symbol, ""))
                     elif ex.reason == "take_profit_2":
                         risk.mark_tp2_taken(ex.symbol)
+                        await self._replace_stop_remaining(ex.symbol, entry_ts_by_symbol.get(ex.symbol, ""))
                     else:
                         risk.clear_hwm(ex.symbol)
                         risk.clear_tp1(ex.symbol)
@@ -1377,6 +1399,25 @@ class Autopilot:
                         ),
                         sig,
                     )
+
+                    # Pre-buy protective-stop feasibility (no-op unless the
+                    # canary allowlist covers this symbol): refuse an entry we
+                    # could not protect with an exchange-native backstop, rather
+                    # than opening an unprotected position.
+                    sw_stop = await self._software_stop_price(symbol, buy_plan["price"])
+                    stop_feasible, stop_why = self._protective_stop_feasible(
+                        symbol,
+                        buy_plan["rounded_qty"],
+                        buy_plan["price"],
+                        "",
+                        sw_stop,
+                        buy_plan["min_notional"] or Decimal("0"),
+                    )
+                    _set_filter(symbol, "protective_stop_feasible", stop_feasible, stop_why, sig)
+                    if not stop_feasible:
+                        _finish(symbol, "protective_stop_feasible", stop_why, submitted=False, sig=sig)
+                        log.warning("skip %s BUY: protective stop infeasible (%s)", symbol, stop_why)
+                        continue
 
                     # Correlation / basket exposure cap — BTC/ETH/SOL/... tend to
                     # move together, so stacking several "independent" longs in
@@ -2330,30 +2371,64 @@ class Autopilot:
         filled = order.filled_quantity or Decimal("0")
         return order.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED) and filled > 0
 
-    # ── Exchange-native protective stops (OFF by default; flag-guarded) ──
-    def _protective_stops_enabled(self) -> bool:
-        return (
-            bool(getattr(get_settings(), "exchange_native_stops_enabled", False))
-            and self.state.mode == "live"
-        )
+    # ── Exchange-native protective stops (OFF by default; flag + canary gated) ──
+    def _stop_allowed(self, symbol: str) -> bool:
+        """Stops are placed/managed only when the flag is on, we're live, AND
+        the symbol is on the canary allowlist — so enabling never touches
+        positions outside the allowlist."""
+        s = get_settings()
+        if not (bool(getattr(s, "exchange_native_stops_enabled", False)) and self.state.mode == "live"):
+            return False
+        raw = (getattr(s, "exchange_native_stops_canary_symbols", "") or "").strip()
+        if not raw:
+            return False
+        if raw.lower() == "all":
+            return True
+        return symbol.upper() in {x.strip().upper() for x in raw.split(",") if x.strip()}
 
     def _protective_stop_manager(self):
         from app.trading.protective_stops import ProtectiveStopManager
         return ProtectiveStopManager(BinanceUSClient())
 
     async def _software_stop_price(self, symbol: str, entry_price: Decimal) -> Decimal:
-        """The level the software risk loop would stop at (ATR-scaled)."""
+        """Entry-based ATR-scaled hard stop (the fixed floor)."""
         atr_pct = await self._atr_pct(symbol)
         stop_frac = risk.dynamic_stop_pct(atr_pct)
         return entry_price * (Decimal("1") - Decimal(str(stop_frac)))
+
+    async def _effective_software_stop_price(self, symbol: str, entry_price: Decimal) -> Decimal:
+        """The level the software loop would stop at RIGHT NOW: the higher of the
+        ATR floor and the trailing floor (once armed) — drives the ratchet."""
+        base_stop = await self._software_stop_price(symbol, entry_price)
+        s = get_settings()
+        hwm = risk.get_hwm(symbol)
+        if hwm is not None:
+            hwm = Decimal(str(hwm))
+            trail_act = Decimal(str(getattr(s, "trailing_activation_pct", 0.05)))
+            trail_dist = Decimal(str(getattr(s, "trailing_stop_pct", 0.03)))
+            if hwm > entry_price * (Decimal("1") + trail_act):
+                return max(base_stop, hwm * (Decimal("1") - trail_dist))
+        return base_stop
+
+    def _protective_stop_feasible(self, symbol: str, qty: Decimal, entry_price: Decimal, entry_ts: str,
+                                  software_stop: Decimal, min_notional: Decimal) -> tuple[bool, str]:
+        """Pre-BUY check: can we place a protective stop? Used to BLOCK an entry
+        we couldn't protect. Always feasible when the feature is off for this
+        symbol (returns True)."""
+        if not self._stop_allowed(symbol):
+            return True, "stops_disabled"
+        from app.trading.protective_stops import ProtectiveStopManager
+        mgr = ProtectiveStopManager(BinanceUSClient())
+        plan = mgr.plan(symbol, qty, software_stop, entry_ts)
+        return ProtectiveStopManager.feasible(plan, min_notional=min_notional)
 
     async def _place_protective_stop(
         self, symbol: str, qty: Decimal, entry_price: Decimal, entry_ts: str
     ) -> bool:
         """Place the exchange-native backstop after a BUY fill. On failure the
         position is UNPROTECTED -> loud alert + halt new entries (per spec).
-        No-op (returns True) when the feature is disabled."""
-        if not self._protective_stops_enabled():
+        No-op (returns True) when disabled/not-allowlisted."""
+        if not self._stop_allowed(symbol):
             return True
         try:
             mgr = self._protective_stop_manager()
@@ -2376,24 +2451,75 @@ class Autopilot:
                 pass
             return False
 
+    async def _cancel_stop_before_exit(self, symbol: str, entry_ts: str) -> str:
+        """Cancel the resting stop so its locked balance frees up for the SELL.
+        'canceled' | 'absent' (may have fired) | 'disabled'."""
+        if not self._stop_allowed(symbol):
+            return "disabled"
+        return await self._protective_stop_manager().cancel(symbol, entry_ts)
+
+    async def _detect_stop_fill(self, symbol: str, entry_ts: str):
+        if not self._stop_allowed(symbol):
+            return None
+        return await self._protective_stop_manager().detect_fill(symbol, entry_ts)
+
+    async def _record_exchange_stop_exit(self, symbol: str, fill: dict) -> None:
+        """The exchange stop already sold the position — record the exit at its
+        ACTUAL fill price/fee and close the book row (never a second SELL)."""
+        try:
+            pos = storage.get_position(symbol)
+            entry_price = Decimal(str((pos or {}).get("entry_price") or 0))
+            mfe_pct, mae_pct = risk.mfe_mae_pct(symbol, entry_price)
+            fee = fill.get("fee")
+            actual_fee = float(fee) if fee is not None and fill.get("fee_asset") == "USDT" else None
+            storage.close_position(
+                symbol=symbol, mode=self.state.mode, exit_price=fill["fill_price"],
+                exit_reason="exchange_stop", mfe_pct=mfe_pct, mae_pct=mae_pct,
+                actual_fee_usdt=actual_fee,
+            )
+            risk.clear_hwm(symbol); risk.clear_tp1(symbol); risk.clear_tp2(symbol)
+            log.warning("EXCHANGE STOP filled %s at %s — recorded exit (no double-sell)",
+                        symbol, fill["fill_price"])
+        except Exception as exc:  # noqa: BLE001
+            log.error("failed to record exchange_stop exit for %s: %s", symbol, exc)
+
+    async def _replace_stop_remaining(self, symbol: str, entry_ts: str) -> None:
+        """After a TP1/TP2 partial, re-place the stop for the REMAINING qty."""
+        if not self._stop_allowed(symbol):
+            return
+        pos = storage.get_position(symbol)
+        if not pos or Decimal(str(pos.get("qty") or 0)) <= 0:
+            return
+        software_stop = await self._effective_software_stop_price(
+            symbol, Decimal(str(pos["entry_price"]))
+        )
+        await self._protective_stop_manager().replace(
+            symbol, Decimal(str(pos["qty"])), software_stop, entry_ts
+        )
+
     async def reconcile_protective_stops(self) -> dict:
-        """Startup/periodic: ensure every live position has its backstop and
-        cancel orphaned bot stops. No-op when disabled."""
-        if not self._protective_stops_enabled():
+        """Startup/periodic: ensure every ALLOWLISTED live position has its
+        backstop, ratchet it up with the trailing floor, and cancel orphaned
+        bot stops. No-op when disabled."""
+        s = get_settings()
+        if not (bool(getattr(s, "exchange_native_stops_enabled", False)) and self.state.mode == "live"):
             return {"skipped": "disabled"}
         mgr = self._protective_stop_manager()
         desired = {}
+        plans = []  # (symbol, qty, effective_software_stop, entry_ts)
         for p in storage.all_positions():
-            if p.get("mode") != "live":
+            if p.get("mode") != "live" or not self._stop_allowed(p["symbol"]):
                 continue
             sym = p["symbol"]
-            software_stop = await self._software_stop_price(
-                sym, Decimal(str(p["entry_price"]))
-            )
-            desired[sym] = mgr.plan(
-                sym, Decimal(str(p["qty"])), software_stop, str(p.get("entry_ts"))
-            )
-        return await mgr.reconcile(desired)
+            entry_ts = str(p.get("entry_ts"))
+            qty = Decimal(str(p["qty"]))
+            eff = await self._effective_software_stop_price(sym, Decimal(str(p["entry_price"])))
+            desired[sym] = mgr.plan(sym, qty, eff, entry_ts)
+            plans.append((sym, qty, eff, entry_ts))
+        summary = await mgr.reconcile(desired)
+        for sym, qty, eff, entry_ts in plans:
+            await mgr.ratchet(sym, qty, eff, entry_ts)
+        return summary
 
     async def _submit(
         self,

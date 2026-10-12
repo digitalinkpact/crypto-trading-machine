@@ -315,6 +315,16 @@ class Settings(BaseSettings):
     exchange_native_stops_enabled: bool = False
     exchange_stop_buffer_pct: float = Field(0.01, ge=0.0, le=0.10)
     exchange_stop_coid_prefix: str = "pstop-"
+    # Canary allowlist. When exchange_native_stops_enabled is True this MUST be
+    # set to either "all" or a comma-separated symbol list (e.g. "BTCUSDT") — an
+    # empty allowlist with the flag on is a configuration ERROR (see the
+    # _validate_exchange_stop_canary validator). Stops are only ever placed/
+    # managed for allowlisted symbols, so a live canary protects ONE position,
+    # never all open positions.
+    exchange_native_stops_canary_symbols: str = ""
+    # Minimum upward move (as a fraction of the resting stop price) before the
+    # trailing ratchet cancel+replaces the exchange stop — avoids churn.
+    exchange_stop_ratchet_min_step_pct: float = Field(0.01, ge=0.0, le=0.10)
 
     # Exit gates (hard rules, evaluated every risk-tick)
     # 0.015->0.04 (2026-09-16 R:R expectancy sweep, scripts/strategy_lab sim on
@@ -736,6 +746,30 @@ class Settings(BaseSettings):
                     f"stream.binance.us), got {value!r}"
                 )
         return self
+
+    @model_validator(mode="after")
+    def _validate_exchange_stop_canary(self) -> "Settings":
+        """Refuse to boot with exchange-native stops ON but no canary allowlist.
+        The flag must be paired with an explicit allowlist ("all" or a symbol
+        list) so a live canary protects ONE named position, never all of them."""
+        if self.exchange_native_stops_enabled and not (
+            self.exchange_native_stops_canary_symbols or ""
+        ).strip():
+            raise ValueError(
+                "exchange_native_stops_enabled=True requires "
+                "exchange_native_stops_canary_symbols to be set to 'all' or a "
+                "comma-separated symbol list (an empty allowlist is not allowed)"
+            )
+        return self
+
+    def exchange_stop_allowed(self, symbol: str) -> bool:
+        """Whether protective stops may be placed/managed for this symbol."""
+        raw = (self.exchange_native_stops_canary_symbols or "").strip()
+        if not raw:
+            return False
+        if raw.lower() == "all":
+            return True
+        return symbol.upper() in {s.strip().upper() for s in raw.split(",") if s.strip()}
 
     # Binance.US spot trading fees.
     # CORRECTED 2026-08-25 (forensic audit): the 0.40% tier-0 default here had
