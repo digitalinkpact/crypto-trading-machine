@@ -336,6 +336,50 @@ class BinanceUSClient:
             symbol=symbol, origClientOrderId=client_order_id,
         )
 
+    async def place_stop_loss(
+        self,
+        symbol: str,
+        quantity: Decimal,
+        stop_price: Decimal,
+        client_order_id: Optional[str] = None,
+        side: OrderSide = OrderSide.SELL,
+    ) -> Order:
+        """Place a resting STOP_LOSS (market) order — the exchange-native
+        catastrophe backstop. Honors dry_run/paper (returns DRY_RUN, no network).
+        """
+        coid = client_order_id or _new_client_order_id()
+        order = Order(
+            symbol=symbol, side=side, type=OrderType.STOP_LOSS,
+            quantity=quantity, stop_price=stop_price, client_order_id=coid,
+            submitted_at=datetime.now(timezone.utc),
+        )
+        if self._settings.dry_run or self._settings.paper_trading:
+            log.warning(
+                "[DRY-RUN] STOP_LOSS %s qty=%s stop=%s coid=%s",
+                symbol, quantity, stop_price, coid,
+            )
+            return order.model_copy(update={"status": OrderStatus.DRY_RUN})
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side.value,
+            "type": OrderType.STOP_LOSS.value,
+            "quantity": str(quantity),
+            "stopPrice": str(stop_price),
+            "newClientOrderId": coid,
+        }
+        log.info(
+            "Submitting STOP_LOSS coid=%s symbol=%s qty=%s stop=%s",
+            coid, symbol, quantity, stop_price,
+        )
+        raw = await self._api_call("place_stop_loss", self._spot.new_order, **params)
+        return order.model_copy(
+            update={
+                "status": OrderStatus(raw.get("status", "NEW")),
+                "exchange_order_id": str(raw.get("orderId")),
+                "raw": raw,
+            }
+        )
+
     async def open_orders(self, symbol: Optional[str] = None) -> list[dict[str, Any]]:
         kwargs = {"symbol": symbol} if symbol else {}
         return await self._api_call("open_orders", self._spot.get_open_orders, **kwargs)

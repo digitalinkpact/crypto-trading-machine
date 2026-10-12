@@ -304,6 +304,17 @@ class Settings(BaseSettings):
     orderbook_retry_enabled: bool = True
     orderbook_retry_delay_seconds: int = Field(60, ge=1, le=3600)
     orderbook_retry_attempts: int = Field(3, ge=1, le=10)
+    # Exchange-native protective stop orders — a resting STOP_LOSS (market) SELL
+    # on Binance.US that protects an open position even if the bot process dies
+    # or the risk loop stalls. Default OFF (opt-in); the software risk loop stays
+    # the PRIMARY stop. The exchange stop sits exchange_stop_buffer_pct BEYOND
+    # (below, for a long) the software stop so the software stop fires first in
+    # normal operation and this only catches a bot-down/stalled-loop catastrophe.
+    # All bot stop orders carry exchange_stop_coid_prefix so orphan cleanup only
+    # ever touches our own orders.
+    exchange_native_stops_enabled: bool = False
+    exchange_stop_buffer_pct: float = Field(0.01, ge=0.0, le=0.10)
+    exchange_stop_coid_prefix: str = "pstop-"
 
     # Exit gates (hard rules, evaluated every risk-tick)
     # 0.015->0.04 (2026-09-16 R:R expectancy sweep, scripts/strategy_lab sim on

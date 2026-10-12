@@ -2330,6 +2330,71 @@ class Autopilot:
         filled = order.filled_quantity or Decimal("0")
         return order.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED) and filled > 0
 
+    # ── Exchange-native protective stops (OFF by default; flag-guarded) ──
+    def _protective_stops_enabled(self) -> bool:
+        return (
+            bool(getattr(get_settings(), "exchange_native_stops_enabled", False))
+            and self.state.mode == "live"
+        )
+
+    def _protective_stop_manager(self):
+        from app.trading.protective_stops import ProtectiveStopManager
+        return ProtectiveStopManager(BinanceUSClient())
+
+    async def _software_stop_price(self, symbol: str, entry_price: Decimal) -> Decimal:
+        """The level the software risk loop would stop at (ATR-scaled)."""
+        atr_pct = await self._atr_pct(symbol)
+        stop_frac = risk.dynamic_stop_pct(atr_pct)
+        return entry_price * (Decimal("1") - Decimal(str(stop_frac)))
+
+    async def _place_protective_stop(
+        self, symbol: str, qty: Decimal, entry_price: Decimal, entry_ts: str
+    ) -> bool:
+        """Place the exchange-native backstop after a BUY fill. On failure the
+        position is UNPROTECTED -> loud alert + halt new entries (per spec).
+        No-op (returns True) when the feature is disabled."""
+        if not self._protective_stops_enabled():
+            return True
+        try:
+            mgr = self._protective_stop_manager()
+            software_stop = await self._software_stop_price(symbol, entry_price)
+            order = await mgr.place(mgr.plan(symbol, qty, software_stop, entry_ts))
+            if order is None:
+                raise RuntimeError("place_stop_loss returned None")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.critical(
+                "PROTECTIVE STOP MISSING for %s (%s) — halting new entries", symbol, exc
+            )
+            try:
+                from app.trading import watchdog
+                watchdog.trigger_emergency_halt(
+                    f"protective stop not placed for {symbol}",
+                    level="new_entries_blocked",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+
+    async def reconcile_protective_stops(self) -> dict:
+        """Startup/periodic: ensure every live position has its backstop and
+        cancel orphaned bot stops. No-op when disabled."""
+        if not self._protective_stops_enabled():
+            return {"skipped": "disabled"}
+        mgr = self._protective_stop_manager()
+        desired = {}
+        for p in storage.all_positions():
+            if p.get("mode") != "live":
+                continue
+            sym = p["symbol"]
+            software_stop = await self._software_stop_price(
+                sym, Decimal(str(p["entry_price"]))
+            )
+            desired[sym] = mgr.plan(
+                sym, Decimal(str(p["qty"])), software_stop, str(p.get("entry_ts"))
+            )
+        return await mgr.reconcile(desired)
+
     async def _submit(
         self,
         symbol: str,
@@ -2456,6 +2521,13 @@ class Autopilot:
                         entry_price=price, agents=agents,
                         entry_confidence=entry_confidence, entry_strategy=entry_strategy,
                         entry_btc_regime=entry_btc_regime, entry_fee_usdt=entry_fee_usdt,
+                    )
+                    # Exchange-native catastrophe backstop (OFF by default; the
+                    # software risk loop stays primary). No-op when disabled.
+                    pos_row = storage.get_position(symbol)
+                    await self._place_protective_stop(
+                        symbol, filled, Decimal(str(price)),
+                        str((pos_row or {}).get("entry_ts") or ""),
                     )
                 else:
                     pos = next(

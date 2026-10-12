@@ -17,6 +17,7 @@ class OrderSide(str, Enum):
 class OrderType(str, Enum):
     MARKET = "MARKET"
     LIMIT = "LIMIT"
+    STOP_LOSS = "STOP_LOSS"
     STOP_LOSS_LIMIT = "STOP_LOSS_LIMIT"
     TAKE_PROFIT_LIMIT = "TAKE_PROFIT_LIMIT"
 
@@ -39,6 +40,7 @@ class Order(BaseModel):
     type: OrderType
     quantity: Decimal
     price: Optional[Decimal] = None
+    stop_price: Optional[Decimal] = None
     client_order_id: str = Field(..., description="Idempotency key — newClientOrderId")
     status: OrderStatus = OrderStatus.NEW
     exchange_order_id: Optional[str] = None

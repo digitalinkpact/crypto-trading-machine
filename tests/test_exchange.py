@@ -32,6 +32,35 @@ async def test_dry_run_does_not_call_exchange(client):
 
 
 @pytest.mark.asyncio
+async def test_place_stop_loss_dry_run_does_not_call_exchange(client):
+    order = await client.place_stop_loss(
+        "BTCUSDT", Decimal("0.01"), Decimal("95"), client_order_id="pstop-x"
+    )
+    assert order.status is OrderStatus.DRY_RUN
+    assert order.type is OrderType.STOP_LOSS
+    assert order.stop_price == Decimal("95")
+    client._spot.new_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_place_stop_loss_live_uses_stop_params(monkeypatch):
+    settings = Settings(dry_run=False, paper_trading=False, live_mode=False)
+    c = BinanceUSClient(settings=settings)
+    c._spot = MagicMock()
+    c._spot.new_order.return_value = {"status": "NEW", "orderId": 7}
+    order = await c.place_stop_loss(
+        "ETHUSDT", Decimal("0.5"), Decimal("1800"), client_order_id="pstop-eth"
+    )
+    assert order.status is OrderStatus.NEW
+    kwargs = c._spot.new_order.call_args.kwargs
+    assert kwargs["type"] == "STOP_LOSS"
+    assert kwargs["side"] == "SELL"
+    assert kwargs["stopPrice"] == "1800"
+    assert kwargs["quantity"] == "0.5"
+    assert kwargs["newClientOrderId"] == "pstop-eth"
+
+
+@pytest.mark.asyncio
 async def test_live_order_uses_client_order_id(monkeypatch):
     settings = Settings(dry_run=False, paper_trading=False, live_buys_enabled=True)
     c = BinanceUSClient(settings=settings)
