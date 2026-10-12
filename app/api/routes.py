@@ -1,6 +1,7 @@
 """HTTP routes — dashboard, settings, autopilot controls, trades log."""
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from html import escape
 
@@ -692,11 +693,92 @@ async def health(response: Response) -> dict:
     return body
 
 
+def _running_commit() -> str:
+    """Best-effort running build identifier.
+
+    Reads a deploy-provided env var first; falls back to .git/HEAD for dev. Never
+    raises and never exposes secrets.
+    """
+    for var in ("APP_COMMIT", "GIT_SHA", "GIT_COMMIT", "SOURCE_COMMIT"):
+        val = os.getenv(var)
+        if val:
+            return val.strip()[:40]
+    try:
+        from pathlib import Path
+        git_dir = Path(__file__).resolve().parents[2] / ".git"
+        head = git_dir / "HEAD"
+        if head.is_file():
+            ref = head.read_text().strip()
+            if ref.startswith("ref:"):
+                ref_path = git_dir / ref.split(" ", 1)[1].strip()
+                if ref_path.is_file():
+                    return ref_path.read_text().strip()[:40]
+            return ref[:40]
+    except Exception:  # noqa: BLE001
+        pass
+    return "unknown"
+
+
 @router.get("/autopilot/status")
 async def autopilot_status() -> dict:
     s = autopilot.state
+    settings = get_settings()
     entry_status = storage.kv_get("entry_status") or {}
+    if not isinstance(entry_status, dict):
+        entry_status = {}
+
+    # Tick age + stale flag. Autopilot ticks every 15 min, so a short watchdog
+    # heartbeat threshold would false-positive between ticks — use the dedicated
+    # autopilot_tick_stale_seconds instead.
+    now = datetime.now(timezone.utc)
+    last_tick_age_seconds = None
+    tick_stale = None
+    if s.last_tick_at is not None:
+        try:
+            last_tick_age_seconds = max(0.0, (now - s.last_tick_at).total_seconds())
+            tick_stale = last_tick_age_seconds > settings.autopilot_tick_stale_seconds
+        except Exception:  # noqa: BLE001
+            last_tick_age_seconds = None
+            tick_stale = None
+
+    # Last-tick skip breakdown (handle missing / malformed).
+    tick_debug = storage.kv_get("autopilot_last_tick_debug")
+    if not isinstance(tick_debug, dict):
+        tick_debug = {}
+    last_tick = {
+        "ts": tick_debug.get("ts"),
+        "total_signals": tick_debug.get("total_signals"),
+        "by_reason": tick_debug.get("by_reason") if isinstance(tick_debug.get("by_reason"), dict) else {},
+        "per_symbol": tick_debug.get("per_symbol") if isinstance(tick_debug.get("per_symbol"), dict) else {},
+    }
+
+    # Exposure from the last persisted equity snapshot — no live exchange call in
+    # a status GET (keeps it fast and rate-limit safe).
+    exposure = {"long_exposure_pct": None, "usdt_cash": None, "total_usdt": None, "as_of": None}
+    try:
+        curve = storage.equity_curve(limit=1)
+        if curve:
+            latest = curve[-1]
+            total = float(latest.get("total_usdt") or 0.0)
+            cash = float(latest.get("cash_usdt") or 0.0)
+            invested = float(latest.get("invested_usdt") or 0.0)
+            exposure = {
+                "long_exposure_pct": (invested / total) if total > 0 else None,
+                "usdt_cash": cash,
+                "total_usdt": total,
+                "as_of": latest.get("ts"),
+            }
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Last account/exchange check (sanitized upstream; never contains secrets).
+    last_account_ok = storage.kv_get("autopilot_last_account_ok")
+    last_exchange_error = storage.kv_get("autopilot_last_exchange_error")
+    if not isinstance(last_exchange_error, dict):
+        last_exchange_error = None
+
     return {
+        # ── existing fields (backward-compatible; do not remove/rename) ──
         "running": s.running,
         "mode": s.mode,
         "credentials_set": credentials_present(),
@@ -712,6 +794,31 @@ async def autopilot_status() -> dict:
         "entry_halted": bool(entry_status.get("entry_halted")),
         "entry_halted_reasons": entry_status.get("reasons") or [],
         "system_offline": bool(entry_status.get("system_offline", False)),
+        # ── new diagnostics ──
+        "last_tick_age_seconds": last_tick_age_seconds,
+        "tick_stale": tick_stale,
+        "stale_tick_threshold_seconds": settings.autopilot_tick_stale_seconds,
+        "last_tick": last_tick,
+        "ml_gate": {
+            "enabled": settings.ml_gate_enabled,
+            # Live gate threshold is hardcoded per action in
+            # Autopilot._ml_gate_threshold_for_confidence; the configured value is
+            # informational only and does NOT change the decision.
+            "effective_buy_threshold": 0.40,
+            "effective_sell_threshold": 0.50,
+            "configured_threshold_unused": settings.ml_gate_threshold,
+        },
+        "risk": {
+            "max_long_exposure_pct": settings.max_long_exposure_pct,
+            "rollback_max_open_positions": getattr(settings, "rollback_max_open_positions", None),
+            "rollback_position_pct": getattr(settings, "rollback_position_pct", None),
+            "risk_per_trade_pct": settings.risk_per_trade_pct,
+            "stop_loss_pct": settings.stop_loss_pct,
+        },
+        "exposure": exposure,
+        "last_account_ok": last_account_ok,
+        "last_exchange_error": last_exchange_error,
+        "commit": _running_commit(),
     }
 
 

@@ -1026,9 +1026,17 @@ class Autopilot:
         try:
             snap = await portfolio_snapshot(mode=self.state.mode)
         except Exception as exc:  # noqa: BLE001
-            self.state.last_error = f"portfolio fetch failed: {exc}"
+            sanitized = f"{type(exc).__name__}: {str(exc)[:200]}"
+            self.state.last_error = f"portfolio fetch failed: {sanitized}"
             log.exception("autopilot portfolio fetch failed")
+            # Persist the failure in skip telemetry so /autopilot/status shows the
+            # real blocker (exchange/account-data failure) instead of leaving the
+            # prior tick's stale by_reason/per_symbol breakdown in place.
+            _bump("portfolio_fetch_failed", detail=sanitized)
+            self._persist_skip_stats(skip_counter, tick_debug, total=len(signals))
+            self._record_account_check(ok=False, error=sanitized)
             return
+        self._record_account_check(ok=True)
 
         usdt_free = Decimal(str(snap["usdt_cash"]))
         total_eq = Decimal(str(snap["total_usdt"]))
@@ -2074,6 +2082,23 @@ class Autopilot:
             non_dust_symbols.add(symbol)
 
         return len(non_dust_symbols), non_dust_symbols
+
+    def _record_account_check(self, *, ok: bool, error: str = "") -> None:
+        """Record the last account/exchange data check for /autopilot/status.
+
+        Stores a success timestamp or a sanitized error. Never raises and never
+        stores secrets (callers pass a pre-sanitized, truncated message).
+        """
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            if ok:
+                storage.kv_set("autopilot_last_account_ok", now)
+            else:
+                storage.kv_set(
+                    "autopilot_last_exchange_error", {"ts": now, "error": error}
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("account-check persist failed: %s", exc)
 
     def _persist_skip_stats(
         self,

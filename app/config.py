@@ -682,6 +682,10 @@ class Settings(BaseSettings):
     # Health monitor / watchdog controls.
     # If `autopilot.last_tick_at` is older than this, the trading loop is stale.
     health_tick_stale_seconds: int = Field(180, ge=30, le=86_400)
+    # Autopilot ticks on a 15-min cron (:02/:17/:32/:47). /autopilot/status flags
+    # the tick loop as stale after this many seconds (~2 missed ticks). Distinct
+    # from health_tick_stale_seconds, which governs the watchdog heartbeat.
+    autopilot_tick_stale_seconds: int = Field(1800, ge=60, le=86_400)
     # API latency warning threshold; informational, does not auto-stop process.
     health_latency_warn_seconds: float = Field(3.0, ge=0.1, le=120.0)
     # Detect near-simultaneous duplicate order candidates (same symbol/side/mode).
