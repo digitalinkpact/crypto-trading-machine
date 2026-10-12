@@ -189,7 +189,12 @@ def test_max_open_positions_cap():
 
 
 def test_max_long_exposure_cap():
-    blocked, why = risk.can_open_new_position(open_positions=1, long_exposure_pct=0.65)
+    # Boundary-test at the CONFIGURED cap (like test_max_open_positions_cap) so
+    # it is hermetic regardless of the ambient .env MAX_LONG_EXPOSURE_PCT.
+    s = get_settings()
+    blocked, why = risk.can_open_new_position(
+        open_positions=1, long_exposure_pct=s.max_long_exposure_pct
+    )
     assert blocked is False
     assert "long_exposure" in why
 

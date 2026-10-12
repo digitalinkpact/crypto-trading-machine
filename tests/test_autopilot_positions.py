@@ -817,6 +817,9 @@ async def test_execute_buy_pyramids_when_position_exists_and_confidence_is_high(
         ml_gate_enabled = False
         buy_cooldown_minutes = 30
         aggressive_mode_enabled = True
+        # Exercise the legacy row path this test already mocks via closed_trades
+        # (10 winning rows -> warmup -> aggressive); keeps the guard hermetic.
+        win_rate_position_level = False
         aggressive_rollback_min_trades = 30
         aggressive_rollback_min_win_rate = 0.50
         aggressive_position_pct = 0.06
