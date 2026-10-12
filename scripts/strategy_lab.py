@@ -445,6 +445,40 @@ def _risk_on_series(frames: dict[str, pd.DataFrame], sym: str) -> Optional[pd.Se
     return mask.reindex(frames[sym].index, method="ffill").fillna(False)
 
 
+def _breadth_above_ema(frames: dict[str, pd.DataFrame], span: int) -> Optional[pd.Series]:
+    """Fraction of ALT symbols (excl. BTC) with close > ema_{span} on each date.
+
+    A broad-market health gauge the single BTC-regime filter misses: BTC can sit
+    above its own EMAs while most alts bleed below theirs (the 2026-10 alt
+    pullback that dropped live win-rate while BTC regime stayed STRONG_BULL).
+    """
+    ema = f"ema_{span}"
+    cols = {
+        sym: (df["close"] > df[ema]).astype(float)
+        for sym, df in frames.items()
+        if sym != "BTCUSDT" and ema in df.columns
+    }
+    if not cols:
+        return None
+    return pd.DataFrame(cols).mean(axis=1, skipna=True)
+
+
+def _breadth_risk_on_fn(span: int, threshold: float, *, with_btc: bool = False):
+    """risk_on source: entries allowed only when >= threshold of alts are above
+    ema_{span} (optionally ANDed with the BTC EMA50>EMA200 regime)."""
+    def fn(frames: dict[str, pd.DataFrame], sym: str) -> Optional[pd.Series]:
+        br = _breadth_above_ema(frames, span)
+        if br is None:
+            return None
+        mask = (br >= threshold).reindex(frames[sym].index, method="ffill").fillna(False)
+        if with_btc:
+            btc = _risk_on_series(frames, sym)
+            if btc is not None:
+                mask = mask & btc
+        return mask
+    return fn
+
+
 def run_sweep(
     frames: dict[str, pd.DataFrame],
     entry_fn: EntryFn,
@@ -453,11 +487,12 @@ def run_sweep(
     folds: int,
     market_filter: bool,
     mean_reversion_priority: bool = False,
+    risk_on_fn=_risk_on_series,
 ) -> tuple[Metrics, list[Metrics]]:
     """Runs the simulator per-symbol per-fold; returns (pooled, per-fold)."""
     all_trades, fold_trades = _collect_sweep_trades(
         frames, entry_fn, params, folds=folds, market_filter=market_filter,
-        mean_reversion_priority=mean_reversion_priority,
+        mean_reversion_priority=mean_reversion_priority, risk_on_fn=risk_on_fn,
     )
     pooled = aggregate(all_trades)
     observation_bars = sum(len(df) for df in frames.values())
@@ -488,11 +523,12 @@ def run_sweep(
 def _collect_sweep_trades(
     frames: dict[str, pd.DataFrame], entry_fn: EntryFn, params: LadderParams,
     *, folds: int, market_filter: bool, mean_reversion_priority: bool = False,
+    risk_on_fn=_risk_on_series,
 ) -> tuple[list[Trade], list[list[Trade]]]:
     all_trades: list[Trade] = []
     fold_trades: list[list[Trade]] = [[] for _ in range(folds)]
     for sym, df in frames.items():
-        risk_on = _risk_on_series(frames, sym)
+        risk_on = risk_on_fn(frames, sym)
         bounds = _fold_bounds(len(df), folds)
         for f, (lo, hi) in enumerate(bounds):
             sub = df.iloc[lo:hi]
@@ -651,6 +687,46 @@ async def sweep_stop_stale(frames: dict[str, pd.DataFrame], folds: int, market_f
             print(f"    vs live_baseline [POS]: {verdict}")
 
 
+async def sweep_breadth(frames: dict[str, pd.DataFrame], folds: int, market_filter: bool) -> None:
+    print("\n### CHANGE 5 — MARKET-BREADTH ENTRY FILTER (per-position), oversold_bounce entry ###")
+    print(
+        "Breadth = fraction of the ALT universe above EMA20/EMA50. The live BTC-regime "
+        "filter is blind to alt pullbacks (BTC above its EMAs while alts bleed — the "
+        "2026-10 drawdown). This gates entries on broad-market health instead. Reports "
+        "both leg and POSITION level, per fold. Backtest only."
+    )
+    entry_fn = entry_oversold_bounce
+    params = default_params()
+    variants = {
+        "btc_regime(current)": _risk_on_series,
+        "breadth_ema50>=0.20(floor)": _breadth_risk_on_fn(50, 0.20),
+        "breadth_ema50>=0.30(floor)": _breadth_risk_on_fn(50, 0.30),
+        "breadth_ema20>=0.30(floor)": _breadth_risk_on_fn(20, 0.30),
+        "btc_AND_breadth50>=0.30": _breadth_risk_on_fn(50, 0.30, with_btc=True),
+    }
+    base_pos: Optional[Metrics] = None
+    for name, fn in variants.items():
+        all_trades, fold_trades = _collect_sweep_trades(
+            frames, entry_fn, params, folds=folds, market_filter=True, risk_on_fn=fn,
+        )
+        print()
+        print_leg_and_position(name, all_trades)
+        for f, ft in enumerate(fold_trades):
+            fm = aggregate_positions(ft)
+            if fm.n:
+                print_metrics(f"    fold {f} [POS]", fm)
+        pos = aggregate_positions(all_trades)
+        if name == "btc_regime(current)":
+            base_pos = pos
+        elif base_pos is not None and pos.n >= 10:
+            better = (
+                pos.expectancy_pct > base_pos.expectancy_pct
+                and pos.profit_factor > base_pos.profit_factor
+                and pos.max_drawdown_pct <= base_pos.max_drawdown_pct + 1e-9
+            )
+            print(f"    vs btc_regime [POS]: {'IMPROVES' if better else 'no (exp/PF/dd test)'}")
+
+
 async def main_async(which: str, tf: Timeframe, folds: int, bars: int, market_filter: bool) -> None:
     print(f"Loading up to {bars} {tf.value} bars per symbol...")
     frames = await _load_frames(tf, bars)
@@ -667,11 +743,13 @@ async def main_async(which: str, tf: Timeframe, folds: int, bars: int, market_fi
         await sweep_trailing(frames, folds, market_filter)
     if which in ("stop_stale", "all"):
         await sweep_stop_stale(frames, folds, market_filter)
+    if which in ("breadth", "all"):
+        await sweep_breadth(frames, folds, market_filter)
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("which", choices=["entry", "rsi_exit", "trailing", "stop_stale", "all"], default="all", nargs="?")
+    p.add_argument("which", choices=["entry", "rsi_exit", "trailing", "stop_stale", "breadth", "all"], default="all", nargs="?")
     p.add_argument("--timeframe", default="1d", choices=[t.value for t in Timeframe])
     p.add_argument("--folds", type=int, default=3)
     p.add_argument("--bars", type=int, default=1000)
