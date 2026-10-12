@@ -406,6 +406,22 @@ async def test_viii_place_failure_halts_but_exits_still_run(monkeypatch):
     assert len(sells) == 1                             # exits unaffected by the entry halt
 
 
+@pytest.mark.asyncio
+async def test_ix_existing_position_gets_stop_via_risk_gates(monkeypatch):
+    """An ALREADY-OPEN allowlisted position must get its backstop placed by the
+    normal risk tick (reconcile), not only on a fresh buy."""
+    fake = FakeExchange()
+    fake.seed_balance("ADA", 100)
+    pos = {"symbol": "ADAUSDT", "mode": "live", "qty": 100, "entry_price": 1.0, "entry_ts": "t1"}
+    ap, sells, closes = _wire_risk_gates(monkeypatch, fake, position=pos, exits=[])
+    assert len(fake.open) == 0                          # no stop before the tick
+    await ap._run_risk_gates()
+    assert len(fake.open) == 1                          # reconcile placed the backstop
+    (raw,) = fake.open.values()
+    assert raw["clientOrderId"] == stop_coid("pstop-", "ADAUSDT", "t1")
+    assert fake.locked("ADA") == 100 and fake.free("ADA") == 0
+
+
 def test_canary_validator_requires_allowlist_when_enabled():
     from app.config import Settings
     with pytest.raises(Exception):

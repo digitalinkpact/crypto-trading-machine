@@ -594,6 +594,14 @@ class Autopilot:
             except Exception as exc:  # noqa: BLE001
                 log.exception("risk-exit failed for %s: %s", ex.symbol, exc)
 
+        # Ensure every allowlisted live position carries its exchange-native
+        # backstop and ratchet it up. No-op unless the canary flag covers a
+        # symbol; isolated so a stop error never blocks risk exits.
+        try:
+            await self.reconcile_protective_stops()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("protective-stop reconcile failed: %s", exc)
+
     async def _check_circuit_breaker(self) -> bool:
         drawdown_halt = storage.kv_get(_DRAWDOWN_HALT_KEY) or {}
         if isinstance(drawdown_halt, dict) and drawdown_halt.get("active"):
