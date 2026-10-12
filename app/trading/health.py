@@ -136,10 +136,24 @@ async def startup_report() -> dict:
         log.debug("startup report: scheduler status unavailable: %s", e)
     ws_status = live_prices.status()
 
+    # The actual order path: paper routes to PaperExchange; otherwise the live
+    # BinanceUSClient, which itself short-circuits to DRY_RUN while dry_run OR
+    # paper_trading is on. Only mode=live AND not dry_run AND not paper_trading
+    # ever reaches the real exchange.
+    if settings.paper_trading:
+        active_exchange_client = "PaperExchange"
+    elif settings.dry_run:
+        active_exchange_client = "BinanceUSClient(dry_run: no real orders)"
+    else:
+        active_exchange_client = "BinanceUSClient(LIVE)"
+    places_real_orders = (not settings.paper_trading) and (not settings.dry_run)
+
     report = {
         "timestamp": _now_iso(),
         "trading_mode": mode,
         "env": env,
+        "active_exchange_client": active_exchange_client,
+        "places_real_orders": places_real_orders,
         "execution_config": execution_config,
         "exchange_connected": exchange_connected,
         "api_permissions": api_permissions,

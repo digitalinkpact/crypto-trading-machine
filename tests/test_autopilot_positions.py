@@ -530,6 +530,35 @@ def test_aggressive_signal_exit_fires_when_enabled(monkeypatch):
     assert "loss" in (ap._aggressive_exit_reason(_ExitSig(autopilot_module.SignalAction.BUY, 0.5), Decimal("-0.06")) or "")
 
 
+async def test_submit_routes_to_paper_exchange_only_in_paper_mode(monkeypatch):
+    """In paper mode a placed order must reach PaperExchange and NEVER construct
+    the live BinanceUSClient — proof the paper node cannot touch the real
+    exchange."""
+    ap = Autopilot()
+    ap.state.mode = "paper"
+
+    paper_calls: list[dict] = []
+
+    async def _paper_place(**kwargs):
+        paper_calls.append(kwargs)
+        return object()  # paper path just returns the order
+
+    class _NoLiveClient:
+        def __init__(self, *a, **k):
+            raise AssertionError("BinanceUSClient must NOT be constructed in paper mode")
+
+    monkeypatch.setattr(autopilot_module.paper_exchange, "place_order", _paper_place, raising=True)
+    monkeypatch.setattr(autopilot_module, "BinanceUSClient", _NoLiveClient, raising=True)
+    monkeypatch.setattr(autopilot_module.storage, "try_acquire_lock", lambda *a, **k: True)
+    monkeypatch.setattr(autopilot_module.storage, "release_lock", lambda *a, **k: None)
+
+    order = await ap._submit("BTCUSDT", autopilot_module.OrderSide.BUY, Decimal("0.01"), ["test"])
+
+    assert len(paper_calls) == 1
+    assert paper_calls[0]["symbol"] == "BTCUSDT"
+    assert order is not None
+
+
 class _Sig:
     contributing_agents = ["test"]
 
