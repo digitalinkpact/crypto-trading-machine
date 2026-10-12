@@ -1,13 +1,21 @@
 """Strategy lab — a single faithful event-driven simulator (entry -> stop_loss
-/ TP1 / TP2 / trailing / mean-reversion-RSI-exit / max_hold, exactly mirroring
-app/trading/risk.py's live exit ladder and app/trading/strategy.py's signal
-exit) used to run every sweep this optimization pass needs with an IDENTICAL
-execution model, so only the one parameter under test actually varies:
+/ TP1 / TP2 / trailing / mean-reversion-RSI-exit / stale_dead_money / max_hold,
+exactly mirroring app/trading/risk.py's live exit ladder and
+app/trading/strategy.py's signal exit) used to run every sweep this
+optimization pass needs with an IDENTICAL execution model, so only the one
+parameter under test actually varies:
 
     python -m scripts.strategy_lab entry            # dip_buy vs oversold_bounce
     python -m scripts.strategy_lab rsi_exit          # old vs new RSI-exit params
     python -m scripts.strategy_lab trailing          # activation x distance grid
+    python -m scripts.strategy_lab stop_stale        # ATR-stop cap x stale-exit (per-position)
     python -m scripts.strategy_lab all               # everything, in the requested order
+
+The stop is the LIVE ATR stop (clamp(atr_stop_multiple*atr_pct, min, max)); the
+stale_dead_money exit (held >= stale_exit_days below stale_exit_max_pnl) is
+modelled too, so the sim's exits match live. Metrics are reported at BOTH leg
+level (= closed_trades rows) and POSITION level (partial-exit legs collapsed by
+symbol+entry — the honest win rate).
 
 Why a custom simulator instead of vectorbt (scripts/walkforward.py): vectorbt's
 `Portfolio.from_signals` takes one fixed sl_stop/tp_stop and has no notion of
@@ -24,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
@@ -79,6 +88,19 @@ class LadderParams:
     mean_reversion_min_pnl: float
     mean_reversion_require_confirmation: bool
     fee_rate: float
+    # ATR-scaled stop (mirrors risk.dynamic_stop_pct): stop = clamp(mult*atr_pct,
+    # min, max), computed from the entry bar's ATR. When disabled, the fixed
+    # stop_loss_pct is used. This is the LIVE stop, so modelling it is required
+    # to evaluate tightening atr_stop_max.
+    atr_stop_enabled: bool = True
+    atr_stop_min: float = 0.03
+    atr_stop_max: float = 0.08
+    atr_stop_multiple: float = 2.0
+    # stale_dead_money exit (mirrors risk.evaluate_exits): force-close a position
+    # held >= stale_exit_days whose gain is still below stale_exit_max_pnl.
+    stale_exit_enabled: bool = True
+    stale_exit_days: int = 2
+    stale_exit_max_pnl: float = 0.02
 
 
 def default_params(**overrides) -> LadderParams:
@@ -99,6 +121,13 @@ def default_params(**overrides) -> LadderParams:
             or s.mean_reversion_exit_require_price_confirmation
         ),
         fee_rate=s.binance_taker_fee,
+        atr_stop_enabled=getattr(s, "atr_stop_enabled", True),
+        atr_stop_min=getattr(s, "atr_stop_min_pct", 0.03),
+        atr_stop_max=getattr(s, "atr_stop_max_pct", 0.08),
+        atr_stop_multiple=getattr(s, "atr_stop_multiple", 2.0),
+        stale_exit_enabled=getattr(s, "stale_exit_enabled", True),
+        stale_exit_days=max(1, int(getattr(s, "stale_exit_hours", 48) / 24)),
+        stale_exit_max_pnl=getattr(s, "stale_exit_max_pnl_pct", 0.02),
     )
     base.update(overrides)
     return LadderParams(**base)
@@ -132,6 +161,23 @@ def _bearish_price_confirmation(df: pd.DataFrame, i: int) -> bool:
     return bool(row["close"] < row["ema_20"])
 
 
+def _entry_stop_frac(df: pd.DataFrame, i: int, params: LadderParams) -> float:
+    """ATR-scaled stop fraction at the entry bar (mirrors risk.dynamic_stop_pct).
+
+    clamp(atr_stop_multiple * atr_pct, atr_stop_min, atr_stop_max). Falls back to
+    the fixed stop_loss_pct when ATR is unavailable or the ATR stop is disabled.
+    """
+    if not params.atr_stop_enabled or "atr_14" not in df.columns:
+        return params.stop_loss_pct
+    close = float(df["close"].iloc[i])
+    atr = float(df["atr_14"].iloc[i]) if not pd.isna(df["atr_14"].iloc[i]) else 0.0
+    atr_pct = (atr / close) if close > 0 else 0.0
+    if atr_pct <= 0:
+        return params.stop_loss_pct
+    raw = params.atr_stop_multiple * atr_pct
+    return float(min(max(raw, params.atr_stop_min), params.atr_stop_max))
+
+
 def simulate_symbol(
     symbol: str,
     df: pd.DataFrame,
@@ -162,6 +208,7 @@ def simulate_symbol(
     original_qty = 0.0
     hwm = 0.0
     lwm = 0.0
+    stop_frac = params.stop_loss_pct
     tp1_taken = False
     tp2_taken = False
 
@@ -180,6 +227,7 @@ def simulate_symbol(
                 original_qty = 1.0
                 hwm = price
                 lwm = price
+                stop_frac = _entry_stop_frac(df, i, params)
                 tp1_taken = False
                 tp2_taken = False
             continue
@@ -204,7 +252,7 @@ def simulate_symbol(
 
         if mean_reversion_priority and _mean_reversion_hit():
             exit_reason, exit_qty = "mean_reversion_rsi", qty
-        elif change <= -params.stop_loss_pct:
+        elif change <= -stop_frac:
             exit_reason, exit_qty = "stop_loss", qty
         elif not tp1_taken and change >= params.tp1_pct:
             exit_reason, exit_qty = "take_profit_1", original_qty * params.tp1_frac
@@ -216,6 +264,12 @@ def simulate_symbol(
             exit_reason, exit_qty = "trailing_stop", qty
         elif (not mean_reversion_priority) and _mean_reversion_hit():
             exit_reason, exit_qty = "mean_reversion_rsi", qty
+        elif (
+            params.stale_exit_enabled
+            and (i - entry_idx) >= params.stale_exit_days
+            and change < params.stale_exit_max_pnl
+        ):
+            exit_reason, exit_qty = "stale_dead_money", qty
         elif (i - entry_idx) >= params.max_hold_days:
             exit_reason, exit_qty = "max_hold", qty
 
@@ -236,7 +290,7 @@ def simulate_symbol(
                 pnl_pct=pnl_pct, exit_reason=exit_reason, mfe_pct=mfe_pct, mae_pct=mae_pct,
             ))
             qty -= exit_qty
-            if qty <= 1e-9 or exit_reason in ("stop_loss", "trailing_stop", "max_hold", "mean_reversion_rsi"):
+            if qty <= 1e-9 or exit_reason in ("stop_loss", "trailing_stop", "max_hold", "mean_reversion_rsi", "stale_dead_money"):
                 entry_price = None
                 entry_idx = None
                 qty = 0.0
@@ -314,6 +368,45 @@ def aggregate(trades: list[Trade], *, risk_per_trade_pct: float = 0.01) -> Metri
     )
 
 
+def positions_from_trades(trades: list[Trade]) -> list[Trade]:
+    """Collapse partial-exit legs (sharing symbol+entry_idx) into one synthetic
+    POSITION-level Trade so win-rate/expectancy are per position, not per leg.
+
+    A winner that scaled out across TP1/TP2/trailing legs is one position, not
+    three wins. Position pnl% on the FULL original notional = Σ(leg pnl% * leg
+    qty) since every leg shares the position's entry price.
+    """
+    groups: dict[tuple[str, int], list[Trade]] = defaultdict(list)
+    for t in trades:
+        groups[(t.symbol, t.entry_idx)].append(t)
+    out: list[Trade] = []
+    for (sym, eidx), legs in groups.items():
+        pos_pnl_pct = sum(leg.pnl_pct * leg.qty for leg in legs)
+        last = max(legs, key=lambda leg: leg.exit_idx)
+        out.append(Trade(
+            symbol=sym, entry_idx=eidx, exit_idx=last.exit_idx,
+            entry_price=legs[0].entry_price, exit_price=last.exit_price,
+            qty=1.0, pnl_pct=pos_pnl_pct, exit_reason=last.exit_reason,
+            mfe_pct=max(leg.mfe_pct for leg in legs),
+            mae_pct=max(leg.mae_pct for leg in legs),
+            regime_risk_on=legs[0].regime_risk_on,
+        ))
+    return out
+
+
+def aggregate_positions(trades: list[Trade]) -> Metrics:
+    """Per-POSITION metrics (collapses partial-exit legs first)."""
+    return aggregate(positions_from_trades(trades))
+
+
+def exit_reason_mix(trades: list[Trade]) -> dict[str, int]:
+    """Count POSITIONS by their final exit reason (how the slot was freed)."""
+    mix: dict[str, int] = defaultdict(int)
+    for p in positions_from_trades(trades):
+        mix[p.exit_reason] += 1
+    return dict(sorted(mix.items(), key=lambda kv: -kv[1]))
+
+
 def print_metrics(label: str, m: Metrics) -> None:
     pf = f"{m.profit_factor:.2f}" if m.profit_factor != float("inf") else "inf"
     print(
@@ -324,6 +417,17 @@ def print_metrics(label: str, m: Metrics) -> None:
         f"time_in_market={m.time_in_market_pct:>6.1%} "
         f"max_lose_streak={m.max_losing_streak:<3} mfe_captured={m.mfe_captured_pct:>5.1%}"
     )
+
+
+def print_leg_and_position(label: str, trades: list[Trade]) -> None:
+    """Report a variant at BOTH leg level (matches live closed_trades rows) and
+    position level (the honest win rate), with the position exit-reason mix."""
+    print_metrics(f"{label} [legs]", aggregate(trades))
+    print_metrics(f"{label} [POS] ", aggregate_positions(trades))
+    mix = exit_reason_mix(trades)
+    if mix:
+        print("    position exit mix: " + ", ".join(f"{k}={v}" for k, v in mix.items()))
+
 
 
 # ── Fold-aware sweep runner ─────────────────────────────────────────────
@@ -504,6 +608,45 @@ async def sweep_trailing(frames: dict[str, pd.DataFrame], folds: int, market_fil
               f"max_dd={best[1].max_drawdown_pct:.1%} n={best[1].n}")
 
 
+async def sweep_stop_stale(frames: dict[str, pd.DataFrame], folds: int, market_filter: bool) -> None:
+    print("\n### CHANGE 4 — ATR-STOP CAP x STALE-EXIT (per-position), oversold_bounce entry ###")
+    print(
+        "Models the LIVE ATR stop (clamp(2*atr_pct, atr_min, atr_max)) and the "
+        "stale_dead_money exit so the sim matches live exits. Reports BOTH leg-level "
+        "(= closed_trades rows) and POSITION-level (the honest win rate). Only deploy "
+        "a variant if BOTH expectancy AND profit factor beat live_baseline at POSITION "
+        "level without raising max_dd."
+    )
+    entry_fn = entry_oversold_bounce  # live entry_strategy default
+    variants = {
+        "live_baseline": default_params(),
+        "atr_cap_6pct": default_params(atr_stop_max=0.06),
+        "atr_cap_5pct": default_params(atr_stop_max=0.05),
+        "stale_off": default_params(stale_exit_enabled=False),
+        "stale_3d": default_params(stale_exit_days=3),
+        "stale_3d+only_up": default_params(stale_exit_days=3, stale_exit_max_pnl=0.0),
+        "atr_cap_5pct+stale_3d": default_params(atr_stop_max=0.05, stale_exit_days=3),
+    }
+    base_pos: Optional[Metrics] = None
+    for name, params in variants.items():
+        all_trades, _ = _collect_sweep_trades(
+            frames, entry_fn, params, folds=folds, market_filter=market_filter
+        )
+        print()
+        print_leg_and_position(name, all_trades)
+        pos = aggregate_positions(all_trades)
+        if name == "live_baseline":
+            base_pos = pos
+        elif base_pos is not None and pos.n >= 10:
+            better = (
+                pos.expectancy_pct > base_pos.expectancy_pct
+                and pos.profit_factor > base_pos.profit_factor
+                and pos.max_drawdown_pct <= base_pos.max_drawdown_pct + 1e-9
+            )
+            verdict = "DEPLOY-CANDIDATE" if better else "no (fails expectancy/PF/dd test)"
+            print(f"    vs live_baseline [POS]: {verdict}")
+
+
 async def main_async(which: str, tf: Timeframe, folds: int, bars: int, market_filter: bool) -> None:
     print(f"Loading up to {bars} {tf.value} bars per symbol...")
     frames = await _load_frames(tf, bars)
@@ -518,11 +661,13 @@ async def main_async(which: str, tf: Timeframe, folds: int, bars: int, market_fi
         await sweep_rsi_exit(frames, folds, market_filter)
     if which in ("trailing", "all"):
         await sweep_trailing(frames, folds, market_filter)
+    if which in ("stop_stale", "all"):
+        await sweep_stop_stale(frames, folds, market_filter)
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("which", choices=["entry", "rsi_exit", "trailing", "all"], default="all", nargs="?")
+    p.add_argument("which", choices=["entry", "rsi_exit", "trailing", "stop_stale", "all"], default="all", nargs="?")
     p.add_argument("--timeframe", default="1d", choices=[t.value for t in Timeframe])
     p.add_argument("--folds", type=int, default=3)
     p.add_argument("--bars", type=int, default=1000)
