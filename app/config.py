@@ -592,10 +592,19 @@ class Settings(BaseSettings):
     # which then filters live entry signals. When enabled, uncertainty blocks
     # a new BUY rather than granting it permission.
     ml_gate_enabled: bool = True
+    # NOTE (config-vs-behaviour): the LIVE per-signal gate in
+    # autopilot._execute uses Autopilot._ml_gate_threshold_for_confidence, which
+    # returns a HARDCODED 0.40 for BUY / 0.50 for SELL and ignores both
+    # confidence and aggressive_mode. So `ml_gate_threshold` does NOT set the
+    # live BUY/SELL gate — it is only read by the LLM-signal gate in
+    # app/agents/runner.py, by telemetry (_persist_gate_stats, /metrics) and by
+    # the dashboard. The conf_70/80/90 ladder below is DEAD (read nowhere; a
+    # leftover from an abandoned confidence-tiered design). Pinned by
+    # tests/test_autopilot_positions.py::test_ml_gate_threshold_is_hardcoded.
     ml_gate_threshold: float = Field(0.50, ge=0.0, le=1.0)
-    ml_gate_threshold_conf_70: float = Field(0.45, ge=0.0, le=1.0)
-    ml_gate_threshold_conf_80: float = Field(0.40, ge=0.0, le=1.0)
-    ml_gate_threshold_conf_90: float = Field(0.35, ge=0.0, le=1.0)
+    ml_gate_threshold_conf_70: float = Field(0.45, ge=0.0, le=1.0)  # DEAD — not read
+    ml_gate_threshold_conf_80: float = Field(0.40, ge=0.0, le=1.0)  # DEAD — not read
+    ml_gate_threshold_conf_90: float = Field(0.35, ge=0.0, le=1.0)  # DEAD — not read
     # Safety valve: an auxiliary quality model trained on a past market regime
     # must not veto trades forever. If the loaded model is older than this many
     # hours, the gate goes advisory (fail-open) so a stale, single-regime model

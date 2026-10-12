@@ -530,6 +530,22 @@ def test_aggressive_signal_exit_fires_when_enabled(monkeypatch):
     assert "loss" in (ap._aggressive_exit_reason(_ExitSig(autopilot_module.SignalAction.BUY, 0.5), Decimal("-0.06")) or "")
 
 
+def test_ml_gate_threshold_is_hardcoded(monkeypatch):
+    """Pin the REAL live gate: 0.40 BUY / 0.50 SELL, independent of confidence,
+    aggressive_mode, and the (non-governing) ml_gate_threshold setting — so the
+    config can't imply a BUY-gate control that does not exist."""
+    ap = Autopilot()
+
+    class _S:
+        ml_gate_threshold = 0.30  # claims 0.30; the live gate must ignore it
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    for conf in (0.0, 0.5, 0.99):
+        for aggr in (True, False):
+            assert ap._ml_gate_threshold_for_confidence(conf, aggr, autopilot_module.SignalAction.BUY) == 0.40
+            assert ap._ml_gate_threshold_for_confidence(conf, aggr, autopilot_module.SignalAction.SELL) == 0.50
+
+
 async def test_submit_routes_to_paper_exchange_only_in_paper_mode(monkeypatch):
     """In paper mode a placed order must reach PaperExchange and NEVER construct
     the live BinanceUSClient — proof the paper node cannot touch the real
