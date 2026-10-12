@@ -1841,6 +1841,12 @@ class Autopilot:
         sig,
         position_return_pct: Decimal,
     ) -> Optional[str]:
+        # Off by default: the live strategy returns HOLD for held coins (and the
+        # mean-reversion exit is disabled), so no qualifying signal reaches this
+        # path and exits are the risk ladder alone. Gated so config matches
+        # behaviour; enable via AGGRESSIVE_SIGNAL_EXIT_ENABLED to restore it.
+        if not getattr(get_settings(), "aggressive_signal_exit_enabled", False):
+            return None
         if sig.action == SignalAction.SELL and sig.confidence >= 0.70:
             return f"sell confidence={sig.confidence:.2f} >= 0.70"
         if position_return_pct >= Decimal("0.03"):

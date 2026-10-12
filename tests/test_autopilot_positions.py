@@ -498,6 +498,38 @@ def test_aggressive_mode_stays_active_during_warmup(monkeypatch):
     assert reason.startswith("warmup:")
 
 
+class _ExitSig:
+    def __init__(self, action, confidence):
+        self.action = action
+        self.confidence = confidence
+
+
+def test_aggressive_signal_exit_inert_by_default(monkeypatch):
+    ap = Autopilot()
+
+    class _S:
+        aggressive_signal_exit_enabled = False
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    # Even a +10% winner, a -6% loser, or a high-confidence SELL returns no
+    # forced exit when disabled — exits are left to the risk ladder.
+    assert ap._aggressive_exit_reason(_ExitSig(autopilot_module.SignalAction.SELL, 0.95), Decimal("0.0")) is None
+    assert ap._aggressive_exit_reason(_ExitSig(autopilot_module.SignalAction.BUY, 0.5), Decimal("0.10")) is None
+    assert ap._aggressive_exit_reason(_ExitSig(autopilot_module.SignalAction.BUY, 0.5), Decimal("-0.06")) is None
+
+
+def test_aggressive_signal_exit_fires_when_enabled(monkeypatch):
+    ap = Autopilot()
+
+    class _S:
+        aggressive_signal_exit_enabled = True
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    assert "sell confidence" in (ap._aggressive_exit_reason(_ExitSig(autopilot_module.SignalAction.SELL, 0.80), Decimal("0.0")) or "")
+    assert "profit" in (ap._aggressive_exit_reason(_ExitSig(autopilot_module.SignalAction.BUY, 0.5), Decimal("0.04")) or "")
+    assert "loss" in (ap._aggressive_exit_reason(_ExitSig(autopilot_module.SignalAction.BUY, 0.5), Decimal("-0.06")) or "")
+
+
 class _Sig:
     contributing_agents = ["test"]
 
@@ -676,6 +708,7 @@ async def test_execute_forces_take_profit_exit_before_buy_path(monkeypatch):
         aggressive_mode_enabled = True
         aggressive_rollback_min_trades = 30
         aggressive_rollback_min_win_rate = 0.50
+        aggressive_signal_exit_enabled = True
 
     async def _fake_snapshot(*, mode):
         assert mode == "live"
@@ -732,6 +765,7 @@ async def test_execute_forces_exit_on_high_confidence_sell_signal(monkeypatch):
         aggressive_mode_enabled = True
         aggressive_rollback_min_trades = 30
         aggressive_rollback_min_win_rate = 0.50
+        aggressive_signal_exit_enabled = True
 
     async def _fake_snapshot(*, mode):
         assert mode == "live"

@@ -289,6 +289,14 @@ class Settings(BaseSettings):
     # (max_open_positions alone does nothing then). 12 = 2026-09-29 win-rate revert.
     aggressive_max_open_positions: int = Field(12, ge=1, le=50)
     rollback_max_open_positions: int = Field(12, ge=1, le=50)
+    # Aggressive signal-exit: when True, a held position is force-closed on a
+    # high-confidence SELL signal, or at +3% / -5% unrealized. Default FALSE —
+    # the live strategy returns HOLD for held coins (and the mean-reversion
+    # exit is off), so no qualifying signal ever reaches this path; exits are
+    # the risk ladder (stop/TP1/TP2/trailing/stale/max_hold) exclusively. The
+    # +3% quick-take also caps winners the +8% TP1/trailing ladder would ride,
+    # so off is the evidence-aligned default (see mean_reversion_exit_enabled).
+    aggressive_signal_exit_enabled: bool = False
     trend_gate_bypass_confidence: float = Field(0.85, ge=0.0, le=1.0)
     trend_gate_bypass_ml_proba: float = Field(0.55, ge=0.0, le=1.0)
     pyramid_confidence_threshold: float = Field(0.85, ge=0.0, le=1.0)
