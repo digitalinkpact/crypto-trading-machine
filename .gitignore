@@ -15,6 +15,7 @@ dist/
 build/
 .DS_Store
 data/cache/
+data/cache*/
 *.sqlite
 *.db
 .ipynb_checkpoints/
