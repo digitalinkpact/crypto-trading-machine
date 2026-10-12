@@ -724,6 +724,9 @@ class Settings(BaseSettings):
 
     # Binance.US REST endpoint — never point this at binance.com
     binance_base_url: str = "https://api.binance.us"
+    # Per-request HTTP timeout for the connector. Without it (connector default
+    # None) one hung socket blocks the call forever.
+    binance_http_timeout_seconds: float = Field(10.0, ge=1.0, le=120.0)
     binance_ws_url: str = "wss://stream.binance.us:9443"
 
     @model_validator(mode="after")

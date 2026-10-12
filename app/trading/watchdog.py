@@ -270,9 +270,16 @@ async def _health_loop() -> None:
             # Automatic API retries: transient blips (a single dropped
             # connection, a momentary 5xx) must not immediately count as a
             # full exchange outage.
+            #
+            # Reachability is measured with the UNSIGNED /api/v3/ping. The
+            # signed /account call also fails on -1021 clock skew, -1003 rate
+            # limits, or a key/IP problem — none of which mean "exchange is
+            # down", and none of which should halt trading via binance_alive.
+            # The signed check is tracked separately as binance_account_ok so a
+            # credential fault is still visible without tripping the halt.
             api_start = time.monotonic()
-            ok, _account = await health._retry_async(
-                lambda: BinanceUSClient().account(), attempts=3, base_delay=1.0, label="binance account ping",
+            ok, _ = await health._retry_async(
+                lambda: BinanceUSClient().ping(), attempts=3, base_delay=1.0, label="binance ping",
             )
             status["binance_alive"] = ok
             if ok:
@@ -280,6 +287,15 @@ async def _health_loop() -> None:
                 status["binance_latency_s"] = round(latency, 3)
                 if latency > s.health_latency_warn_seconds:
                     log.warning("health check: abnormal binance API latency %.2fs", latency)
+            acct_ok, _account = await health._retry_async(
+                lambda: BinanceUSClient().account(), attempts=2, base_delay=1.0, label="binance account check",
+            )
+            status["binance_account_ok"] = acct_ok
+            if ok and not acct_ok:
+                log.error(
+                    "health check: Binance.US reachable but signed /account failed — "
+                    "check API key permissions / IP allowlist / server clock (not an outage)"
+                )
 
             # detect failure -> attempt recovery -> verify recovery.
             if not live_prices.connected:

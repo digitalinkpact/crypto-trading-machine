@@ -777,6 +777,25 @@ async def autopilot_status() -> dict:
     if not isinstance(last_exchange_error, dict):
         last_exchange_error = None
 
+    # Watchdog view: reachability (unsigned ping) vs credential validity (signed
+    # /account). Reachable-but-account-failing points at key/IP/clock, not an
+    # outage.
+    health_status = storage.kv_get("health_status")
+    if not isinstance(health_status, dict):
+        health_status = {}
+    exchange_health = {
+        "checked_at": health_status.get("timestamp"),
+        "binance_reachable": health_status.get("binance_alive"),
+        "binance_account_ok": health_status.get("binance_account_ok"),
+        "binance_latency_s": health_status.get("binance_latency_s"),
+        "risk_loop_alive": health_status.get("risk_loop_alive"),
+        "risk_loop_age_s": health_status.get("risk_loop_age_s"),
+        "trade_loop_alive": health_status.get("trade_loop_alive"),
+    }
+    emergency_halt = storage.kv_get("emergency_halt")
+    if not isinstance(emergency_halt, dict):
+        emergency_halt = None
+
     return {
         # ── existing fields (backward-compatible; do not remove/rename) ──
         "running": s.running,
@@ -818,6 +837,8 @@ async def autopilot_status() -> dict:
         "exposure": exposure,
         "last_account_ok": last_account_ok,
         "last_exchange_error": last_exchange_error,
+        "exchange_health": exchange_health,
+        "emergency_halt": emergency_halt,
         "commit": _running_commit(),
     }
 

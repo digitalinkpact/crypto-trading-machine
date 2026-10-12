@@ -111,10 +111,15 @@ class BinanceUSClient:
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self._settings = settings or get_settings()
+        # binance-connector defaults to timeout=None, so a single hung socket
+        # blocks the (to_thread) call forever and starves the health loop's
+        # retry/streak logic. A bounded timeout turns that hang into a fast,
+        # retryable exception.
         self._spot = Spot(
             api_key=self._settings.binance_api_key.get_secret_value() or None,
             api_secret=self._settings.binance_api_secret.get_secret_value() or None,
             base_url=self._settings.binance_base_url,
+            timeout=float(getattr(self._settings, "binance_http_timeout_seconds", 10.0)),
         )
 
     def generate_client_order_id(self, prefix: str = "ctm") -> str:
@@ -235,6 +240,13 @@ class BinanceUSClient:
 
     async def account(self) -> dict[str, Any]:
         return await self._api_call("account", self._spot.account)
+
+    async def ping(self) -> bool:
+        """Unsigned reachability probe (GET /api/v3/ping). No credentials involved,
+        so it answers "is Binance.US reachable" without conflating that with key
+        validity, clock skew, or account rate limits."""
+        await self._api_call("ping", self._spot.ping)
+        return True
 
     async def trade_fees(self) -> dict[str, Decimal]:
         """Read this account's REAL spot maker/taker fee rates from Binance.US.
