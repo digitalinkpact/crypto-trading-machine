@@ -101,8 +101,23 @@ def test_max_hold_triggers():
     assert exits[0].reason == "max_hold"
 
 
-def test_stale_dead_money_exit_triggers_before_max_hold():
-    """Held >48h with <2% gain should exit as stale, well before max_hold (96h)."""
+def test_stale_dead_money_exit_triggers_before_max_hold(monkeypatch):
+    """Held >stale_exit_hours with <2% gain should exit as stale, before max_hold."""
+    class _S:
+        stop_loss_pct = 0.015
+        take_profit_pct = 0.05
+        take_profit_1_pct = 0.08
+        take_profit_1_fraction = 0.50
+        take_profit_2_pct = 0.15
+        take_profit_2_fraction = 0.25
+        trailing_activation_pct = 0.02
+        trailing_stop_pct = 0.01
+        max_hold_hours = 96
+        stale_exit_enabled = True
+        stale_exit_hours = 48
+        stale_exit_max_pnl_pct = 0.02
+
+    monkeypatch.setattr(risk, "get_settings", lambda: _S())
     positions = [_pos("BTCUSDT", 1.0, 100.0, hours_ago=50)]
     prices = {"BTCUSDT": Decimal("101")}  # +1%, below the 2% stale threshold
     risk.clear_hwm("BTCUSDT")
