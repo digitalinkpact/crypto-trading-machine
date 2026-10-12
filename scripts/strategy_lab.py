@@ -629,11 +629,15 @@ async def sweep_stop_stale(frames: dict[str, pd.DataFrame], folds: int, market_f
     }
     base_pos: Optional[Metrics] = None
     for name, params in variants.items():
-        all_trades, _ = _collect_sweep_trades(
+        all_trades, fold_trades = _collect_sweep_trades(
             frames, entry_fn, params, folds=folds, market_filter=market_filter
         )
         print()
         print_leg_and_position(name, all_trades)
+        for f, ft in enumerate(fold_trades):
+            fm = aggregate_positions(ft)
+            if fm.n:
+                print_metrics(f"    fold {f} [POS]", fm)
         pos = aggregate_positions(all_trades)
         if name == "live_baseline":
             base_pos = pos
