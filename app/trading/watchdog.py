@@ -431,8 +431,8 @@ async def _health_loop() -> None:
                 status["open_orders_count"] = open_orders_count
                 if open_orders_bad:
                     log.warning(
-                        "health check: %d unexpected resting open order(s) — "
-                        "this strategy only places MARKET orders", open_orders_count,
+                        "health check: %d unexpected resting open order(s)",
+                        open_orders_count,
                     )
             except Exception as e:  # noqa: BLE001
                 log.exception("health check: open-orders check failed: %s", e)
