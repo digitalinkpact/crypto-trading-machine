@@ -21,3 +21,4 @@ data/cache*/
 .ipynb_checkpoints/
 logs/
 *.log
+data/
