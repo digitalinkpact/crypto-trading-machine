@@ -523,12 +523,13 @@ class Autopilot:
                             # corrupts realized PnL, win-rate and agent stats.
                             # Close at the entry price so realized PnL is ~0
                             # (bookkeeping cleanup, not a real trade).
-                            stale_pos = storage.get_position(ex.symbol)
+                            stale_pos = storage.get_position(ex.symbol, mode=self.state.mode)
                             book_exit_price = Decimal(
                                 str((stale_pos or {}).get("entry_price") or price)
                             )
                             storage.close_position(
-                                symbol=ex.symbol, exit_price=book_exit_price,
+                                symbol=ex.symbol, mode=self.state.mode,
+                                exit_price=book_exit_price,
                                 exit_reason=f"{ex.reason}_stale_dust",
                             )
                             risk.clear_hwm(ex.symbol)
@@ -2514,15 +2515,17 @@ class Autopilot:
                     symbol, fill_price,
                 )
                 return
-            pos = storage.get_position(symbol)
+            pos = storage.get_position(symbol, mode=self.state.mode)
             entry_price = Decimal(str((pos or {}).get("entry_price") or 0))
             mfe_pct, mae_pct = risk.mfe_mae_pct(symbol, entry_price)
             fee = fill.get("fee")
-            actual_fee = float(fee) if fee is not None and fill.get("fee_asset") == "USDT" else None
+            # The stop fill's commission is the EXIT leg only — pass it as such
+            # so storage still charges the entry leg (recorded or modeled).
+            actual_exit_fee = float(fee) if fee is not None and fill.get("fee_asset") == "USDT" else None
             storage.close_position(
                 symbol=symbol, mode=self.state.mode, exit_price=priced,
                 exit_reason="exchange_stop", mfe_pct=mfe_pct, mae_pct=mae_pct,
-                actual_fee_usdt=actual_fee,
+                actual_exit_fee_usdt=actual_exit_fee,
             )
             risk.clear_hwm(symbol); risk.clear_tp1(symbol); risk.clear_tp2(symbol)
             log.warning("EXCHANGE STOP filled %s at %s — recorded exit (no double-sell)",
@@ -2534,7 +2537,7 @@ class Autopilot:
         """After a TP1/TP2 partial, re-place the stop for the REMAINING qty."""
         if not self._stop_allowed(symbol):
             return
-        pos = storage.get_position(symbol)
+        pos = storage.get_position(symbol, mode=self.state.mode)
         if not pos or Decimal(str(pos.get("qty") or 0)) <= 0:
             return
         software_stop = await self._effective_software_stop_price(
@@ -2697,16 +2700,13 @@ class Autopilot:
                     )
                     # Exchange-native catastrophe backstop (OFF by default; the
                     # software risk loop stays primary). No-op when disabled.
-                    pos_row = storage.get_position(symbol)
+                    pos_row = storage.get_position(symbol, mode="live")
                     await self._place_protective_stop(
                         symbol, filled, Decimal(str(price)),
                         str((pos_row or {}).get("entry_ts") or ""),
                     )
                 else:
-                    pos = next(
-                        (p for p in storage.all_positions() if p["symbol"] == symbol and p["mode"] == "live"),
-                        None,
-                    )
+                    pos = storage.get_position(symbol, mode="live")
                     mfe_pct, mae_pct = risk.mfe_mae_pct(
                         symbol, Decimal(str((pos or {}).get("entry_price") or 0))
                     )
@@ -2716,14 +2716,17 @@ class Autopilot:
                     # entry's and this exit's commission are known and were
                     # paid in the quote asset (USDT). A commission paid in
                     # another asset (e.g. BNB fee discount) isn't directly a
-                    # USDT cost without a conversion we don't have here, and
-                    # mixing one real leg with one modeled leg would blur
-                    # `fee_source` — storage.reduce_position falls back to a
-                    # fully modeled estimate for the whole trade rather than
-                    # fabricate a partial number.
+                    # USDT cost without a conversion we don't have here. When
+                    # the entry fee was never recorded, pass None so
+                    # storage.reduce_position models BOTH legs instead of
+                    # booking only the exit leg as the whole fee.
                     actual_exit_fee_usdt = None
                     entry_fee = (pos or {}).get("entry_fee_usdt")
-                    if order.commission is not None and order.commission_asset == "USDT":
+                    if (
+                        entry_fee is not None
+                        and order.commission is not None
+                        and order.commission_asset == "USDT"
+                    ):
                         actual_exit_fee_usdt = float(order.commission)
                     storage.reduce_position(
                         symbol=symbol, mode="live", qty=filled, exit_price=price,

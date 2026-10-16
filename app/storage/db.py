@@ -231,6 +231,44 @@ def _f(x: Any) -> float:
     return float(x)
 
 
+def _round_trip_fee(
+    *,
+    entry_price: float,
+    exit_price: float,
+    qty: float,
+    taker_fee: float,
+    entry_fee: Optional[float],
+    actual_fee_usdt: Optional[float],
+    actual_exit_fee_usdt: Optional[float],
+) -> tuple[float, str]:
+    """Return (fee_amount, fee_source) for a closed slice of `qty`.
+
+    Both legs are ALWAYS charged. `entry_fee` is the recorded (already
+    allocated to this slice) entry commission or None when unknown;
+    `actual_exit_fee_usdt` is the exit leg's real USDT commission or None.
+    `actual_fee_usdt` is a caller-supplied total for the whole round trip.
+
+    fee_source: "actual"  — both legs are real exchange commissions
+                "mixed"   — one leg real, the other modeled at `taker_fee`
+                "modeled" — both legs estimated
+    An unknown leg is modeled, never silently dropped: dropping it would
+    overstate net PnL, win rate and expectancy for exactly the trades that
+    reconcile against real exchange fills.
+    """
+    if actual_fee_usdt is not None:
+        return float(actual_fee_usdt), "actual"
+    if entry_fee is None and actual_exit_fee_usdt is None:
+        return (entry_price * qty * taker_fee) + (exit_price * qty * taker_fee), "modeled"
+    entry_leg = float(entry_fee) if entry_fee is not None else entry_price * qty * taker_fee
+    exit_leg = (
+        float(actual_exit_fee_usdt)
+        if actual_exit_fee_usdt is not None
+        else exit_price * qty * taker_fee
+    )
+    both_real = entry_fee is not None and actual_exit_fee_usdt is not None
+    return entry_leg + exit_leg, ("actual" if both_real else "mixed")
+
+
 def _owner_is_alive(owner: str | None) -> bool:
     """Best-effort process liveness check for lock owners.
 
@@ -549,12 +587,21 @@ class Storage:
                 ),
             )
 
-    def get_position(self, symbol: str) -> Optional[dict]:
+    def get_position(self, symbol: str, mode: Optional[str] = None) -> Optional[dict]:
+        """Fetch one open position. Always pass `mode` from a trading loop —
+        the mode-less form prefers the live row and can silently return the
+        wrong book when paper and live rows coexist for the same symbol."""
         with self._lock, self._conn() as c:
-            row = c.execute(
-                "SELECT * FROM positions WHERE symbol=? ORDER BY CASE mode WHEN 'live' THEN 0 ELSE 1 END LIMIT 1",
-                (symbol,),
-            ).fetchone()
+            if mode is None:
+                row = c.execute(
+                    "SELECT * FROM positions WHERE symbol=? ORDER BY CASE mode WHEN 'live' THEN 0 ELSE 1 END LIMIT 1",
+                    (symbol,),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT * FROM positions WHERE symbol=? AND mode=?",
+                    (symbol, mode),
+                ).fetchone()
         return dict(row) if row else None
 
     def all_positions(self) -> list[dict]:
@@ -572,6 +619,7 @@ class Storage:
         mfe_pct: Optional[float] = None,
         mae_pct: Optional[float] = None,
         actual_fee_usdt: Optional[float] = None,
+        actual_exit_fee_usdt: Optional[float] = None,
     ) -> Optional[dict]:
         """Close a position fully. Records to closed_trades and updates agent stats.
 
@@ -586,7 +634,10 @@ class Storage:
         favorably first, then this trade still lost). `actual_fee_usdt`, when
         the caller can supply Binance's REAL per-fill commission (see
         `app.exchange.client._extract_commission`), is used in place of the
-        modeled fee estimate — never fabricated when unavailable.
+        modeled fee estimate — never fabricated when unavailable. It is the
+        TOTAL round-trip fee (entry + exit); a caller that only knows the EXIT
+        leg's real commission must pass `actual_exit_fee_usdt` instead so the
+        entry leg is still charged (recorded or modeled) rather than dropped.
         """
         with self._lock, self._conn() as c:
             if mode is None:
@@ -613,15 +664,11 @@ class Storage:
             taker_fee = float(s.binance_taker_fee)
             gross_pnl = (exit_p - entry) * qty
             entry_fee = row["entry_fee_usdt"] if "entry_fee_usdt" in row.keys() else None
-            if actual_fee_usdt is not None:
-                fee_amount = float(actual_fee_usdt)
-                fee_source = "actual"
-            elif entry_fee is not None:
-                fee_amount = float(entry_fee) + (exit_p * qty * taker_fee)
-                fee_source = "mixed"
-            else:
-                fee_amount = (entry * qty * taker_fee) + (exit_p * qty * taker_fee)
-                fee_source = "modeled"
+            fee_amount, fee_source = _round_trip_fee(
+                entry_price=entry, exit_price=exit_p, qty=qty, taker_fee=taker_fee,
+                entry_fee=entry_fee, actual_fee_usdt=actual_fee_usdt,
+                actual_exit_fee_usdt=actual_exit_fee_usdt,
+            )
             pnl = gross_pnl - fee_amount
             entry_notional = entry * qty
             pnl_pct = ((pnl / entry_notional) * 100) if entry_notional else 0.0
@@ -698,24 +745,15 @@ class Storage:
             gross_pnl = (exit_p - entry) * reduce_qty
             entry_fee = row["entry_fee_usdt"] if "entry_fee_usdt" in row.keys() else None
             allocated_entry_fee = (
-                float(entry_fee or 0) * (reduce_qty / pos_qty)
+                float(entry_fee) * (reduce_qty / pos_qty)
                 if entry_fee is not None and pos_qty > 0
-                else 0.0
+                else None
             )
-            if actual_exit_fee_usdt is not None or entry_fee is not None:
-                exit_fee = (
-                    float(actual_exit_fee_usdt)
-                    if actual_exit_fee_usdt is not None
-                    else exit_p * reduce_qty * taker_fee
-                )
-                fee_amount = allocated_entry_fee + exit_fee
-                fee_source = "actual" if actual_exit_fee_usdt is not None else "mixed"
-            elif actual_fee_usdt is not None:
-                fee_amount = float(actual_fee_usdt)
-                fee_source = "actual"
-            else:
-                fee_amount = (entry * reduce_qty * taker_fee) + (exit_p * reduce_qty * taker_fee)
-                fee_source = "modeled"
+            fee_amount, fee_source = _round_trip_fee(
+                entry_price=entry, exit_price=exit_p, qty=reduce_qty, taker_fee=taker_fee,
+                entry_fee=allocated_entry_fee, actual_fee_usdt=actual_fee_usdt,
+                actual_exit_fee_usdt=actual_exit_fee_usdt,
+            )
             pnl = gross_pnl - fee_amount
             entry_notional = entry * reduce_qty
             pnl_pct = ((pnl / entry_notional) * 100) if entry_notional else 0.0
@@ -734,7 +772,11 @@ class Storage:
             else:
                 c.execute(
                     "UPDATE positions SET qty=?, entry_fee_usdt=? WHERE symbol=? AND mode=?",
-                    (remaining, max(0.0, float(entry_fee or 0) - allocated_entry_fee), symbol, mode),
+                    (
+                        remaining,
+                        max(0.0, float(entry_fee or 0) - (allocated_entry_fee or 0.0)),
+                        symbol, mode,
+                    ),
                 )
             c.execute(
                 "INSERT INTO closed_trades(mode,symbol,qty,entry_price,exit_price,pnl,"
