@@ -206,9 +206,11 @@ STRATEGIES: dict[str, Strategy] = {
 
 
 # ── Data ────────────────────────────────────────────────────────────────
-async def _load(repo: OHLCVRepository, tf: Timeframe, bars: int) -> dict[str, pd.DataFrame]:
+async def _load(
+    repo: OHLCVRepository, tf: Timeframe, bars: int, symbols: list[str] | None = None,
+) -> dict[str, pd.DataFrame]:
     out: dict[str, pd.DataFrame] = {}
-    for sym in SYMBOLS:
+    for sym in (symbols or SYMBOLS):
         try:
             df = await repo.get(sym, tf, limit=bars, refresh=True)
         except Exception as e:

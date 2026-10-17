@@ -81,3 +81,46 @@ def test_positions_from_trades_collapses_partial_legs():
     assert by_sym["ETHUSDT"].pnl_pct == -0.05
     # Per-position win rate: 1 win / 2 positions, not 2 wins / 3 legs.
     assert aggregate_positions(legs).win_rate == 0.5
+
+
+def test_entry_pullback_mirrors_live_rule():
+    from scripts.strategy_lab import entry_pullback
+
+    def frame(close, ema20, ema50, rsi):
+        return pd.DataFrame({"close": [close], "ema_20": [ema20], "ema_50": [ema50], "rsi_14": [rsi]})
+
+    assert entry_pullback(frame(103.0, 100.0, 95.0, 50.0), 0)          # above both EMAs, 3% off EMA20
+    assert not entry_pullback(frame(108.0, 100.0, 95.0, 50.0), 0)      # >7% extended from EMA20
+    assert not entry_pullback(frame(99.0, 100.0, 95.0, 50.0), 0)       # below EMA20
+    assert not entry_pullback(frame(103.0, 100.0, 104.0, 50.0), 0)     # below EMA50
+    assert not entry_pullback(frame(103.0, 100.0, 95.0, 75.0), 0)      # RSI overbought
+    assert not entry_pullback(frame(103.0, 100.0, 95.0, 30.0), 0)      # RSI too low
+
+
+def test_mean_reversion_exit_respects_enabled_flag():
+    # RSI jumps above the exit threshold with a small gain: fires only when enabled.
+    close = [100.0, 101.0, 101.0]
+    df = pd.DataFrame({"close": close, "low": close, "rsi_14": [50.0, 70.0, 70.0],
+                       "atr_14": [0.5] * 3, "macd_hist": [0.0] * 3, "ema_20": close})
+    common = dict(mean_reversion_rsi=55, mean_reversion_min_pnl=0.0,
+                  mean_reversion_require_confirmation=False, stale_exit_enabled=False,
+                  max_hold_days=10, tp1_pct=0.9, trail_activation=0.9)
+    on = simulate_symbol("X", df, lambda d, i: i == 0, default_params(mean_reversion_enabled=True, **common))
+    off = simulate_symbol("X", df, lambda d, i: i == 0, default_params(mean_reversion_enabled=False, **common))
+    assert on[0].exit_reason == "mean_reversion_rsi"
+    assert not off  # no exit fired; position still open at end of frame
+
+
+def test_breakeven_after_tp1_replaces_hard_stop():
+    # +10% bar fills TP1 (50%), then price round-trips to -1%: with breakeven
+    # the remainder exits at entry (breakeven_stop) instead of waiting for -8%.
+    close = [100.0, 110.0, 99.0, 99.0]
+    df = pd.DataFrame({"close": close, "low": close, "rsi_14": [50.0] * 4, "atr_14": [10.0] * 4,
+                       "macd_hist": [0.0] * 4, "ema_20": close})
+    common = dict(tp1_pct=0.08, tp1_frac=0.5, tp2_pct=0.5, trail_activation=0.5,
+                  stale_exit_enabled=False, max_hold_days=10, atr_stop_max=0.08)
+    be = simulate_symbol("X", df, lambda d, i: i == 0, default_params(breakeven_after_tp1=True, **common))
+    assert [t.exit_reason for t in be] == ["take_profit_1", "breakeven_stop"]
+    assert be[1].qty == 0.5
+    no = simulate_symbol("X", df, lambda d, i: i == 0, default_params(breakeven_after_tp1=False, **common))
+    assert [t.exit_reason for t in no] == ["take_profit_1"]  # -1% never reaches the -8% stop
