@@ -134,6 +134,10 @@ class Settings(BaseSettings):
         "ZECUSDT",       # 75 trades, -$12.17, 18.7% win — worst by a wide margin
         "PUMPUSDT",      # 38 trades, -$5.46, 31.6% win
         "HYPEUSDT",      # 55 trades, -$5.23, 21.8% win
+        # A2) pullback-era losers (273 live positions 2026-09-10..10-15, 3
+        #     chronological folds, position-level, id 646 excluded):
+        "DOTUSDT",       # 11 pos, PF 0.33, -$8.95, negative in 2/3 folds
+        "ADAUSDT",       # 12 pos, PF 0.55, -$3.42, negative in 3/3 folds
         # B) structurally thin / un-tradeable spreads (2026-09-26):
         "TOSHIUSDT",     # top-of-book spread 25.3%
         "FARTCOINUSDT",  # 13.7%

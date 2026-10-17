@@ -20,7 +20,7 @@ def test_blocked_symbols_field_exists_and_is_populated_from_evidence():
     # the evidence-based defaults: proven live losers + structurally thin books.
     s = Settings(_env_file=None)
     assert isinstance(s.blocked_symbols, tuple)
-    for sym in ("ZECUSDT", "PUMPUSDT", "HYPEUSDT"):
+    for sym in ("ZECUSDT", "PUMPUSDT", "HYPEUSDT", "DOTUSDT", "ADAUSDT"):
         assert sym in s.blocked_symbols
 
 
