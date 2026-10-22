@@ -10,7 +10,7 @@ import os
 import pickle
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -357,7 +357,7 @@ class Storage:
                 c.execute("DROP TABLE positions_old")
             # Older DBs pre-date the exit_reason column — add it in place so
             # every executed_sell/risk exit can record WHY the position closed
-            # (stop_loss/take_profit/trailing_stop/max_hold/signal/reconcile_stale).
+            # (stop_loss/take_profit/trailing_stop/max_hold/signal).
             ct_cols = [r["name"] for r in c.execute("PRAGMA table_info(closed_trades)").fetchall()]
             if "exit_reason" not in ct_cols:
                 c.execute("ALTER TABLE closed_trades ADD COLUMN exit_reason TEXT")
@@ -609,6 +609,15 @@ class Storage:
             rows = c.execute("SELECT * FROM positions").fetchall()
         return [dict(r) for r in rows]
 
+    def discard_position(self, *, symbol: str, mode: str) -> bool:
+        """Remove an unbacked position without recording a fabricated trade or PnL."""
+        with self._lock, self._conn() as c:
+            cursor = c.execute(
+                "DELETE FROM positions WHERE symbol=? AND mode=?",
+                (symbol, mode),
+            )
+        return cursor.rowcount > 0
+
     def close_position(
         self,
         *,
@@ -625,10 +634,10 @@ class Storage:
 
         `exit_reason` should be one of stop_loss/take_profit/trailing_stop/
         max_hold (risk exits), a specific signal reason (e.g.
-        "mean_reversion_rsi_price" — see ProfitStreamStrategy), or
-        "reconcile_stale" (exchange balance gone, book cleanup) — kept distinct
+        "mean_reversion_rsi_price" — see ProfitStreamStrategy) — kept distinct
         from `agents` (the entry agents) so a closed trade's WHY is always
-        traceable. `mfe_pct`/`mae_pct` (maximum favorable/adverse excursion,
+        traceable. Unbacked bookkeeping rows should use `discard_position`
+        rather than being recorded as trades. `mfe_pct`/`mae_pct` (maximum favorable/adverse excursion,
         see app/trading/risk.py `mfe_mae_pct`) answer whether the ENTRY was bad
         (price never moved favorably) or the EXIT was bad (price moved
         favorably first, then this trade still lost). `actual_fee_usdt`, when
@@ -873,6 +882,15 @@ class Storage:
                 "SELECT * FROM closed_trades ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def daily_realized_pnl(self, *, mode: str, day: date) -> Decimal:
+        """Sum every exit leg for a UTC day, isolated from other trading modes."""
+        with self._lock, self._conn() as c:
+            rows = c.execute(
+                "SELECT pnl FROM closed_trades WHERE mode=? AND date(exit_ts)=?",
+                (mode, day.isoformat()),
+            ).fetchall()
+        return sum((Decimal(str(r["pnl"])) for r in rows), Decimal("0"))
 
     def closed_positions(self, limit: int = 100, mode: Optional[str] = None) -> list[dict]:
         """Return the most recent closed POSITIONS (not partial-exit rows).

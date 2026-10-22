@@ -122,9 +122,8 @@ async def test_live_sell_non_usdt_commission_is_not_forwarded(monkeypatch):
     assert reduces[0]["actual_exit_fee_usdt"] is None
 
 
-async def test_risk_gate_stale_dust_close_carries_mode(monkeypatch):
-    """_run_risk_gates' phantom-position cleanup must look up and close the
-    book row for THIS mode only."""
+async def test_risk_gate_stale_dust_discards_phantom_without_recording_trade(monkeypatch):
+    """_run_risk_gates must not add a fake fee loss for a phantom position."""
     from app.trading.risk import ExitDecision
 
     ap = Autopilot()
@@ -151,14 +150,10 @@ async def test_risk_gate_stale_dust_close_carries_mode(monkeypatch):
     monkeypatch.setattr(autopilot_module.filters, "meets_min", lambda sym, q, p: False)
     monkeypatch.setattr(autopilot_module.storage, "record_tick_audit", lambda **k: None)
 
-    gets: list = []
-    closes: list = []
+    discarded: list = []
     monkeypatch.setattr(
-        autopilot_module.storage, "get_position",
-        lambda s, mode=None: gets.append((s, mode)) or pos,
-    )
-    monkeypatch.setattr(
-        autopilot_module.storage, "close_position", lambda **k: closes.append(k) or {"pnl": 0},
+        autopilot_module.storage, "discard_position",
+        lambda **k: discarded.append(k) or True,
     )
     monkeypatch.setattr(
         Autopilot, "_submit",
@@ -168,11 +163,7 @@ async def test_risk_gate_stale_dust_close_carries_mode(monkeypatch):
 
     await ap._run_risk_gates()
 
-    assert gets == [("XLMUSDT", "paper")]
-    assert len(closes) == 1
-    assert closes[0]["mode"] == "paper"
-    assert closes[0]["exit_reason"] == "stop_loss_stale_dust"
-    assert closes[0]["exit_price"] == Decimal("0.10")  # booked at entry: PnL ~0
+    assert discarded == [{"symbol": "XLMUSDT", "mode": "paper"}]
 
 
 # ── startup seeding of safety state ───────────────────────────────────────
@@ -246,10 +237,19 @@ async def test_final_live_buy_check_passes_safety_state_after_seeding(monkeypatc
     ap.state.running = True
     ap.state.starting_balance_usdt = Decimal("100")
 
-    class _Settings:
-        live_buys_enabled = True
+    from app.config import get_settings
 
-    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _Settings())
+    settings = get_settings().model_copy(update={
+        "live_buys_enabled": True,
+        "aggressive_mode_enabled": True,
+        "aggressive_position_pct": 0.10,
+        "drawdown_circuit_breaker_pct": 0.15,
+    })
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(Autopilot, "_aggressive_mode_active", lambda self: (True, "test"))
+    monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [])
+    monkeypatch.setattr(autopilot_module.storage, "closed_trades", lambda limit=100: [])
+    monkeypatch.setattr(autopilot_module.storage, "daily_realized_pnl", lambda **kw: Decimal("0"))
     monkeypatch.setattr(autopilot_module.filters, "_loaded", True)
     monkeypatch.setattr(autopilot_module.filters, "is_listed", lambda s: True)
     monkeypatch.setattr(autopilot_module.filters, "meets_min", lambda s, q, p: True)
@@ -259,6 +259,8 @@ async def test_final_live_buy_check_passes_safety_state_after_seeding(monkeypatc
         autopilot_module, "portfolio_snapshot",
         lambda *, mode: _async_result({"usdt_cash": "1000", "total_usdt": "1000"}),
     )
+    import app.trading.risk_manager as risk_manager_module
+    monkeypatch.setattr(risk_manager_module, "get_settings", lambda: settings)
 
     allowed, reason, _detail = await ap._final_live_buy_safety_check(
         symbol="BTCUSDT", qty=Decimal("1")

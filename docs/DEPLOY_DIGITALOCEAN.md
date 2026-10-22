@@ -51,11 +51,39 @@ Keep these values true while testing:
 
 ## 5. Restart and verify
 
+Before updating a money-handling deployment, disable new entries with
+`LIVE_BUYS_ENABLED=false` in `.env`. Leave the independent risk service running
+to protect existing positions. Back up the database using SQLite's backup API,
+and do not change `LIVE_MODE`, `DRY_RUN`, or `PAPER_TRADING` as part of a code
+update.
+
 ```bash
 systemctl restart crypto-bot
 systemctl status crypto-bot --no-pager -l
 journalctl -u crypto-bot -f
 ```
+
+Run `bash scripts/diag_readonly.sh` on the droplet to verify its revision,
+health, risk-loop heartbeat, entry halts and recent losses. Do not enable new
+live buys solely because tests pass: execution correctness is not evidence of
+positive strategy expectancy.
+
+Entry safety controls:
+
+- New orders are sized to the remaining portfolio exposure budget. Pyramid
+  additions consume the remaining **total** position, Kelly and stop-risk
+  budgets; they do not receive a fresh full-sized allowance or reset existing
+  high-water marks and take-profit flags.
+- Stop-risk sizing covers the widest configured ATR stop when ATR stops are
+  enabled. Gaps, slippage and commissions can still increase actual losses.
+- Delayed order-book retries request fresh full strategy ticks, including all
+  risk and quality gates, rather than executing a saved signal.
+- A portfolio-wide BUY mutex and a final live submission check revalidate
+  drawdown, daily loss and position/exposure limits, including correlated
+  baskets and the existing stake in a pyramid add. Protective SELLs do not
+  acquire the BUY mutex.
+- Daily realized loss includes every exit leg in the UTC day for the selected
+  mode, without a latest-500-trades cutoff.
 
 ## 6. Enable app authentication (recommended)
 

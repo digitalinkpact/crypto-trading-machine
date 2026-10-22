@@ -258,6 +258,186 @@ async def test_run_risk_gates_executes_stop_loss_even_when_entry_gates_blocked(m
     assert any(a == "risk:stop_loss" for a in agents)
 
 
+async def test_partial_take_profit_advances_ladder_once(monkeypatch):
+    from app.trading.risk import ExitDecision
+
+    ap = Autopilot()
+    ap.state.mode = "paper"
+    position = {
+        "symbol": "ETHUSDT", "mode": "paper", "qty": 1.0,
+        "entry_price": 100.0, "entry_ts": datetime.now(timezone.utc).isoformat(),
+        "agents": "[]",
+    }
+    marks: list[str] = []
+    stop_refreshes: list[str] = []
+
+    async def _snapshot(**_kwargs):
+        return {"free_balances": {"ETH": Decimal("1")}, "all_balances": {"ETH": Decimal("1")}}
+
+    async def _submit(self, symbol, side, qty, agents):
+        assert side == OrderSide.SELL
+        assert qty == Decimal("0.5")
+        return Order(
+            symbol=symbol, side=side, type=OrderType.MARKET, quantity=qty,
+            client_order_id="partial-tp1", status=OrderStatus.PARTIALLY_FILLED,
+            filled_quantity=Decimal("0.25"), avg_fill_price=Decimal("108"),
+        )
+
+    async def _refresh_stop(symbol, _entry_ts):
+        stop_refreshes.append(symbol)
+
+    async def _reconcile():
+        return {}
+
+    monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [position])
+    monkeypatch.setattr(autopilot_module.storage, "get_position", lambda *_a, **_k: position)
+    monkeypatch.setattr(autopilot_module, "portfolio_snapshot", _snapshot)
+    monkeypatch.setattr(Autopilot, "_price", lambda *_a, **_k: asyncio.sleep(0, result=Decimal("108")))
+    monkeypatch.setattr(Autopilot, "_atr_pct", lambda *_a, **_k: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(Autopilot, "_stop_allowed", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        autopilot_module.risk, "evaluate_exits",
+        lambda **_k: [ExitDecision("ETHUSDT", Decimal("0.5"), "take_profit_1")],
+    )
+    monkeypatch.setattr(autopilot_module.filters, "round_qty", lambda _s, qty: qty)
+    monkeypatch.setattr(autopilot_module.filters, "meets_min", lambda *_a: True)
+    monkeypatch.setattr(autopilot_module.storage, "record_tick_audit", lambda **_k: None)
+    monkeypatch.setattr(Autopilot, "_submit", _submit)
+    monkeypatch.setattr(ap, "_replace_stop_remaining", _refresh_stop)
+    monkeypatch.setattr(ap, "reconcile_protective_stops", _reconcile)
+    monkeypatch.setattr(autopilot_module.risk, "mark_tp1_taken", lambda _s: marks.append("tp1"))
+
+    await ap._run_risk_gates()
+
+    assert marks == ["tp1"]
+    assert stop_refreshes == ["ETHUSDT"]
+
+
+async def test_partial_full_risk_exit_keeps_trailing_state_and_restores_stop(monkeypatch):
+    from app.trading.risk import ExitDecision
+
+    ap = Autopilot()
+    ap.state.mode = "live"
+    position = {
+        "symbol": "ETHUSDT", "mode": "live", "qty": 1.0,
+        "entry_price": 100.0, "entry_ts": datetime.now(timezone.utc).isoformat(),
+        "agents": "[]",
+    }
+    clears: list[str] = []
+    stop_refreshes: list[str] = []
+
+    async def _snapshot(**_kwargs):
+        return {"free_balances": {"ETH": Decimal("1")}, "all_balances": {"ETH": Decimal("1")}}
+
+    async def _submit(self, symbol, side, qty, agents):
+        assert side == OrderSide.SELL
+        return Order(
+            symbol=symbol, side=side, type=OrderType.MARKET, quantity=qty,
+            client_order_id="partial-trailing", status=OrderStatus.PARTIALLY_FILLED,
+            filled_quantity=qty / 2, avg_fill_price=Decimal("96"),
+        )
+
+    async def _refresh_stop(symbol, _entry_ts):
+        stop_refreshes.append(symbol)
+
+    async def _reconcile():
+        return {}
+
+    monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [position])
+    monkeypatch.setattr(autopilot_module.storage, "get_position", lambda *_a, **_k: {**position, "qty": 0.5})
+    monkeypatch.setattr(autopilot_module, "portfolio_snapshot", _snapshot)
+    monkeypatch.setattr(Autopilot, "_price", lambda *_a, **_k: asyncio.sleep(0, result=Decimal("96")))
+    monkeypatch.setattr(Autopilot, "_atr_pct", lambda *_a, **_k: asyncio.sleep(0, result=None))
+    monkeypatch.setattr(Autopilot, "_stop_allowed", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        Autopilot, "_detect_stop_fill",
+        lambda *_a, **_k: asyncio.sleep(0, result=None),
+    )
+    monkeypatch.setattr(
+        Autopilot, "_cancel_stop_before_exit",
+        lambda *_a, **_k: asyncio.sleep(0, result="cancelled"),
+    )
+    monkeypatch.setattr(
+        autopilot_module.risk, "evaluate_exits",
+        lambda **_k: [ExitDecision("ETHUSDT", Decimal("1"), "trailing_stop")],
+    )
+    monkeypatch.setattr(autopilot_module.filters, "round_qty", lambda _s, qty: qty)
+    monkeypatch.setattr(autopilot_module.filters, "meets_min", lambda *_a: True)
+    monkeypatch.setattr(autopilot_module.storage, "record_tick_audit", lambda **_k: None)
+    monkeypatch.setattr(Autopilot, "_submit", _submit)
+    monkeypatch.setattr(ap, "_replace_stop_remaining", _refresh_stop)
+    monkeypatch.setattr(ap, "reconcile_protective_stops", _reconcile)
+    for name in ("clear_hwm", "clear_tp1", "clear_tp2"):
+        monkeypatch.setattr(
+            autopilot_module.risk, name,
+            lambda _symbol, _name=name: clears.append(_name),
+        )
+
+    await ap._run_risk_gates()
+
+    assert clears == []
+    assert stop_refreshes == ["ETHUSDT"]
+
+
+async def test_execute_does_not_raise_small_risk_budget_to_minimum_order(monkeypatch):
+    ap = Autopilot()
+    ap.state.mode = "paper"
+    settings = autopilot_module.get_settings().model_copy(update={
+        "min_signal_confidence": 0.40,
+        "dynamic_threshold_enabled": False,
+        "ml_gate_enabled": False,
+        "buy_cooldown_minutes": 20,
+        "blocked_symbols": (),
+    })
+
+    async def _snapshot(*, mode):
+        assert mode == "paper"
+        return {"usdt_cash": Decimal("100"), "total_usdt": Decimal("100")}
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(autopilot_module, "portfolio_snapshot", _snapshot)
+    monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [])
+    monkeypatch.setattr(autopilot_module.storage, "kv_get", lambda *_a, **_k: None)
+    monkeypatch.setattr(autopilot_module.filters, "is_listed", lambda _s: True)
+    monkeypatch.setattr(autopilot_module.trade_audit_logger, "log_event", lambda **_k: None)
+    monkeypatch.setattr(Autopilot, "_entry_block_reason", lambda _self: None)
+    monkeypatch.setattr(Autopilot, "_aggressive_mode_active", lambda _self: (False, "test"))
+    monkeypatch.setattr(Autopilot, "_on_cooldown", lambda *_a: False)
+    monkeypatch.setattr(Autopilot, "_stop_loss_cooldown_active", lambda *_a: (False, "ok"))
+    monkeypatch.setattr(Autopilot, "_price", lambda *_a: asyncio.sleep(0, result=Decimal("100")))
+    monkeypatch.setattr(
+        Autopilot, "_count_non_dust_positions",
+        lambda *_a, **_k: asyncio.sleep(0, result=(0, set())),
+    )
+    monkeypatch.setattr(
+        Autopilot, "_record_signal_event", lambda *_a, **_k: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(Autopilot, "_persist_skip_stats", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        autopilot_module.RiskManager,
+        "evaluate_entry",
+        lambda *_a, **_k: type(
+            "Decision", (), {"allow": True, "reason": "ok", "notional_usdt": Decimal("5")}
+        )(),
+    )
+    monkeypatch.setattr(
+        Autopilot, "_buy_order_plan",
+        lambda *_a, **_k: pytest.fail("sub-minimum risk budget must not be increased"),
+    )
+    monkeypatch.setattr(
+        Autopilot, "_place_buy",
+        lambda *_a, **_k: pytest.fail("sub-minimum risk budget must not submit a BUY"),
+    )
+
+    class _BuySignal:
+        action = autopilot_module.SignalAction.BUY
+        confidence = 0.90
+        contributing_agents = ["test"]
+        timeframe = autopilot_module.Timeframe.D1
+
+    await ap._execute({"BTCUSDT": _BuySignal()}, allow_buys=True)
+
+
 async def test_start_rejects_restart_while_running(monkeypatch):
     ap = Autopilot()
     ap.state.running = True
@@ -853,7 +1033,12 @@ async def test_execute_buy_pyramids_when_position_exists_and_confidence_is_high(
     ap.state.mode = "live"
     ap.state.starting_balance_usdt = Decimal("1000")
 
-    kv_state = {"pyramid_adds:live:BTCUSDT": 1}
+    kv_state = {
+        "pyramid_adds:live:BTCUSDT": 1,
+        "hwm:BTCUSDT": "110",
+        "tp1:BTCUSDT": True,
+        "tp2:BTCUSDT": True,
+    }
     placed: list[tuple[str, Decimal]] = []
 
     class _Settings:
@@ -938,6 +1123,9 @@ async def test_execute_buy_pyramids_when_position_exists_and_confidence_is_high(
 
     assert placed == [("BTCUSDT", Decimal("50"))]
     assert kv_state["pyramid_adds:live:BTCUSDT"] == 2
+    assert kv_state["hwm:BTCUSDT"] == "110"
+    assert kv_state["tp1:BTCUSDT"] is True
+    assert kv_state["tp2:BTCUSDT"] is True
 
 
 def test_profitstream_trend_adjustment_is_soft_and_legacy_stays_blocked():
@@ -1114,9 +1302,9 @@ async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
     async def _fake_snapshot(*, mode):
         assert mode == "live"
         return {
-            "usdt_cash": Decimal("100"),
-            "total_usdt": Decimal("100"),
-            "all_balances": {"USDT": Decimal("100")},
+            "usdt_cash": Decimal("1000"),
+            "total_usdt": Decimal("1000"),
+            "all_balances": {"USDT": Decimal("1000")},
         }
 
     async def _fake_count(*_a, **_k):
@@ -1181,8 +1369,8 @@ async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
     assert info["action"] == "BUY"
     assert info["filters"]["market_regime"]["ok"] is False
     assert info["filters"]["min_notional"]["ok"] is True
-    assert info["sizing"]["rounded_qty"] == "0.0600"
-    assert info["sizing"]["notional"] == "3.0000"
+    assert info["sizing"]["rounded_qty"] == "0.6000"
+    assert info["sizing"]["notional"] == "30.0000"
     assert info["final_reason"] == "market_gate"
     assert info["submitted"] is False
 
@@ -1206,9 +1394,9 @@ async def test_strong_bull_regime_mode_blocks_weak_bull(monkeypatch):
 
     async def _fake_snapshot(*, mode):
         return {
-            "usdt_cash": Decimal("100"),
-            "total_usdt": Decimal("100"),
-            "all_balances": {"USDT": Decimal("100")},
+            "usdt_cash": Decimal("1000"),
+            "total_usdt": Decimal("1000"),
+            "all_balances": {"USDT": Decimal("1000")},
         }
 
     async def _fake_count(*_a, **_k):
@@ -1400,4 +1588,3 @@ async def test_correlation_basket_gate_symbol_not_in_group_allows(monkeypatch):
     )
     assert ok is True
     assert why == "not_in_correlated_group"
-
