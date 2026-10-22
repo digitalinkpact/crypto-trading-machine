@@ -15,6 +15,10 @@ async def test_startup_reconcile_blocks_entries_on_position_drift(monkeypatch):
         main.watchdog, "trigger_emergency_halt",
         lambda reason, *, level: halts.append((reason, level)),
     )
+    monkeypatch.setattr(
+        main.watchdog, "_verify_safe_to_resume",
+        lambda _mode: _async_result((True, "protective stops verified")),
+    )
 
     await main.verify_before_trading()
 
@@ -36,6 +40,10 @@ async def test_startup_reconcile_blocks_entries_when_verification_fails(monkeypa
     monkeypatch.setattr(
         main.watchdog, "trigger_emergency_halt",
         lambda reason, *, level: halts.append((reason, level)),
+    )
+    monkeypatch.setattr(
+        main.watchdog, "_verify_safe_to_resume",
+        lambda _mode: _async_result((False, "protective stop under-sized for APTUSDT")),
     )
 
     await main.verify_before_trading()
@@ -106,6 +114,79 @@ async def test_startup_blocks_entries_when_running_state_has_no_baseline(monkeyp
     await main.verify_before_trading()
 
     assert kv_state["baseline_unavailable"]["active"] is True
+
+
+@pytest.mark.asyncio
+async def test_startup_accepts_expected_protective_stops(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.trading import startup as main
+    from app.trading.protective_stops import stop_coid
+
+    position = {
+        "symbol": "APTUSDT", "mode": "live", "qty": "33.44",
+        "entry_ts": "2026-10-22T00:00:00+00:00",
+    }
+    coid = stop_coid("pstop-", position["symbol"], position["entry_ts"])
+    settings = SimpleNamespace(
+        paper_trading=False,
+        exchange_native_stops_enabled=True,
+        exchange_stop_coid_prefix="pstop-",
+        exchange_stop_allowed=lambda _symbol: True,
+    )
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "reconcile_positions", lambda **_kwargs: _async_result({"mismatched": 0}))
+    monkeypatch.setattr(main.storage, "all_positions", lambda: [position])
+    monkeypatch.setattr(
+        "app.exchange.BinanceUSClient.open_orders",
+        lambda _self: _async_result([{
+            "clientOrderId": coid, "symbol": "APTUSDT", "side": "SELL",
+            "type": "STOP_LOSS", "status": "NEW", "origQty": "33.43",
+        }]),
+    )
+    halts = []
+    monkeypatch.setattr(
+        main.watchdog, "trigger_emergency_halt",
+        lambda reason, *, level: halts.append((reason, level)),
+    )
+
+    await main.verify_before_trading()
+
+    assert halts == []
+
+
+@pytest.mark.asyncio
+async def test_startup_blocks_when_canary_position_has_no_protective_stop(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.trading import startup as main
+
+    position = {
+        "symbol": "APTUSDT", "mode": "live", "qty": "33.44",
+        "entry_ts": "2026-10-22T00:00:00+00:00",
+    }
+    settings = SimpleNamespace(
+        paper_trading=False,
+        exchange_native_stops_enabled=True,
+        exchange_stop_coid_prefix="pstop-",
+        exchange_stop_allowed=lambda _symbol: True,
+    )
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "reconcile_positions", lambda **_kwargs: _async_result({"mismatched": 0}))
+    monkeypatch.setattr(main.storage, "all_positions", lambda: [position])
+    monkeypatch.setattr(
+        "app.exchange.BinanceUSClient.open_orders",
+        lambda _self: _async_result([]),
+    )
+    halts = []
+    monkeypatch.setattr(
+        main.watchdog, "trigger_emergency_halt",
+        lambda reason, *, level: halts.append((reason, level)),
+    )
+
+    await main.verify_before_trading()
+
+    assert halts and "1 missing/inactive protective stop(s)" in halts[0][0]
 
 
 def _async_result(value):

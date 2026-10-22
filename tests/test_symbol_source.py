@@ -20,7 +20,10 @@ def test_blocked_symbols_field_exists_and_is_populated_from_evidence():
     # the evidence-based defaults: proven live losers + structurally thin books.
     s = Settings(_env_file=None)
     assert isinstance(s.blocked_symbols, tuple)
-    for sym in ("ZECUSDT", "PUMPUSDT", "HYPEUSDT"):
+    for sym in (
+        "ZECUSDT", "PUMPUSDT", "HYPEUSDT", "ARBUSDT", "DOTUSDT",
+        "ETHUSDT", "ADAUSDT",
+    ):
         assert sym in s.blocked_symbols
 
 
@@ -52,4 +55,4 @@ async def test_get_symbols_excludes_blocked_even_when_top_ranked(monkeypatch):
     out = await symbol_source.get_symbols()
     assert "ZECUSDT" not in out
     assert "HYPEUSDT" not in out
-    assert out == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    assert out == ["BTCUSDT", "SOLUSDT"]

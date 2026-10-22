@@ -327,6 +327,37 @@ def _fake_order(status: OrderStatus, filled: str) -> Order:
     )
 
 
+def test_net_buy_position_qty_subtracts_base_asset_commission():
+    assert autopilot_module._net_buy_position_qty(
+        "APTUSDT", Decimal("33.44"), Decimal("0.006688"), "APT"
+    ) == Decimal("33.433312")
+
+
+def test_net_buy_position_qty_keeps_fill_when_commission_is_not_in_base_asset():
+    assert autopilot_module._net_buy_position_qty(
+        "BTCUSDT", Decimal("0.1"), Decimal("0.02"), "USDT"
+    ) == Decimal("0.1")
+
+
+def test_net_buy_position_qty_sums_base_commission_from_mixed_fills():
+    assert autopilot_module._net_buy_position_qty(
+        "BTCUSDT",
+        Decimal("0.1"),
+        None,
+        None,
+        [
+            {"commission": "0.0001", "commissionAsset": "BTC"},
+            {"commission": "0.02", "commissionAsset": "USDT"},
+        ],
+    ) == Decimal("0.0999")
+
+
+def test_net_buy_position_qty_keeps_fill_when_commission_is_unknown():
+    assert autopilot_module._net_buy_position_qty(
+        "BTCUSDT", Decimal("0.1"), None, None
+    ) == Decimal("0.1")
+
+
 def test_order_filled_true_for_filled_order():
     order = _fake_order(OrderStatus.FILLED, "1")
     assert Autopilot._order_filled(order) is True
