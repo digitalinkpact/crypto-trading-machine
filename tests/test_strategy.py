@@ -189,6 +189,9 @@ async def test_profitstream_bull_regime_pending_golden_cross_scores_high(monkeyp
 
 
 async def test_profitstream_buys_pullback_and_keeps_spread_filter(monkeypatch):
+    # The pullback entry is OFF by default (2026-10-23); this test exercises
+    # the pullback path itself, so opt it on.
+    _enable_mean_reversion_exit(monkeypatch, pullback_entry_enabled=True)
     strategy = ProfitStreamStrategy()
     frames = {
         ("ETHUSDT", "1d"): _frame(
@@ -255,6 +258,90 @@ async def test_profitstream_buys_pullback_and_keeps_spread_filter(monkeypatch):
 
     assert dip_blocked.action == SignalAction.HOLD
     assert "spread_wide:0.3000%>0.2500%" in dip_blocked.reasons
+
+
+async def test_pullback_entry_is_off_by_default_so_only_configured_entry_buys(monkeypatch):
+    """Regression (2026-10-23): the pullback setup used to fire as a SECOND BUY
+    trigger regardless of `entry_strategy`. With the default
+    pullback_entry_enabled=False a pullback-ready / not-dip-ready frame must
+    HOLD; flipping the flag restores the old behaviour."""
+    import app.trading.strategy as strategy_module
+    from app.config import get_settings as real_get_settings
+
+    real = real_get_settings()
+    assert real.pullback_entry_enabled is False, "default must be OFF"
+
+    strategy = ProfitStreamStrategy()
+    frames = {
+        # Pullback-ready (close near EMA20, RSI 70, EMA20>EMA50), NOT dip-ready.
+        ("ETHUSDT", "1d"): _frame(close=107, rsi=70, bb_lower=90, bb_mid=98,
+                                  ema20=100, ema50=95, ema200=90),
+        ("BTCUSDT", "1d"): _frame(close=90000, rsi=55, bb_lower=85000, bb_mid=88000,
+                                  ema50=87000, ema200=97000),
+    }
+
+    async def _candles(self, symbol: str, interval: str, limit: int):
+        return frames[(symbol, interval)]
+
+    monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct",
+                        lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: False, raising=True)
+
+    # Default (flag OFF): the configured entry is the only entry -> HOLD.
+    monkeypatch.setattr(strategy_module, "get_settings",
+                        lambda: real.model_copy(update={"pullback_entry_enabled": False}))
+    off = await strategy.analyze_symbol("ETHUSDT", mode="live")
+    assert off.action == SignalAction.HOLD
+    assert off.indicators["pullback_ready"] is False
+    assert off.indicators.get("entry_strategy") != "pullback"
+
+    # Opt-in (flag ON): old dual-trigger behaviour is restored.
+    monkeypatch.setattr(strategy_module, "get_settings",
+                        lambda: real.model_copy(update={"pullback_entry_enabled": True}))
+    on = await strategy.analyze_symbol("ETHUSDT", mode="live")
+    assert on.action == SignalAction.BUY
+    assert on.indicators["entry_strategy"] == "pullback"
+
+
+async def test_oversold_bounce_entry_still_buys_with_pullback_off(monkeypatch):
+    """Disabling the pullback trigger must not touch the configured entry."""
+    import app.trading.strategy as strategy_module
+    from app.config import get_settings as real_get_settings
+
+    real = real_get_settings()
+    strategy = ProfitStreamStrategy()
+    idx = pd.date_range("2026-01-01", periods=80, freq="1D", tz="UTC")
+    close = 95.0
+    lows = [90.0] * 75 + [85.0, 86.0, 87.0, 88.0, 89.0]  # 5-day low 85 -> bounced
+    eth = pd.DataFrame({
+        "open": [close] * 80, "high": [close] * 80, "low": lows, "close": [close] * 80,
+        "volume": [10.0] * 80, "quote_volume": [1000.0] * 80,
+        "rsi_14": [25.0] * 80, "bb_lower": [96.0] * 80, "bb_mid": [105.0] * 80,
+        "ema_20": [100.0] * 80, "ema_50": [95.0] * 80, "ema_200": [90.0] * 80,
+    }, index=idx)
+    frames = {
+        ("ETHUSDT", "1d"): eth,
+        ("BTCUSDT", "1d"): _frame(close=100000, rsi=55, bb_lower=95000, bb_mid=98000,
+                                  ema50=99000, ema200=97000),
+    }
+
+    async def _candles(self, symbol: str, interval: str, limit: int):
+        return frames[(symbol, interval)]
+
+    monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct",
+                        lambda *_a, **_k: __import__("asyncio").sleep(0, result=0.001), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: False, raising=True)
+    monkeypatch.setattr(strategy_module, "get_settings",
+                        lambda: real.model_copy(update={"entry_strategy": "oversold_bounce",
+                                                        "pullback_entry_enabled": False}))
+
+    decision = await strategy.analyze_symbol("ETHUSDT", mode="live")
+    assert decision.action == SignalAction.BUY
+    assert decision.indicators["entry_strategy"] == "oversold_bounce"
 
 
 async def test_profitstream_exits_held_position_on_daily_mean_reversion(monkeypatch):
