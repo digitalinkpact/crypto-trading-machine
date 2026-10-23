@@ -825,6 +825,105 @@ async def sweep_exits(
             print(f"    verdict vs baseline: {_fold_verdict(base_folds, cand_folds, pos)}")
 
 
+async def sweep_ladder(
+    frames: dict[str, pd.DataFrame], folds: int, market_filter: bool,
+    entry_fn: EntryFn = entry_pullback,
+) -> None:
+    """Joint exit-LADDER sweep: coherent candidate shapes tested as a unit.
+
+    `exits` moves one knob at a time, which cannot detect a shape problem. The
+    live ladder (-3..-8% ATR stop vs +8% TP1 on half, trail from +5%) needs a
+    high win rate to be positive; this sweep tests tighter stop / earlier, fuller
+    take-profit / earlier trail combinations against the SAME entry and the SAME
+    folds. Backtest only — nothing here touches live config.
+    """
+    print("\n### LADDER SWEEP — joint exit shapes, pullback entry, POSITION level, per fold ###")
+    base = default_params()
+    print(
+        f"live: atr_stop x{base.atr_stop_multiple} [{base.atr_stop_min:.0%},{base.atr_stop_max:.0%}] "
+        f"tp1={base.tp1_pct:.0%}x{base.tp1_frac:.0%} tp2={base.tp2_pct:.0%}x{base.tp2_frac:.0%} "
+        f"trail act={base.trail_activation:.1%} dist={base.trail_distance:.1%} "
+        f"breakeven={'on' if base.breakeven_after_tp1 else 'off'} fee {base.fee_rate:.4%}"
+    )
+    # Each candidate is a complete, internally-consistent ladder. Names encode
+    # stop / tp1 / trail so the printout is self-describing.
+    candidates: dict[str, LadderParams] = {
+        "A tight: stop[2,4] tp1 4%x100% trail 2%/1.5%": default_params(
+            atr_stop_min=0.02, atr_stop_max=0.04, atr_stop_multiple=1.5,
+            tp1_pct=0.04, tp1_frac=1.0, tp2_pct=0.99, tp2_frac=0.0,
+            trail_activation=0.02, trail_distance=0.015,
+        ),
+        "B balanced: stop[2,5] tp1 5%x50% tp2 10%x50% trail 3%/2% BE": default_params(
+            atr_stop_min=0.02, atr_stop_max=0.05, atr_stop_multiple=1.5,
+            tp1_pct=0.05, tp1_frac=0.5, tp2_pct=0.10, tp2_frac=0.5,
+            trail_activation=0.03, trail_distance=0.02,
+            breakeven_after_tp1=True, breakeven_offset=0.0,
+        ),
+        "C trail-only: stop[2,5] no TP trail 2.5%/2%": default_params(
+            atr_stop_min=0.02, atr_stop_max=0.05, atr_stop_multiple=1.5,
+            tp1_pct=0.99, tp1_frac=0.0, tp2_pct=0.99, tp2_frac=0.0,
+            trail_activation=0.025, trail_distance=0.02,
+        ),
+        "D live+BE: live ladder + breakeven after TP1": default_params(
+            breakeven_after_tp1=True, breakeven_offset=0.0,
+        ),
+        "E live tighter stop: stop[2,5] else live": default_params(
+            atr_stop_min=0.02, atr_stop_max=0.05, atr_stop_multiple=1.5,
+        ),
+        "F 1:1 R: stop[3,4] tp1 4%x100% no trail": default_params(
+            atr_stop_min=0.03, atr_stop_max=0.04, atr_stop_multiple=1.5,
+            tp1_pct=0.04, tp1_frac=1.0, tp2_pct=0.99, tp2_frac=0.0,
+            trail_activation=0.99, trail_distance=0.99,
+        ),
+    }
+    base_trades, base_fold_trades = _collect_sweep_trades(
+        frames, entry_fn, base, folds=folds, market_filter=market_filter,
+    )
+    base_pos = aggregate_positions(base_trades)
+    base_folds = [aggregate_positions(ft) for ft in base_fold_trades]
+    print()
+    print_leg_and_position("LIVE BASELINE", base_trades)
+    for f, fm in enumerate(base_folds):
+        print_metrics(f"    fold {f} [POS]", fm)
+    print("    exit mix: " + ", ".join(f"{k}={v}" for k, v in exit_reason_mix(base_trades).items()))
+
+    ranked: list[tuple[str, Metrics, list[Metrics], dict[str, int]]] = []
+    for name, params in candidates.items():
+        trades, fold_trades = _collect_sweep_trades(
+            frames, entry_fn, params, folds=folds, market_filter=market_filter,
+        )
+        pos = aggregate_positions(trades)
+        cand_folds = [aggregate_positions(ft) for ft in fold_trades]
+        ranked.append((name, pos, cand_folds, exit_reason_mix(trades)))
+        print()
+        print_metrics(name, pos)
+        for f, fm in enumerate(cand_folds):
+            print_metrics(f"    fold {f} [POS]", fm)
+        print("    exit mix: " + ", ".join(f"{k}={v}" for k, v in ranked[-1][3].items()))
+        print(f"    verdict vs baseline: {_fold_verdict(base_folds, cand_folds, pos)}")
+
+    # Summary table: pooled position-level, sorted by expectancy. Promotion gate
+    # mirrors docs/research/promotion_criteria.md (PF > 1.5, expectancy > 0) and
+    # requires the win-rate to improve in >= 2/3 OOS folds vs live.
+    print("\n--- SUMMARY (pooled POSITION-level, sorted by expectancy) ---")
+    print(f"{'ladder':62s} {'n':>4s} {'win%':>6s} {'exp':>8s} {'PF':>6s} {'maxDD':>7s} folds  gate")
+    print(f"{'LIVE BASELINE':62s} {base_pos.n:4d} {base_pos.win_rate:6.1%} {base_pos.expectancy_pct:+8.2%} "
+          f"{base_pos.profit_factor:6.2f} {base_pos.max_drawdown_pct:7.1%}   —    —")
+    for name, pos, cand_folds, _ in sorted(ranked, key=lambda r: r[1].expectancy_pct, reverse=True):
+        pairs = [(b, c) for b, c in zip(base_folds, cand_folds) if b.n >= 10 and c.n >= 10]
+        wr_up = sum(c.win_rate > b.win_rate for b, c in pairs)
+        gate = (
+            "PASS" if (pos.n >= 30 and pos.expectancy_pct > 0 and pos.profit_factor > 1.5
+                       and len(pairs) >= 2 and wr_up >= 2
+                       and pos.max_drawdown_pct <= base_pos.max_drawdown_pct + 1e-9)
+            else "no"
+        )
+        print(f"{name:62s} {pos.n:4d} {pos.win_rate:6.1%} {pos.expectancy_pct:+8.2%} "
+              f"{pos.profit_factor:6.2f} {pos.max_drawdown_pct:7.1%} {wr_up}/{len(pairs)}   {gate}")
+    print("\nPASS = n>=30, exp>0, PF>1.5, win-rate up in >=2 folds, maxDD not worse than live. "
+          "Advisory only — nothing is applied.")
+
+
 async def main_async(
     which: str, tf: Timeframe, folds: int, bars: int, market_filter: bool,
     symbols: list[str] | None = None,
@@ -849,11 +948,13 @@ async def main_async(
         await sweep_breadth(frames, folds, market_filter)
     if which in ("exits", "all"):
         await sweep_exits(frames, folds, market_filter)
+    if which in ("ladder", "all"):
+        await sweep_ladder(frames, folds, market_filter)
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("which", choices=["entry", "rsi_exit", "trailing", "stop_stale", "breadth", "exits", "all"], default="all", nargs="?")
+    p.add_argument("which", choices=["entry", "rsi_exit", "trailing", "stop_stale", "breadth", "exits", "ladder", "all"], default="all", nargs="?")
     p.add_argument("--timeframe", default="1d", choices=[t.value for t in Timeframe])
     p.add_argument("--folds", type=int, default=3)
     p.add_argument("--bars", type=int, default=1000)
