@@ -536,6 +536,24 @@ class Settings(BaseSettings):
     # setups (fewer trades / more time in cash). Exits are never affected.
     require_strong_bull_regime: bool = False
 
+    # ── Alt-market BREADTH gate (2026-10-28) ────────────────────────────
+    # The BTC-only regime gate scored the entire Oct-2026 alt drawdown as
+    # STRONG_BULL (BTC held its EMAs while most alts broke theirs); the live
+    # pullback entry went 91% -> 36% win with no config change. Breadth =
+    # fraction of the cached alt universe (excl. BTC) closing above its
+    # EMA{span}. Gate is ANDed with the BTC regime. Validated on the pullback
+    # entry, 189 symbols, data through 2026-10-28, position level:
+    #   gate                  SEP14-28 (won)   OCT5-27 (lost)   pooled
+    #   BTC only (current)    n=371 PF 2.67    n=328 PF 0.27    PF 1.04
+    #   BTC AND breadth20>=.5 n=361 PF 2.81    n=125 PF 0.18    PF 1.52
+    # Keeps September, cuts October entries 62%, lifts pooled PF above the
+    # 1.5 promotion bar. FAIL-CLOSED when breadth cannot be computed.
+    breadth_gate_enabled: bool = True
+    breadth_ema_span: int = Field(20, ge=5, le=200)
+    breadth_min_fraction: float = Field(0.50, ge=0.0, le=1.0)
+    # Minimum number of alt symbols with usable data for the reading to count.
+    breadth_min_symbols: int = Field(15, ge=3, le=500)
+
     # ── Anti-chase / extension guard ──────────────────────────────────
     # A dip-buy that is too far *below* its EMA20 is more likely a falling
     # knife/capitulation event than a healthy pullback — reject it instead of
