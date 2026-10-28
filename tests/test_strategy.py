@@ -269,7 +269,9 @@ async def test_pullback_entry_is_off_by_default_so_only_configured_entry_buys(mo
     from app.config import get_settings as real_get_settings
 
     real = real_get_settings()
-    assert real.pullback_entry_enabled is False, "default must be OFF"
+    # Assert the CODE default, independent of any .env override on the host.
+    from app.config import Settings
+    assert Settings.model_fields["pullback_entry_enabled"].default is False, "code default must be OFF"
 
     strategy = ProfitStreamStrategy()
     frames = {
