@@ -1477,6 +1477,16 @@ class Autopilot:
                         log.info("skip %s BUY: %s", symbol, market_why)
                         continue
 
+                    # Alt-market breadth — ANDed with the BTC gate. BTC above its
+                    # EMAs while most alts are below theirs is the exact regime
+                    # that broke the pullback entry in Oct-2026.
+                    breadth_ok, breadth_why = await self._breadth_gate()
+                    _set_filter(symbol, "breadth", breadth_ok, breadth_why, sig)
+                    if not breadth_ok:
+                        _finish(symbol, "breadth_gate", breadth_why, submitted=False, sig=sig)
+                        log.info("skip %s BUY: %s", symbol, breadth_why)
+                        continue
+
                     # Sideways-tier stricter setup requirement: when BTC's scored
                     # regime is neutral (neither confirmed bull nor bear), only
                     # take the trade if the strategy's own quality score clears
@@ -2260,6 +2270,67 @@ class Autopilot:
             score = -1
         self._market_regime_cache = (allowed, reason, asyncio.get_event_loop().time(), score)
         self._last_regime_score = score
+        return allowed, reason
+
+    async def _breadth_gate(self) -> tuple[bool, str]:
+        """Alt-market breadth gate: fraction of the cached alt universe closing
+        above EMA{breadth_ema_span} must be >= breadth_min_fraction.
+
+        Mirrors scripts/strategy_lab._breadth_above_ema (the validated backtest
+        implementation). Reads only on-disk OHLCV pickles — no exchange calls.
+        One reading per tick is cached for 5 minutes. FAIL-CLOSED: if breadth
+        cannot be computed from enough symbols, new entries are blocked.
+        """
+        s = get_settings()
+        if not getattr(s, "breadth_gate_enabled", False):
+            return True, "breadth_gate_disabled"
+        cache = getattr(self, "_breadth_cache", None)
+        now = asyncio.get_event_loop().time()
+        if cache is not None and (now - cache[2]) < 300.0:
+            return cache[0], cache[1]
+        allowed, reason = False, "breadth_no_data"
+        try:
+            import glob
+            from pathlib import Path
+            from app.data import OHLCVRepository
+            from app.ta import add_indicators
+
+            span = int(s.breadth_ema_span)
+            col = f"ema_{span}"
+            cache_dir = Path(s.data_cache_dir)
+            syms = sorted(
+                p.stem.removesuffix("_1d")
+                for p in cache_dir.glob("*_1d.pkl")
+                if not p.stem.startswith("BTCUSDT")
+            )
+            above = total = 0
+            repo = OHLCVRepository()
+            for sym in syms:
+                try:
+                    df = await repo.get(sym, Timeframe.D1, refresh=False)
+                    df = add_indicators(df).dropna()
+                    if df.empty or col not in df.columns:
+                        continue
+                    last = df.iloc[-1]
+                    total += 1
+                    if float(last["close"]) > float(last[col]):
+                        above += 1
+                except Exception:  # noqa: BLE001
+                    continue
+            if total >= int(s.breadth_min_symbols):
+                frac = above / total
+                allowed = frac >= float(s.breadth_min_fraction)
+                reason = (
+                    f"breadth {above}/{total}={frac:.0%} above EMA{span} "
+                    f"({'>=' if allowed else '<'} {s.breadth_min_fraction:.0%})"
+                )
+            else:
+                reason = f"breadth_insufficient_symbols:{total}<{s.breadth_min_symbols}"
+                log.warning("[BREADTH] %s — blocking new entries (fail-closed)", reason)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[BREADTH] gate failed (%s) — blocking new entries (fail-closed)", exc)
+            reason = f"breadth_unavailable:{exc}"
+        self._breadth_cache = (allowed, reason, now)
         return allowed, reason
 
     async def _onchain_gate(self, symbol: str) -> tuple[bool, str]:
