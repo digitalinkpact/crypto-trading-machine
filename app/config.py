@@ -129,11 +129,19 @@ class Settings(BaseSettings):
     #     The universe spread probe FAILS OPEN on error, so these are a hard
     #     backstop against that path. (ONE 5.4%, PROM 5.4%, BTRST 4.9%, DGB 4.4%
     #     also trip the gate but are left to the dynamic spread filter.)
+    #  C) Position-level live audit (2026-10-22): ARB 11 / -$22.08; DOT 13 /
+    #     -$14.07; ETH 31 / -$4.20 (32.3% wins); ADA 13 / -$3.43 (38.5% wins).
+    #     Each meets the >=10-position evidence bar with persistently weak wins.
     blocked_symbols: tuple[str, ...] = (
         # A) proven live losers (trades / realized PnL / win-rate):
         "ZECUSDT",       # 75 trades, -$12.17, 18.7% win — worst by a wide margin
         "PUMPUSDT",      # 38 trades, -$5.46, 31.6% win
         "HYPEUSDT",      # 55 trades, -$5.23, 21.8% win
+        # C) additional position-level live losers (2026-10-22):
+        "ARBUSDT",       # 11 positions, -$22.08
+        "DOTUSDT",       # 13 positions, -$14.07
+        "ETHUSDT",       # 31 positions, -$4.20, 32.3% win
+        "ADAUSDT",       # 13 positions, -$3.43, 38.5% win
         # B) structurally thin / un-tradeable spreads (2026-09-26):
         "TOSHIUSDT",     # top-of-book spread 25.3%
         "FARTCOINUSDT",  # 13.7%

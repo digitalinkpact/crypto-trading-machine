@@ -228,9 +228,52 @@ async def _verify_safe_to_resume(mode: str) -> tuple[bool, str]:
         return False, f"position verification failed: {e}"
 
     try:
-        await BinanceUSClient().open_orders()
+        orders = await BinanceUSClient().open_orders()
     except Exception as e:  # noqa: BLE001
         return False, f"open-order verification failed: {e}"
+
+    settings = get_settings()
+    if mode == "live" and getattr(settings, "exchange_native_stops_enabled", False):
+        from decimal import Decimal, InvalidOperation
+
+        from app.exchange.filters import filters
+        from app.trading.protective_stops import stop_coid
+
+        open_by_coid = {str(order.get("clientOrderId", "")): order for order in orders}
+        total_balances = snap.get("all_balances", {})
+        for position in storage.all_positions():
+            symbol = str(position.get("symbol", "")).upper()
+            if position.get("mode") != "live" or not settings.exchange_stop_allowed(symbol):
+                continue
+            coid = stop_coid(
+                settings.exchange_stop_coid_prefix,
+                symbol,
+                str(position.get("entry_ts") or ""),
+            )
+            order = open_by_coid.get(coid)
+            if (
+                order is None
+                or str(order.get("side", "")).upper() != "SELL"
+                or str(order.get("type", "")).upper() != "STOP_LOSS"
+                or str(order.get("status", "")).upper() not in {"NEW", "PARTIALLY_FILLED"}
+            ):
+                return False, f"protective stop missing or inactive for {symbol}"
+            if not filters.loaded:
+                return False, "exchange lot-size filters unavailable for protective-stop verification"
+            try:
+                remaining = Decimal(str(order.get("origQty", "0"))) - Decimal(
+                    str(order.get("executedQty", "0"))
+                )
+                position_qty = Decimal(str(position.get("qty", "0")))
+                base_asset = symbol.removesuffix("USDT")
+                exchange_qty = Decimal(str(total_balances[base_asset]))
+            except (InvalidOperation, TypeError, ValueError):
+                return False, f"protective stop quantity unreadable for {symbol}"
+            except KeyError:
+                return False, f"exchange balance missing for {symbol}"
+            required_qty = filters.round_qty(symbol, min(position_qty, exchange_qty))
+            if remaining < required_qty:
+                return False, f"protective stop under-sized for {symbol}"
 
     return True, "balances/positions/open-orders all verified readable"
 
@@ -431,8 +474,8 @@ async def _health_loop() -> None:
                 status["open_orders_count"] = open_orders_count
                 if open_orders_bad:
                     log.warning(
-                        "health check: %d unexpected resting open order(s) — "
-                        "this strategy only places MARKET orders", open_orders_count,
+                        "health check: %d unexpected resting open order(s)",
+                        open_orders_count,
                     )
             except Exception as e:  # noqa: BLE001
                 log.exception("health check: open-orders check failed: %s", e)

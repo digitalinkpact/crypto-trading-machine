@@ -6,6 +6,8 @@ tested separately in tests/test_watchdog.py.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import app.trading.health as health
 
 
@@ -123,6 +125,98 @@ def test_check_duplicate_positions_ok_across_modes(monkeypatch):
     )
     dup, _detail = health._check_duplicate_positions()
     assert dup is False
+
+
+async def test_check_open_orders_allows_matching_bot_protective_stop(monkeypatch):
+    settings = SimpleNamespace(
+        exchange_native_stops_enabled=True,
+        exchange_stop_coid_prefix="pstop-",
+        exchange_stop_allowed=lambda symbol: symbol == "BTCUSDT",
+    )
+
+    class _Client:
+        async def open_orders(self):
+            return [{
+                "symbol": "BTCUSDT",
+                "side": "SELL",
+                "type": "STOP_LOSS",
+                "status": "NEW",
+                "clientOrderId": "pstop-BTCUSDT-abc123",
+                "origQty": "0.00071",
+            }]
+
+    monkeypatch.setattr(health, "get_settings", lambda: settings)
+    monkeypatch.setattr(health, "BinanceUSClient", _Client)
+    monkeypatch.setattr(
+        health.storage,
+        "all_positions",
+        lambda: [{"symbol": "BTCUSDT", "mode": "live", "qty": 0.00071}],
+    )
+
+    unexpected, count = await health._check_open_orders()
+
+    assert unexpected is False
+    assert count == 0
+
+
+async def test_check_open_orders_flags_non_bot_resting_order(monkeypatch):
+    settings = SimpleNamespace(
+        exchange_native_stops_enabled=True,
+        exchange_stop_coid_prefix="pstop-",
+        exchange_stop_allowed=lambda _symbol: True,
+    )
+
+    class _Client:
+        async def open_orders(self):
+            return [{
+                "symbol": "BTCUSDT",
+                "side": "SELL",
+                "type": "LIMIT",
+                "status": "NEW",
+                "clientOrderId": "manual-order",
+                "origQty": "0.00071",
+            }]
+
+    monkeypatch.setattr(health, "get_settings", lambda: settings)
+    monkeypatch.setattr(health, "BinanceUSClient", _Client)
+    monkeypatch.setattr(
+        health.storage,
+        "all_positions",
+        lambda: [{"symbol": "BTCUSDT", "mode": "live", "qty": 0.00071}],
+    )
+
+    unexpected, count = await health._check_open_orders()
+
+    assert unexpected is True
+    assert count == 1
+
+
+async def test_check_open_orders_flags_orphaned_bot_stop(monkeypatch):
+    settings = SimpleNamespace(
+        exchange_native_stops_enabled=True,
+        exchange_stop_coid_prefix="pstop-",
+        exchange_stop_allowed=lambda _symbol: True,
+    )
+
+    class _Client:
+        async def open_orders(self):
+            return [{
+                "symbol": "BTCUSDT",
+                "side": "SELL",
+                "type": "STOP_LOSS",
+                "status": "NEW",
+                "clientOrderId": "pstop-BTCUSDT-abc123",
+                "origQty": "0.00071",
+            }]
+
+    monkeypatch.setattr(health, "get_settings", lambda: settings)
+    monkeypatch.setattr(health, "BinanceUSClient", _Client)
+    monkeypatch.setattr(health.storage, "all_positions", lambda: [])
+
+    unexpected, count = await health._check_open_orders()
+
+    assert unexpected is True
+    assert count == 1
 
 
 async def test_retry_async_succeeds_after_transient_failures(monkeypatch):

@@ -18,6 +18,7 @@ import asyncio
 import resource
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 
 from app.config import get_settings
 from app.exchange import BinanceUSClient
@@ -238,14 +239,43 @@ def _check_failed_orders() -> tuple[bool, int]:
 
 
 async def _check_open_orders() -> tuple[bool, int]:
-    """This strategy only places MARKET orders, so any resting open order is
-    unexpected — could indicate a stuck/partially-processed order."""
+    """Flag resting orders except bot-owned protective stops for live positions."""
     ok, open_orders = await _retry_async(
         lambda: BinanceUSClient().open_orders(), attempts=2, base_delay=1.0, label="open_orders fetch",
     )
     if not ok:
         return False, 0
-    return len(open_orders) > 0, len(open_orders)
+
+    settings = get_settings()
+    positions = storage.all_positions()
+    live_positions = {
+        str(position.get("symbol", "")).upper(): Decimal(str(position.get("qty", "0")))
+        for position in positions
+        if position.get("mode") == "live"
+    }
+    prefix = str(getattr(settings, "exchange_stop_coid_prefix", "pstop-"))
+
+    def _is_expected_protective_stop(order: dict) -> bool:
+        symbol = str(order.get("symbol", "")).upper()
+        if not (
+            getattr(settings, "exchange_native_stops_enabled", False)
+            and prefix
+            and str(order.get("clientOrderId", "")).startswith(prefix)
+            and str(order.get("side", "")).upper() == "SELL"
+            and str(order.get("type", "")).upper() == "STOP_LOSS"
+            and str(order.get("status", "")).upper() in {"NEW", "PARTIALLY_FILLED"}
+            and settings.exchange_stop_allowed(symbol)
+            and symbol in live_positions
+        ):
+            return False
+        try:
+            original_qty = Decimal(str(order.get("origQty", "0")))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        return original_qty > 0 and original_qty <= live_positions[symbol]
+
+    unexpected = [order for order in open_orders if not _is_expected_protective_stop(order)]
+    return bool(unexpected), len(unexpected)
 
 
 def _check_duplicate_positions() -> tuple[bool, str]:
@@ -320,4 +350,3 @@ async def _check_portfolio_discrepancy(mode: str) -> tuple[bool, int]:
         if balances.get(base, 0.0) <= 0:
             mismatches += 1
     return mismatches > 0, mismatches
-

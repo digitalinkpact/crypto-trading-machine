@@ -66,9 +66,52 @@ async def verify_before_trading() -> None:
             )
         if mode == "live":
             orders = await BinanceUSClient().open_orders()
-            if orders:
+            settings = get_settings()
+            expected_stops = {}
+            if getattr(settings, "exchange_native_stops_enabled", False):
+                from app.trading.protective_stops import stop_coid
+
+                for position in storage.all_positions():
+                    symbol = str(position.get("symbol", "")).upper()
+                    if position.get("mode") != "live" or not settings.exchange_stop_allowed(symbol):
+                        continue
+                    coid = stop_coid(
+                        settings.exchange_stop_coid_prefix,
+                        symbol,
+                        str(position.get("entry_ts") or ""),
+                    )
+                    expected_stops[coid] = position
+
+            active_stops = set()
+            unexpected_orders = []
+            for order in orders:
+                coid = str(order.get("clientOrderId", ""))
+                position = expected_stops.get(coid)
+                if position is None:
+                    unexpected_orders.append(order)
+                    continue
+                try:
+                    order_qty = float(order.get("origQty", "0"))
+                    position_qty = float(position.get("qty", "0"))
+                except (TypeError, ValueError):
+                    unexpected_orders.append(order)
+                    continue
+                if (
+                    str(order.get("side", "")).upper() == "SELL"
+                    and str(order.get("type", "")).upper() == "STOP_LOSS"
+                    and str(order.get("status", "")).upper() in {"NEW", "PARTIALLY_FILLED"}
+                    and 0 < order_qty <= position_qty
+                ):
+                    active_stops.add(coid)
+                else:
+                    unexpected_orders.append(order)
+
+            missing_stops = set(expected_stops) - active_stops
+            if unexpected_orders or missing_stops:
                 watchdog.trigger_emergency_halt(
-                    f"startup found {len(orders)} unexpected open orders",
+                    "startup found "
+                    f"{len(unexpected_orders)} unexpected open order(s) and "
+                    f"{len(missing_stops)} missing/inactive protective stop(s)",
                     level="new_entries_blocked",
                 )
     except Exception as exc:  # noqa: BLE001

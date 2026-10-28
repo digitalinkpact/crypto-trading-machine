@@ -234,6 +234,7 @@ def _wire_risk_gates(monkeypatch, fake, *, position, exits, order_status="FILLED
     ap.state.mode = "live"
     base = position["symbol"][:-4]
     monkeypatch.setattr(ap_mod, "get_settings", lambda: _S())
+    monkeypatch.setattr(ap_mod, "BinanceUSClient", lambda: fake)
     monkeypatch.setattr(Autopilot, "_protective_stop_manager",
                         lambda self: ProtectiveStopManager(fake, settings=_S()), raising=True)
     monkeypatch.setattr(ap_mod.storage, "all_positions", lambda: [position])
@@ -334,6 +335,7 @@ async def test_v_restart_does_not_duplicate_resting_stop(monkeypatch):
     ap = Autopilot()
     ap.state.mode = "live"
     monkeypatch.setattr(ap_mod, "get_settings", lambda: _S())
+    monkeypatch.setattr(ap_mod, "BinanceUSClient", lambda: fake)
     monkeypatch.setattr(Autopilot, "_protective_stop_manager",
                         lambda self: ProtectiveStopManager(fake, settings=_S()), raising=True)
     monkeypatch.setattr(ap_mod.storage, "all_positions", lambda: [pos])
@@ -341,6 +343,37 @@ async def test_v_restart_does_not_duplicate_resting_stop(monkeypatch):
     monkeypatch.setattr(ap_mod.risk, "get_hwm", lambda s: None)
     await ap.reconcile_protective_stops()
     assert len(fake.open) == 1   # existing stop kept, not duplicated
+
+
+@pytest.mark.asyncio
+async def test_reconcile_caps_missing_stop_to_free_balance_after_base_fee(monkeypatch):
+    import app.trading.autopilot as ap_mod
+    from app.trading.autopilot import Autopilot
+
+    fake = FakeExchange()
+    fake.seed_balance("APT", "33.433312")
+    position = {
+        "symbol": "APTUSDT", "mode": "live", "qty": "33.44",
+        "entry_price": "0.822", "entry_ts": "t-apt",
+    }
+    ap = Autopilot()
+    ap.state.mode = "live"
+    monkeypatch.setattr(ap_mod, "get_settings", lambda: _S())
+    monkeypatch.setattr(ap_mod, "BinanceUSClient", lambda: fake)
+    monkeypatch.setattr(ap_mod.storage, "all_positions", lambda: [position])
+    monkeypatch.setattr(ap_mod.filters, "round_qty", lambda symbol, qty: qty)
+
+    async def software_stop(_self, _symbol, entry_price):
+        return entry_price * Decimal("0.96")
+
+    monkeypatch.setattr(Autopilot, "_effective_software_stop_price", software_stop)
+    summary = await ap.reconcile_protective_stops()
+
+    assert summary["placed"] == ["APTUSDT"]
+    (stop,) = fake.open.values()
+    assert Decimal(stop["origQty"]) == Decimal("33.433312")
+    assert fake.free("APT") == Decimal("0")
+    assert fake.locked("APT") == Decimal("33.433312")
 
 
 @pytest.mark.asyncio

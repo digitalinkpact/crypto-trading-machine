@@ -5,6 +5,8 @@ order-outcome-unknown protocol) use to escalate into the same halt mechanism.
 """
 from __future__ import annotations
 
+import pytest
+
 import app.trading.watchdog as watchdog
 
 
@@ -127,3 +129,82 @@ async def test_verify_safe_to_resume_fails_when_open_orders_raises(monkeypatch):
     safe, detail = await watchdog._verify_safe_to_resume("live")
     assert safe is False
     assert "open-order verification failed" in detail
+
+
+@pytest.mark.asyncio
+async def test_verify_safe_to_resume_blocks_when_protective_stop_is_missing(monkeypatch):
+    from types import SimpleNamespace
+
+    async def _snapshot(mode):
+        return {"usdt_cash": "10", "total_usdt": "10"}
+
+    position = {
+        "symbol": "APTUSDT", "mode": "live", "qty": "33.433312",
+        "entry_ts": "2026-10-22T00:00:00+00:00",
+    }
+    monkeypatch.setattr("app.trading.portfolio.portfolio_snapshot", _snapshot)
+    monkeypatch.setattr(watchdog.storage, "all_positions", lambda: [position])
+    monkeypatch.setattr(
+        watchdog,
+        "get_settings",
+        lambda: SimpleNamespace(
+            exchange_native_stops_enabled=True,
+            exchange_stop_coid_prefix="pstop-",
+            exchange_stop_allowed=lambda _symbol: True,
+        ),
+    )
+
+    class _Client:
+        async def open_orders(self):
+            return []
+
+    monkeypatch.setattr(watchdog, "BinanceUSClient", lambda: _Client())
+    safe, detail = await watchdog._verify_safe_to_resume("live")
+
+    assert safe is False
+    assert "protective stop missing" in detail
+
+
+@pytest.mark.asyncio
+async def test_verify_safe_to_resume_requires_stop_to_cover_position(monkeypatch):
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from app.exchange.filters import filters
+    from app.trading.protective_stops import stop_coid
+
+    async def _snapshot(mode):
+        return {"usdt_cash": "10", "total_usdt": "10", "all_balances": {"APT": "33.436378"}}
+
+    position = {
+        "symbol": "APTUSDT", "mode": "live", "qty": "33.433312",
+        "entry_ts": "2026-10-22T00:00:00+00:00",
+    }
+    coid = stop_coid("pstop-", position["symbol"], position["entry_ts"])
+    monkeypatch.setattr("app.trading.portfolio.portfolio_snapshot", _snapshot)
+    monkeypatch.setattr(watchdog.storage, "all_positions", lambda: [position])
+    monkeypatch.setattr(filters, "_loaded", True)
+    monkeypatch.setattr(filters, "round_qty", lambda _symbol, _qty: Decimal("33.43"))
+    monkeypatch.setattr(
+        watchdog,
+        "get_settings",
+        lambda: SimpleNamespace(
+            exchange_native_stops_enabled=True,
+            exchange_stop_coid_prefix="pstop-",
+            exchange_stop_allowed=lambda _symbol: True,
+        ),
+    )
+
+    class _Client:
+        async def open_orders(self):
+            return [{
+                "clientOrderId": coid, "symbol": "APTUSDT", "side": "SELL",
+                "type": "STOP_LOSS", "status": "NEW", "origQty": "33.43",
+                "executedQty": "0",
+            }]
+
+    monkeypatch.setattr(watchdog, "BinanceUSClient", lambda: _Client())
+    safe, detail = await watchdog._verify_safe_to_resume("live")
+
+    assert safe is True
+    assert "verified readable" in detail

@@ -23,7 +23,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from app.agents import run_all_agents
@@ -55,6 +55,37 @@ _BASELINE_HALT_KEY = "baseline_unavailable"
 _CIRCUIT_BREAKER_FAILURE_KEY = "circuit_breaker_check_failed"
 _FILTERS_HALT_KEY = "exchange_filters_unavailable"
 _ML_GATE_HALT_KEY = "ml_gate_unavailable"
+
+
+def _net_buy_position_qty(
+    symbol: str,
+    filled_qty: Decimal,
+    commission: Optional[Decimal],
+    commission_asset: Optional[str],
+    raw_fills: Optional[list[dict]] = None,
+) -> Decimal:
+    """Return sellable base quantity after a buy fee charged in the base asset."""
+    base_asset = symbol.upper().removesuffix("USDT")
+    base_commission = Decimal("0")
+    if raw_fills is not None:
+        for fill in raw_fills:
+            if str(fill.get("commissionAsset", "")).upper() != base_asset:
+                continue
+            try:
+                base_commission += Decimal(str(fill["commission"]))
+            except (KeyError, InvalidOperation, TypeError, ValueError) as exc:
+                raise ValueError("invalid base-asset commission in buy fills") from exc
+    elif commission is not None and commission_asset is not None and commission_asset.upper() == base_asset:
+        base_commission = commission
+    if base_commission < 0:
+        raise ValueError("buy commission cannot be negative")
+    if base_commission == 0:
+        return filled_qty
+    net_qty = filled_qty - base_commission
+    if net_qty <= 0:
+        raise ValueError("base-asset buy commission consumes the entire fill")
+    return net_qty
+
 
 # Exit reasons that sell only a fraction of the position (the TP scale-out
 # ladder). Every other reason is a full exit that flattens the free balance.
@@ -2551,7 +2582,16 @@ class Autopilot:
         s = get_settings()
         if not (bool(getattr(s, "exchange_native_stops_enabled", False)) and self.state.mode == "live"):
             return {"skipped": "disabled"}
-        mgr = self._protective_stop_manager()
+        from app.trading.protective_stops import ProtectiveStopManager
+
+        client = BinanceUSClient()
+        mgr = ProtectiveStopManager(client)
+        existing = {o.get("clientOrderId"): o for o in await mgr.list_bot_stops()}
+        account = await client.account()
+        free_balances = {
+            str(b.get("asset", "")).upper(): Decimal(str(b.get("free", "0")))
+            for b in account.get("balances", [])
+        }
         desired = {}
         plans = []  # (symbol, qty, effective_software_stop, entry_ts)
         for p in storage.all_positions():
@@ -2559,11 +2599,49 @@ class Autopilot:
                 continue
             sym = p["symbol"]
             entry_ts = str(p.get("entry_ts"))
-            qty = Decimal(str(p["qty"]))
+            position_qty = Decimal(str(p["qty"]))
             eff = await self._effective_software_stop_price(sym, Decimal(str(p["entry_price"])))
+            candidate = mgr.plan(sym, position_qty, eff, entry_ts)
+            existing_stop = existing.get(candidate.coid)
+            if existing_stop:
+                qty = max(
+                    Decimal("0"),
+                    Decimal(str(existing_stop.get("origQty", "0")))
+                    - Decimal(str(existing_stop.get("executedQty", "0"))),
+                )
+            else:
+                base_asset = sym.upper().removesuffix("USDT")
+                free_qty = free_balances.get(base_asset, Decimal("0"))
+                qty = filters.round_qty(sym, min(position_qty, free_qty))
+                if qty < position_qty:
+                    log.warning(
+                        "protective stop qty capped to free balance %s position=%s free=%s stop_qty=%s",
+                        sym, position_qty, free_qty, qty,
+                    )
+            if qty <= 0:
+                log.critical("protective stop cannot cover any free balance for %s", sym)
+                try:
+                    from app.trading import watchdog
+                    watchdog.trigger_emergency_halt(
+                        f"protective stop has no free balance for {sym}",
+                        level="new_entries_blocked",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
             desired[sym] = mgr.plan(sym, qty, eff, entry_ts)
             plans.append((sym, qty, eff, entry_ts))
         summary = await mgr.reconcile(desired)
+        if summary.get("failed"):
+            try:
+                from app.trading import watchdog
+
+                watchdog.trigger_emergency_halt(
+                    "protective stops failed for " + ",".join(summary["failed"]),
+                    level="new_entries_blocked",
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("failed to engage halt after protective-stop reconciliation failure")
         for sym, qty, eff, entry_ts in plans:
             await mgr.ratchet(sym, qty, eff, entry_ts)
         return summary
@@ -2672,6 +2750,17 @@ class Autopilot:
                     symbol, side.value, qty, filled, order.client_order_id,
                 )
             try:
+                position_qty = filled
+                if side is OrderSide.BUY:
+                    position_qty = filters.round_qty(
+                        symbol,
+                        _net_buy_position_qty(
+                            symbol, filled, order.commission, order.commission_asset,
+                            (order.raw or {}).get("fills") if isinstance(order.raw, dict) else None,
+                        ),
+                    )
+                    if position_qty <= 0:
+                        raise ValueError("net buy position quantity rounds to zero")
                 price = order.avg_fill_price or order.price or await self._price(symbol)
                 order_fee_usdt = (
                     float(order.commission)
@@ -2690,7 +2779,7 @@ class Autopilot:
                         else None
                     )
                     storage.open_position(
-                        symbol=symbol, mode="live", qty=filled,
+                        symbol=symbol, mode="live", qty=position_qty,
                         entry_price=price, agents=agents,
                         entry_confidence=entry_confidence, entry_strategy=entry_strategy,
                         entry_btc_regime=entry_btc_regime, entry_fee_usdt=entry_fee_usdt,
@@ -2699,7 +2788,7 @@ class Autopilot:
                     # software risk loop stays primary). No-op when disabled.
                     pos_row = storage.get_position(symbol)
                     await self._place_protective_stop(
-                        symbol, filled, Decimal(str(price)),
+                        symbol, position_qty, Decimal(str(price)),
                         str((pos_row or {}).get("entry_ts") or ""),
                     )
                 else:
