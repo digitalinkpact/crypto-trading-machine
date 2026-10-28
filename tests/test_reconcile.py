@@ -30,16 +30,16 @@ async def _fake_snapshot(**_kwargs):
     }
 
 
-async def test_reconcile_closes_stale_db_position_with_no_real_balance(monkeypatch):
+async def test_reconcile_discards_stale_db_position_without_recording_trade(monkeypatch):
     monkeypatch.setattr(reconcile_module, "portfolio_snapshot", _fake_snapshot)
     monkeypatch.setattr(
         reconcile_module.storage, "all_positions",
         lambda: [{"symbol": "SOLUSDT", "mode": "live", "qty": 1.0, "entry_price": 100.0}],
     )
-    closed_calls = []
+    discarded_calls = []
     monkeypatch.setattr(
-        reconcile_module.storage, "close_position",
-        lambda **kw: (closed_calls.append(kw) or {"symbol": kw["symbol"]}),
+        reconcile_module.storage, "discard_position",
+        lambda **kw: (discarded_calls.append(kw) or True),
     )
     monkeypatch.setattr(reconcile_module.storage, "open_position", lambda **kw: None)
     import app.trading.risk as risk_module
@@ -48,16 +48,12 @@ async def test_reconcile_closes_stale_db_position_with_no_real_balance(monkeypat
 
     result = await reconcile_positions(mode="live")
 
-    # Phantom row (exchange holds 0) is now auto-closed at its entry price so it
-    # can never reach a risk-exit and fabricate PnL. ZEC below is the separate
-    # untracked-holding mismatch, so mismatched counts both.
+    # Phantom row (exchange holds 0) is discarded without booking fake PnL.
+    # ZEC below is the separate untracked-holding mismatch, so both count.
     assert result["closed"] == 1
     assert result["adopted"] == 0
     assert result["mismatched"] == 2
-    assert len(closed_calls) == 1
-    assert closed_calls[0]["symbol"] == "SOLUSDT"
-    assert closed_calls[0]["exit_reason"] == "reconcile_stale"
-    assert Decimal(str(closed_calls[0]["exit_price"])) == Decimal("100.0")
+    assert discarded_calls == [{"symbol": "SOLUSDT", "mode": "live"}]
 
 
 async def test_reconcile_adopts_untracked_exchange_holding(monkeypatch):
@@ -192,4 +188,3 @@ async def test_reconcile_flags_material_shortfall(monkeypatch):
 
     assert result["mismatched"] == 1
     assert result["kept"] == 0
-

@@ -81,6 +81,13 @@ class ProfitStreamStrategy:
         else:
             dip_ready, dip_rsi = self._dip_buy_setup(df_1d)
         pullback_ready, pullback_rsi, pullback_dist_pct = self._pullback_setup(df_1d)
+        # The pullback setup is a SECOND, independent BUY trigger that fires
+        # regardless of `entry_strategy` and gets a 4x wider spread allowance.
+        # 3-fold OOS (2026-10-23, strategy_lab ladder sweep) shows it has no edge
+        # (PF 0.96, fold-1 PF 0.64-0.72) while oversold_bounce correctly sits out
+        # the same regime. Default OFF so the configured entry is the only entry.
+        if not getattr(s, "pullback_entry_enabled", False):
+            pullback_ready = False
         btc_risk_on, btc_ema50, btc_ema200 = self._btc_risk_on(btc_1d)
         btc_regime = compute_btc_regime_score(btc_1d)
         daily_quote = self._latest_quote_volume(df_1d)

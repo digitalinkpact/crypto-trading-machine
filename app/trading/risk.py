@@ -314,23 +314,11 @@ def is_daily_loss_limit_tripped(
         return False, Decimal("0")
 
     now = now or datetime.now(timezone.utc)
-    today = now.date()
-    today_pnl = Decimal("0")
-    for t in storage.closed_trades(limit=500):
-        if t.get("mode") != mode:
-            continue
-        exit_ts_raw = t.get("exit_ts")
-        if not exit_ts_raw:
-            continue
-        try:
-            exit_ts = datetime.fromisoformat(str(exit_ts_raw))
-            if exit_ts.tzinfo is None:
-                exit_ts = exit_ts.replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-        if exit_ts.date() != today:
-            continue
-        today_pnl += Decimal(str(t.get("pnl", 0)))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    today_pnl = storage.daily_realized_pnl(
+        mode=mode, day=now.astimezone(timezone.utc).date()
+    )
 
     limit = starting_balance * Decimal(str(s.daily_loss_limit_pct))
     return (today_pnl <= -limit), today_pnl

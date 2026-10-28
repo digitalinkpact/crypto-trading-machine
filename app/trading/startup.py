@@ -10,9 +10,39 @@ from app.trading.reconcile import reconcile_positions
 
 log = get_logger(__name__)
 
+# Mutable safety flags read by Autopilot._final_live_buy_safety_check. That
+# guard rejects a BUY when any of these kv rows is missing ("safety state
+# unknown"), which is the right fail-closed default — but a brand-new DB has
+# none of them, so every live BUY would be rejected forever. Each row is
+# written ONLY when absent; an existing (possibly active) halt is never touched.
+SAFETY_STATE_KEYS: tuple[str, ...] = (
+    "drawdown_halt",
+    "emergency_halt",
+    "tick_protection",
+    "entry_status",
+)
+
+
+def ensure_safety_state_initialized() -> list[str]:
+    """Seed absent safety-state kv rows as inactive. Returns the keys seeded."""
+    seeded: list[str] = []
+    for key in SAFETY_STATE_KEYS:
+        existing = storage.kv_get(key)
+        if isinstance(existing, dict):
+            continue
+        payload: dict = {"active": False, "initialized_at_startup": True}
+        if key == "entry_status":
+            payload.update({"entry_halted": False, "reasons": [], "system_offline": False})
+        storage.kv_set(key, payload)
+        seeded.append(key)
+    if seeded:
+        log.info("startup seeded inactive safety state for %s", seeded)
+    return seeded
+
 
 async def verify_before_trading() -> None:
     """Verify local/exchange state and halt new entries on any discrepancy."""
+    ensure_safety_state_initialized()
     mode = "paper" if get_settings().paper_trading else "live"
     prior_state = storage.kv_get("autopilot_state") or {}
     if prior_state.get("running") and not prior_state.get("starting_balance_usdt"):

@@ -548,23 +548,16 @@ class Autopilot:
                             "below min — closing stale position", ex.symbol, ex.qty, avail,
                         )
                         try:
-                            # The exchange holds ~none of this — the book row is
-                            # phantom. Booking at the current price fabricates a
-                            # win/loss on a position we don't actually hold, which
-                            # corrupts realized PnL, win-rate and agent stats.
-                            # Close at the entry price so realized PnL is ~0
-                            # (bookkeeping cleanup, not a real trade).
-                            stale_pos = storage.get_position(ex.symbol)
-                            book_exit_price = Decimal(
-                                str((stale_pos or {}).get("entry_price") or price)
+                            # The exchange holds none of this — delete the
+                            # phantom row without booking a trade or modeled
+                            # fees that would create a false realized loss.
+                            discarded = storage.discard_position(
+                                symbol=ex.symbol, mode=self.state.mode
                             )
-                            storage.close_position(
-                                symbol=ex.symbol, exit_price=book_exit_price,
-                                exit_reason=f"{ex.reason}_stale_dust",
-                            )
-                            risk.clear_hwm(ex.symbol)
-                            risk.clear_tp1(ex.symbol)
-                            risk.clear_tp2(ex.symbol)
+                            if discarded:
+                                risk.clear_hwm(ex.symbol)
+                                risk.clear_tp1(ex.symbol)
+                                risk.clear_tp2(ex.symbol)
                         except Exception as exc:  # noqa: BLE001
                             log.warning("stale close failed for %s: %s", ex.symbol, exc)
                     else:
@@ -608,14 +601,32 @@ class Autopilot:
                 if self._order_filled(order):
                     if ex.reason == "take_profit_1":
                         risk.mark_tp1_taken(ex.symbol)
+                        if Decimal(str(order.filled_quantity or 0)) < qty:
+                            log.warning(
+                                "RISK EXIT %s TP1 partially filled (%s/%s); "
+                                "advancing the ladder for the remaining position",
+                                ex.symbol, order.filled_quantity, qty,
+                            )
                         await self._replace_stop_remaining(ex.symbol, entry_ts_by_symbol.get(ex.symbol, ""))
                     elif ex.reason == "take_profit_2":
                         risk.mark_tp2_taken(ex.symbol)
+                        if Decimal(str(order.filled_quantity or 0)) < qty:
+                            log.warning(
+                                "RISK EXIT %s TP2 partially filled (%s/%s); "
+                                "advancing the ladder for the remaining position",
+                                ex.symbol, order.filled_quantity, qty,
+                            )
                         await self._replace_stop_remaining(ex.symbol, entry_ts_by_symbol.get(ex.symbol, ""))
                     else:
-                        risk.clear_hwm(ex.symbol)
-                        risk.clear_tp1(ex.symbol)
-                        risk.clear_tp2(ex.symbol)
+                        if not self._clear_exit_state_if_flat(ex.symbol):
+                            log.warning(
+                                "RISK EXIT %s only partially filled (%s/%s); "
+                                "retaining exit state and restoring the remaining stop",
+                                ex.symbol, order.filled_quantity, qty,
+                            )
+                            await self._replace_stop_remaining(
+                                ex.symbol, entry_ts_by_symbol.get(ex.symbol, "")
+                            )
                 else:
                     log.error(
                         "RISK EXIT %s did NOT fill (status=%s) — position remains "
@@ -1256,10 +1267,7 @@ class Autopilot:
                             placed = await self._place_sell(symbol, sig, sell_qty)
                             if placed:
                                 skip_counter["executed_sell"] += 1
-                                risk.clear_hwm(symbol)
-                                risk.clear_tp1(symbol)
-                                risk.clear_tp2(symbol)
-                                self._clear_pyramid_adds_count(symbol)
+                                self._clear_exit_state_if_flat(symbol)
                                 _finish(symbol, "executed_sell", aggressive_exit_reason, submitted=True, sig=sig)
                             else:
                                 _bump("filter_reject_sell", symbol)
@@ -1427,6 +1435,17 @@ class Autopilot:
                         _finish(symbol, "risk_manager", entry_risk.reason, submitted=False, sig=sig)
                         log.info("skip %s BUY: %s", symbol, entry_risk.reason)
                         continue
+                    if entry_risk.notional_usdt < Decimal("10"):
+                        reason = (
+                            f"risk_budget={entry_risk.notional_usdt:.4f} "
+                            "below_min_trade_usdt=10"
+                        )
+                        _set_filter(symbol, "risk_budget_minimum", False, reason, sig)
+                        _finish(
+                            symbol, "risk_budget_below_minimum", reason,
+                            submitted=False, sig=sig,
+                        )
+                        continue
 
                     atr_pct = await self._atr_pct(symbol)
                     per_trade_usdt = entry_risk.notional_usdt
@@ -1565,26 +1584,6 @@ class Autopilot:
                         _finish(symbol, "trend_gate", trend_why, submitted=False, sig=sig)
                         log.info("skip %s BUY: %s", symbol, trend_why)
                         continue
-                    # Enforce $10 minimum per trade
-                    if per_trade_usdt < 10:
-                        if usdt_free >= 10:
-                            per_trade_usdt = Decimal("10")
-                        else:
-                            _set_filter(
-                                symbol,
-                                "cash_available",
-                                False,
-                                f"per_trade={per_trade_usdt:.4f} cash={usdt_free:.2f} eff={eff_pct:.4f}",
-                                sig,
-                            )
-                            _finish(
-                                symbol,
-                                "insufficient_usdt",
-                                f"per_trade={per_trade_usdt:.4f} cash={usdt_free:.2f} eff={eff_pct:.4f}",
-                                submitted=False,
-                                sig=sig,
-                            )
-                            continue
                     _set_filter(symbol, "cash_available", True, f"usdt_free={usdt_free}", sig)
 
                     # Derivatives context gate (funding too negative → skip long).
@@ -1616,15 +1615,13 @@ class Autopilot:
                                 self._orderbook_retry_tasks[task_key] = asyncio.create_task(
                                     self._retry_orderbook_recheck(
                                         symbol=symbol,
-                                        sig=sig,
-                                        per_trade_usdt=per_trade_usdt,
-                                        attempt=1,
-                                        aggressive_mode=aggressive_mode,
-                                        spread_cap=spread_cap,
                                     )
                                 )
                                 retry_scheduled = True
-                        detail = ob_why if not retry_scheduled else f"{ob_why}; retry_scheduled=60s x{int(getattr(s, 'orderbook_retry_attempts', 3))}"
+                        detail = ob_why if not retry_scheduled else (
+                            f"{ob_why}; full_tick_retry={s.orderbook_retry_delay_seconds}s "
+                            f"x{s.orderbook_retry_attempts}"
+                        )
                         _finish(symbol, "orderbook_gate", detail, submitted=False, sig=sig)
                         log.info("skip %s BUY: order book %s", symbol, ob_why)
                         continue
@@ -1633,9 +1630,10 @@ class Autopilot:
                     if not placed:
                         _finish(symbol, "filter_reject_buy", "exchange filters rejected computed qty", submitted=False, sig=sig)
                         continue
-                    risk.clear_hwm(symbol)
-                    risk.clear_tp1(symbol)
-                    risk.clear_tp2(symbol)
+                    if not is_pyramid:
+                        risk.clear_hwm(symbol)
+                        risk.clear_tp1(symbol)
+                        risk.clear_tp2(symbol)
                     self.state.cooldowns[symbol] = now.isoformat()
                     if not is_pyramid:
                         open_count += 1
@@ -1669,10 +1667,7 @@ class Autopilot:
                         placed = await self._place_sell(symbol, sig, sell_qty)
                         if placed:
                             skip_counter["executed_sell"] += 1
-                            risk.clear_hwm(symbol)
-                            risk.clear_tp1(symbol)
-                            risk.clear_tp2(symbol)
-                            self._clear_pyramid_adds_count(symbol)
+                            self._clear_exit_state_if_flat(symbol)
                         else:
                             _bump("filter_reject_sell", symbol)
                     else:
@@ -1851,7 +1846,7 @@ class Autopilot:
 
         basket_notional = proposed_notional
         for pos in open_positions:
-            if pos.get("symbol") not in group or pos.get("symbol") == symbol:
+            if pos.get("symbol") not in group:
                 continue
             try:
                 qty = Decimal(str(pos.get("qty") or "0"))
@@ -1878,6 +1873,17 @@ class Autopilot:
 
     def _clear_pyramid_adds_count(self, symbol: str) -> None:
         self._set_pyramid_adds_count(symbol, 0)
+
+    def _clear_exit_state_if_flat(self, symbol: str) -> bool:
+        """Clear position-scoped state only after storage confirms the exit is flat."""
+        position = storage.get_position(symbol, mode=self.state.mode)
+        if position and Decimal(str(position.get("qty") or 0)) > 0:
+            return False
+        risk.clear_hwm(symbol)
+        risk.clear_tp1(symbol)
+        risk.clear_tp2(symbol)
+        self._clear_pyramid_adds_count(symbol)
+        return True
 
     def _aggressive_mode_active(self) -> tuple[bool, str]:
         s = get_settings()
@@ -1982,86 +1988,24 @@ class Autopilot:
         self,
         *,
         symbol: str,
-        sig,
-        per_trade_usdt: Decimal,
-        attempt: int,
-        aggressive_mode: bool,
-        spread_cap: Decimal,
     ) -> None:
         s = get_settings()
-        task_key = (symbol, sig.action.value)
+        mode = self.state.mode
+        task_key = (symbol, SignalAction.BUY.value)
         try:
-            await asyncio.sleep(int(getattr(s, "orderbook_retry_delay_seconds", 60)))
-            if not self.state.running or sig.action != SignalAction.BUY:
-                return
-
-            snap = await portfolio_snapshot(mode=self.state.mode)
-            balance_source = snap.get("free_balances") or snap.get("all_balances") or {}
-            balances: dict[str, Decimal] = {
-                asset: Decimal(str(qty)) for asset, qty in balance_source.items()
-            }
-            open_positions = [
-                p for p in storage.all_positions() if p["mode"] == self.state.mode
-            ]
-            open_count, held_symbols = await self._count_non_dust_positions(
-                open_positions=open_positions,
-                balances=balances,
-            )
-            if symbol in held_symbols:
-                return
-
-            usdt_free = Decimal(str(snap["usdt_cash"]))
-            total_eq = Decimal(str(snap["total_usdt"]))
-            long_exposure_pct = float(
-                (total_eq - usdt_free) / total_eq if total_eq > 0 else Decimal("0")
-            )
-            entry_price = await self._price(symbol)
-            entry_risk = RiskManager().evaluate_entry(
-                mode=self.state.mode,
-                total_equity_usdt=total_eq,
-                open_positions=open_count,
-                long_exposure_pct=long_exposure_pct,
-                entry_price=entry_price,
-                aggressive_mode=aggressive_mode,
-            )
-            if not entry_risk.allow:
-                log.info("[OB_RETRY] %s attempt=%d skipped: %s", symbol, attempt, entry_risk.reason)
-                return
-
-            retry_notional = min(per_trade_usdt, usdt_free, entry_risk.notional_usdt)
-            if retry_notional <= 0:
-                return
-            ob_ok, ob_why = await liquidity_gate(
-                symbol,
-                SignalAction.BUY,
-                retry_notional,
-                max_spread_pct=spread_cap,
-            )
-            if not ob_ok:
-                log.info("[OB_RETRY] %s attempt=%d blocked: %s", symbol, attempt, ob_why)
-                if getattr(s, "orderbook_retry_enabled", True) and attempt < int(getattr(s, "orderbook_retry_attempts", 3)):
-                    next_task = asyncio.create_task(
-                        self._retry_orderbook_recheck(
-                            symbol=symbol,
-                            sig=sig,
-                            per_trade_usdt=retry_notional,
-                            attempt=attempt + 1,
-                            aggressive_mode=aggressive_mode,
-                            spread_cap=spread_cap,
-                        )
-                    )
-                    self._orderbook_retry_tasks[task_key] = next_task
-                return
-
-            placed = await self._place_buy(symbol, sig, retry_notional)
-            if placed:
-                self.state.cooldowns[symbol] = datetime.now(timezone.utc).isoformat()
-                self._save()
-                log.info("[OB_RETRY] %s attempt=%d executed after recheck", symbol, attempt)
-            else:
-                log.info("[OB_RETRY] %s attempt=%d failed at submit stage", symbol, attempt)
+            for attempt in range(1, s.orderbook_retry_attempts + 1):
+                await asyncio.sleep(s.orderbook_retry_delay_seconds)
+                if not self.state.running or self.state.mode != mode:
+                    return
+                if storage.get_position(symbol, mode=mode):
+                    return
+                # Never submit the old signal outside the tick mutex and gates.
+                log.info("[OB_RETRY] %s attempt=%d requesting a fresh full tick", symbol, attempt)
+                await asyncio.wait_for(
+                    self.tick(), timeout=s.autopilot_tick_timeout_seconds
+                )
         except Exception as exc:  # noqa: BLE001
-            log.warning("[OB_RETRY] %s attempt=%d failed: %s", symbol, attempt, exc)
+            log.exception("[OB_RETRY] %s failed: %s", symbol, exc)
         finally:
             task = self._orderbook_retry_tasks.get(task_key)
             if task is asyncio.current_task():
@@ -2545,15 +2489,17 @@ class Autopilot:
                     symbol, fill_price,
                 )
                 return
-            pos = storage.get_position(symbol)
+            pos = storage.get_position(symbol, mode=self.state.mode)
             entry_price = Decimal(str((pos or {}).get("entry_price") or 0))
             mfe_pct, mae_pct = risk.mfe_mae_pct(symbol, entry_price)
             fee = fill.get("fee")
-            actual_fee = float(fee) if fee is not None and fill.get("fee_asset") == "USDT" else None
+            # The stop fill's commission is the EXIT leg only — pass it as such
+            # so storage still charges the entry leg (recorded or modeled).
+            actual_exit_fee = float(fee) if fee is not None and fill.get("fee_asset") == "USDT" else None
             storage.close_position(
                 symbol=symbol, mode=self.state.mode, exit_price=priced,
                 exit_reason="exchange_stop", mfe_pct=mfe_pct, mae_pct=mae_pct,
-                actual_fee_usdt=actual_fee,
+                actual_exit_fee_usdt=actual_exit_fee,
             )
             risk.clear_hwm(symbol); risk.clear_tp1(symbol); risk.clear_tp2(symbol)
             log.warning("EXCHANGE STOP filled %s at %s — recorded exit (no double-sell)",
@@ -2565,7 +2511,7 @@ class Autopilot:
         """After a TP1/TP2 partial, re-place the stop for the REMAINING qty."""
         if not self._stop_allowed(symbol):
             return
-        pos = storage.get_position(symbol)
+        pos = storage.get_position(symbol, mode=self.state.mode)
         if not pos or Decimal(str(pos.get("qty") or 0)) <= 0:
             return
         software_stop = await self._effective_software_stop_price(
@@ -2657,8 +2603,14 @@ class Autopilot:
         entry_strategy: Optional[str] = None,
         entry_btc_regime: Optional[int] = None,
     ) -> Optional[Order]:
-        order_lock = f"order:{self.state.mode}:{symbol}:{side.value}"
-        if not storage.try_acquire_lock(order_lock, ttl_seconds=300.0, owner=self._owner):
+        # BUYs in different symbols compete for the same portfolio headroom.
+        order_lock = (
+            f"order:{self.state.mode}:portfolio:BUY"
+            if side is OrderSide.BUY
+            else f"order:{self.state.mode}:{symbol}:{side.value}"
+        )
+        order_owner = f"{self._owner}-{uuid.uuid4().hex[:8]}"
+        if not storage.try_acquire_lock(order_lock, ttl_seconds=300.0, owner=order_owner):
             log.warning("order skipped: another submission is active for %s %s", symbol, side.value)
             return None
         try:
@@ -2669,7 +2621,7 @@ class Autopilot:
                 entry_btc_regime=entry_btc_regime,
             )
         finally:
-            storage.release_lock(order_lock, owner=self._owner)
+            storage.release_lock(order_lock, owner=order_owner)
 
     async def _submit_locked(
         self,
@@ -2786,16 +2738,13 @@ class Autopilot:
                     )
                     # Exchange-native catastrophe backstop (OFF by default; the
                     # software risk loop stays primary). No-op when disabled.
-                    pos_row = storage.get_position(symbol)
+                    pos_row = storage.get_position(symbol, mode="live")
                     await self._place_protective_stop(
                         symbol, position_qty, Decimal(str(price)),
                         str((pos_row or {}).get("entry_ts") or ""),
                     )
                 else:
-                    pos = next(
-                        (p for p in storage.all_positions() if p["symbol"] == symbol and p["mode"] == "live"),
-                        None,
-                    )
+                    pos = storage.get_position(symbol, mode="live")
                     mfe_pct, mae_pct = risk.mfe_mae_pct(
                         symbol, Decimal(str((pos or {}).get("entry_price") or 0))
                     )
@@ -2805,14 +2754,17 @@ class Autopilot:
                     # entry's and this exit's commission are known and were
                     # paid in the quote asset (USDT). A commission paid in
                     # another asset (e.g. BNB fee discount) isn't directly a
-                    # USDT cost without a conversion we don't have here, and
-                    # mixing one real leg with one modeled leg would blur
-                    # `fee_source` — storage.reduce_position falls back to a
-                    # fully modeled estimate for the whole trade rather than
-                    # fabricate a partial number.
+                    # USDT cost without a conversion we don't have here. When
+                    # the entry fee was never recorded, pass None so
+                    # storage.reduce_position models BOTH legs instead of
+                    # booking only the exit leg as the whole fee.
                     actual_exit_fee_usdt = None
                     entry_fee = (pos or {}).get("entry_fee_usdt")
-                    if order.commission is not None and order.commission_asset == "USDT":
+                    if (
+                        entry_fee is not None
+                        and order.commission is not None
+                        and order.commission_asset == "USDT"
+                    ):
                         actual_exit_fee_usdt = float(order.commission)
                     storage.reduce_position(
                         symbol=symbol, mode="live", qty=filled, exit_price=price,
@@ -2877,6 +2829,9 @@ class Autopilot:
                 return False, "safety_state_unknown:entry_status", detail
             if entry_status.get("entry_halted"):
                 return False, "entry_status_halted", detail
+            block_reason = self._entry_block_reason()
+            if block_reason:
+                return False, block_reason, detail
             if qty <= 0 or not filters.is_listed(symbol):
                 return False, "exchange_filter_reject", detail
             price = await self._price(symbol)
@@ -2889,6 +2844,55 @@ class Autopilot:
             detail["order_notional"] = str(qty * price)
             if usdt_free < qty * price:
                 return False, "insufficient_usdt", detail
+            total_equity = Decimal(str(snapshot["total_usdt"]))
+            tripped, drawdown = risk.is_circuit_breaker_tripped(
+                starting_balance=self.state.starting_balance_usdt,
+                current_balance=total_equity,
+            )
+            detail["drawdown_pct"] = drawdown
+            if tripped:
+                return False, "drawdown_circuit_breaker", detail
+            daily_tripped, daily_pnl = risk.is_daily_loss_limit_tripped(
+                mode="live", starting_balance=self.state.starting_balance_usdt
+            )
+            detail["daily_realized_pnl"] = str(daily_pnl)
+            if daily_tripped:
+                return False, "daily_loss_limit", detail
+            positions = [p for p in storage.all_positions() if p["mode"] == "live"]
+            existing = next((p for p in positions if p["symbol"] == symbol), None)
+            current_notional = (
+                Decimal(str(existing["qty"])) * price if existing else None
+            )
+            open_count, _ = await self._count_non_dust_positions(
+                open_positions=positions,
+                balances={
+                    asset: Decimal(str(balance))
+                    for asset, balance in (snapshot.get("all_balances") or {}).items()
+                },
+            )
+            aggressive, _ = self._aggressive_mode_active()
+            entry_risk = RiskManager().evaluate_entry(
+                mode="live",
+                total_equity_usdt=total_equity,
+                open_positions=open_count,
+                long_exposure_pct=float(
+                    (total_equity - usdt_free) / total_equity
+                ) if total_equity > 0 else 0.0,
+                entry_price=price,
+                aggressive_mode=aggressive,
+                is_pyramid=existing is not None,
+                current_position_notional=current_notional,
+            )
+            detail["max_order_notional"] = str(entry_risk.notional_usdt)
+            if not entry_risk.allow:
+                return False, f"risk_manager:{entry_risk.reason}", detail
+            if qty * price > entry_risk.notional_usdt:
+                return False, "order_exceeds_risk_budget", detail
+            correlation_ok, correlation_why = await self._correlation_basket_gate(
+                symbol, qty * price, positions, total_equity
+            )
+            if not correlation_ok:
+                return False, f"correlation_gate:{correlation_why}", detail
             return True, "ok", detail
         except Exception as exc:  # noqa: BLE001
             detail["exception"] = str(exc)

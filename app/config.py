@@ -500,6 +500,12 @@ class Settings(BaseSettings):
     #     universe becomes actionable. Set ENTRY_STRATEGY=dip_buy in .env to
     #     revert to the tighter legacy entry.
     entry_strategy: str = Field("oversold_bounce", pattern="^(dip_buy|oversold_bounce)$")
+    # Secondary "pullback to EMA20" entry. Historically it fired in ADDITION to
+    # entry_strategy (an OR), so the config did not describe live behaviour.
+    # 3-fold OOS backtest of this entry alone: PF 0.96, expectancy -0.12%/pos,
+    # negative in the most recent fold (PF 0.64-0.72). OFF by default; set
+    # PULLBACK_ENTRY_ENABLED=true to restore the old dual-trigger behaviour.
+    pullback_entry_enabled: bool = False
     oversold_bounce_rsi_max: float = Field(40.0, ge=1.0, le=99.0)
     oversold_bounce_bb_multiplier: float = Field(1.02, ge=1.0, le=1.20)
     oversold_bounce_min_bounce_pct: float = Field(0.05, ge=0.0, le=0.50)

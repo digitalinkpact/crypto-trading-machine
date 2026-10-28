@@ -72,6 +72,22 @@ def make_entry_oversold_bounce(rsi_max: float, bb_mult: float, min_bounce_pct: f
 entry_oversold_bounce = make_entry_oversold_bounce(40.0, 1.02, 0.05)
 
 
+def entry_pullback(df: pd.DataFrame, i: int) -> bool:
+    """Mirror of ProfitStreamStrategy._pullback_setup — the LIVE entry since
+    2026-09-10: close above EMA20 and EMA50, within 7% of EMA20, RSI 35..70."""
+    row = df.iloc[i]
+    ema20 = float(row["ema_20"])
+    if ema20 <= 0:
+        return False
+    close = float(row["close"])
+    return bool(
+        close > ema20
+        and close > float(row["ema_50"])
+        and (close - ema20) / ema20 <= 0.07
+        and 35 <= float(row["rsi_14"]) <= 70
+    )
+
+
 # ── Trade / params containers ───────────────────────────────────────────
 
 @dataclass
@@ -88,6 +104,9 @@ class LadderParams:
     mean_reversion_min_pnl: float
     mean_reversion_require_confirmation: bool
     fee_rate: float
+    # Live default is OFF (Settings.mean_reversion_exit_enabled); when False the
+    # RSI-recovery exit never fires and positions are managed by the ladder only.
+    mean_reversion_enabled: bool = True
     # ATR-scaled stop (mirrors risk.dynamic_stop_pct): stop = clamp(mult*atr_pct,
     # min, max), computed from the entry bar's ATR. When disabled, the fixed
     # stop_loss_pct is used. This is the LIVE stop, so modelling it is required
@@ -101,6 +120,11 @@ class LadderParams:
     stale_exit_enabled: bool = True
     stale_exit_days: int = 2
     stale_exit_max_pnl: float = 0.02
+    # Breakeven stop after TP1 fills: once the first scale-out banks profit, the
+    # remainder's hard stop is lifted to entry * (1 + breakeven_offset) so a
+    # partial winner can no longer round-trip into a full-size stop_loss.
+    breakeven_after_tp1: bool = False
+    breakeven_offset: float = 0.0
 
 
 def default_params(**overrides) -> LadderParams:
@@ -121,6 +145,7 @@ def default_params(**overrides) -> LadderParams:
             or s.mean_reversion_exit_require_price_confirmation
         ),
         fee_rate=s.binance_taker_fee,
+        mean_reversion_enabled=getattr(s, "mean_reversion_exit_enabled", False),
         atr_stop_enabled=getattr(s, "atr_stop_enabled", True),
         atr_stop_min=getattr(s, "atr_stop_min_pct", 0.03),
         atr_stop_max=getattr(s, "atr_stop_max_pct", 0.08),
@@ -128,6 +153,8 @@ def default_params(**overrides) -> LadderParams:
         stale_exit_enabled=getattr(s, "stale_exit_enabled", True),
         stale_exit_days=max(1, int(getattr(s, "stale_exit_hours", 48) / 24)),
         stale_exit_max_pnl=getattr(s, "stale_exit_max_pnl_pct", 0.02),
+        breakeven_after_tp1=getattr(s, "breakeven_after_tp1_enabled", False),
+        breakeven_offset=getattr(s, "breakeven_after_tp1_offset_pct", 0.0),
     )
     base.update(overrides)
     return LadderParams(**base)
@@ -240,7 +267,8 @@ def simulate_symbol(
 
         def _mean_reversion_hit() -> bool:
             return bool(
-                row.get("rsi_14", 0) > params.mean_reversion_rsi
+                params.mean_reversion_enabled
+                and row.get("rsi_14", 0) > params.mean_reversion_rsi
                 and change >= params.mean_reversion_min_pnl
                 and change < params.trail_activation  # defer to the ladder above this
                 and (
@@ -252,6 +280,8 @@ def simulate_symbol(
 
         if mean_reversion_priority and _mean_reversion_hit():
             exit_reason, exit_qty = "mean_reversion_rsi", qty
+        elif tp1_taken and params.breakeven_after_tp1 and change <= params.breakeven_offset:
+            exit_reason, exit_qty = "breakeven_stop", qty
         elif change <= -stop_frac:
             exit_reason, exit_qty = "stop_loss", qty
         elif not tp1_taken and change >= params.tp1_pct:
@@ -598,15 +628,15 @@ async def sweep_rsi_exit(frames: dict[str, pd.DataFrame], folds: int, market_fil
     )
     variants = {
         "old(rsi=55,min_pnl=0.0%,no_confirm)": default_params(
-            mean_reversion_rsi=55, mean_reversion_min_pnl=0.0,
+            mean_reversion_enabled=True, mean_reversion_rsi=55, mean_reversion_min_pnl=0.0,
             mean_reversion_require_confirmation=False,
         ),
         "current(rsi=55,min_pnl=0.0%,confirm)": default_params(
-            mean_reversion_rsi=55, mean_reversion_min_pnl=0.0,
+            mean_reversion_enabled=True, mean_reversion_rsi=55, mean_reversion_min_pnl=0.0,
             mean_reversion_require_confirmation=True,
         ),
         "proposed(rsi=60,min_pnl=0.25%,confirm)": default_params(
-            mean_reversion_rsi=60, mean_reversion_min_pnl=0.0025,
+            mean_reversion_enabled=True, mean_reversion_rsi=60, mean_reversion_min_pnl=0.0025,
             mean_reversion_require_confirmation=True,
         ),
     }
@@ -727,9 +757,180 @@ async def sweep_breadth(frames: dict[str, pd.DataFrame], folds: int, market_filt
             print(f"    vs btc_regime [POS]: {'IMPROVES' if better else 'no (exp/PF/dd test)'}")
 
 
-async def main_async(which: str, tf: Timeframe, folds: int, bars: int, market_filter: bool) -> None:
+def _fold_verdict(base_folds: list[Metrics], cand_folds: list[Metrics], cand: Metrics) -> str:
+    """Acceptance rule (2026-10-17 tuning pass): OOS position win-rate must
+    improve in >= 2 of 3 folds, pooled PF >= 1.3, pooled expectancy > 0, and
+    pooled max_dd not worse than baseline."""
+    pairs = [(b, c) for b, c in zip(base_folds, cand_folds) if b.n >= 10 and c.n >= 10]
+    wr_up = sum(c.win_rate > b.win_rate for b, c in pairs)
+    pf_up = sum(c.profit_factor > b.profit_factor for b, c in pairs)
+    return (
+        f"wr_up={wr_up}/{len(pairs)} pf_up={pf_up}/{len(pairs)} "
+        f"pf={cand.profit_factor:.2f} exp={cand.expectancy_pct:+.2%} dd={cand.max_drawdown_pct:.1%}"
+    )
+
+
+async def sweep_exits(
+    frames: dict[str, pd.DataFrame], folds: int, market_filter: bool,
+    entry_fn: EntryFn = entry_pullback,
+) -> None:
+    """Phase-4 exit sweep: ONE parameter at a time around the live defaults,
+    pullback entry (the live entry), POSITION-level metrics per fold."""
+    print("\n### EXIT SWEEP — one parameter at a time, pullback entry, POSITION level ###")
+    base = default_params()
+    print(
+        f"live: tp1={base.tp1_pct:.0%}x{base.tp1_frac:.0%} tp2={base.tp2_pct:.0%}x{base.tp2_frac:.0%} "
+        f"trail act={base.trail_activation:.1%} dist={base.trail_distance:.1%} "
+        f"atr_stop x{base.atr_stop_multiple} [{base.atr_stop_min:.0%},{base.atr_stop_max:.0%}] "
+        f"stale {base.stale_exit_days}d<{base.stale_exit_max_pnl:.0%} max_hold {base.max_hold_days}d "
+        f"fee {base.fee_rate:.4%}"
+    )
+    groups: dict[str, dict[str, LadderParams]] = {
+        "TAKE_PROFIT_1_PCT": {f"tp1={v:.0%}": default_params(tp1_pct=v) for v in (0.03, 0.04, 0.05, 0.06, 0.07, 0.08)},
+        "TAKE_PROFIT_1_FRACTION": {f"tp1_frac={v:.0%}": default_params(tp1_frac=v) for v in (0.25, 0.50, 0.75, 1.0)},
+        "TRAILING_ACTIVATION_PCT": {f"trail_act={v:.1%}": default_params(trail_activation=v) for v in (0.02, 0.03, 0.04, 0.05, 0.06)},
+        "TRAILING_STOP_PCT": {f"trail_dist={v:.1%}": default_params(trail_distance=v) for v in (0.015, 0.02, 0.03, 0.04)},
+        "STALE_EXIT_HOURS": {f"stale={d}d": default_params(stale_exit_days=d) for d in (1, 2, 3, 4, 5)}
+        | {"stale=off": default_params(stale_exit_enabled=False)},
+        "ATR_STOP_MULTIPLE": {f"atr_mult={v}": default_params(atr_stop_multiple=v) for v in (1.0, 1.5, 2.0, 2.5, 3.0)},
+        "ATR_STOP_MAX_PCT": {f"atr_max={v:.0%}": default_params(atr_stop_max=v) for v in (0.04, 0.05, 0.06, 0.08)},
+        "BREAKEVEN_AFTER_TP1": {
+            "breakeven=off": default_params(breakeven_after_tp1=False),
+            "breakeven=entry": default_params(breakeven_after_tp1=True, breakeven_offset=0.0),
+            "breakeven=entry+0.5%": default_params(breakeven_after_tp1=True, breakeven_offset=0.005),
+        },
+    }
+    base_trades, base_fold_trades = _collect_sweep_trades(
+        frames, entry_fn, base, folds=folds, market_filter=market_filter,
+    )
+    base_pos = aggregate_positions(base_trades)
+    base_folds = [aggregate_positions(ft) for ft in base_fold_trades]
+    print()
+    print_leg_and_position("LIVE BASELINE", base_trades)
+    for f, fm in enumerate(base_folds):
+        print_metrics(f"    fold {f} [POS]", fm)
+    for group, variants in groups.items():
+        print(f"\n--- {group} ---")
+        for name, params in variants.items():
+            trades, fold_trades = _collect_sweep_trades(
+                frames, entry_fn, params, folds=folds, market_filter=market_filter,
+            )
+            pos = aggregate_positions(trades)
+            cand_folds = [aggregate_positions(ft) for ft in fold_trades]
+            print_metrics(name, pos)
+            for f, fm in enumerate(cand_folds):
+                print_metrics(f"    fold {f} [POS]", fm)
+            mix = exit_reason_mix(trades)
+            print("    exit mix: " + ", ".join(f"{k}={v}" for k, v in mix.items()))
+            print(f"    verdict vs baseline: {_fold_verdict(base_folds, cand_folds, pos)}")
+
+
+async def sweep_ladder(
+    frames: dict[str, pd.DataFrame], folds: int, market_filter: bool,
+    entry_fn: EntryFn = entry_pullback,
+) -> None:
+    """Joint exit-LADDER sweep: coherent candidate shapes tested as a unit.
+
+    `exits` moves one knob at a time, which cannot detect a shape problem. The
+    live ladder (-3..-8% ATR stop vs +8% TP1 on half, trail from +5%) needs a
+    high win rate to be positive; this sweep tests tighter stop / earlier, fuller
+    take-profit / earlier trail combinations against the SAME entry and the SAME
+    folds. Backtest only — nothing here touches live config.
+    """
+    print("\n### LADDER SWEEP — joint exit shapes, pullback entry, POSITION level, per fold ###")
+    base = default_params()
+    print(
+        f"live: atr_stop x{base.atr_stop_multiple} [{base.atr_stop_min:.0%},{base.atr_stop_max:.0%}] "
+        f"tp1={base.tp1_pct:.0%}x{base.tp1_frac:.0%} tp2={base.tp2_pct:.0%}x{base.tp2_frac:.0%} "
+        f"trail act={base.trail_activation:.1%} dist={base.trail_distance:.1%} "
+        f"breakeven={'on' if base.breakeven_after_tp1 else 'off'} fee {base.fee_rate:.4%}"
+    )
+    # Each candidate is a complete, internally-consistent ladder. Names encode
+    # stop / tp1 / trail so the printout is self-describing.
+    candidates: dict[str, LadderParams] = {
+        "A tight: stop[2,4] tp1 4%x100% trail 2%/1.5%": default_params(
+            atr_stop_min=0.02, atr_stop_max=0.04, atr_stop_multiple=1.5,
+            tp1_pct=0.04, tp1_frac=1.0, tp2_pct=0.99, tp2_frac=0.0,
+            trail_activation=0.02, trail_distance=0.015,
+        ),
+        "B balanced: stop[2,5] tp1 5%x50% tp2 10%x50% trail 3%/2% BE": default_params(
+            atr_stop_min=0.02, atr_stop_max=0.05, atr_stop_multiple=1.5,
+            tp1_pct=0.05, tp1_frac=0.5, tp2_pct=0.10, tp2_frac=0.5,
+            trail_activation=0.03, trail_distance=0.02,
+            breakeven_after_tp1=True, breakeven_offset=0.0,
+        ),
+        "C trail-only: stop[2,5] no TP trail 2.5%/2%": default_params(
+            atr_stop_min=0.02, atr_stop_max=0.05, atr_stop_multiple=1.5,
+            tp1_pct=0.99, tp1_frac=0.0, tp2_pct=0.99, tp2_frac=0.0,
+            trail_activation=0.025, trail_distance=0.02,
+        ),
+        "D live+BE: live ladder + breakeven after TP1": default_params(
+            breakeven_after_tp1=True, breakeven_offset=0.0,
+        ),
+        "E live tighter stop: stop[2,5] else live": default_params(
+            atr_stop_min=0.02, atr_stop_max=0.05, atr_stop_multiple=1.5,
+        ),
+        "F 1:1 R: stop[3,4] tp1 4%x100% no trail": default_params(
+            atr_stop_min=0.03, atr_stop_max=0.04, atr_stop_multiple=1.5,
+            tp1_pct=0.04, tp1_frac=1.0, tp2_pct=0.99, tp2_frac=0.0,
+            trail_activation=0.99, trail_distance=0.99,
+        ),
+    }
+    base_trades, base_fold_trades = _collect_sweep_trades(
+        frames, entry_fn, base, folds=folds, market_filter=market_filter,
+    )
+    base_pos = aggregate_positions(base_trades)
+    base_folds = [aggregate_positions(ft) for ft in base_fold_trades]
+    print()
+    print_leg_and_position("LIVE BASELINE", base_trades)
+    for f, fm in enumerate(base_folds):
+        print_metrics(f"    fold {f} [POS]", fm)
+    print("    exit mix: " + ", ".join(f"{k}={v}" for k, v in exit_reason_mix(base_trades).items()))
+
+    ranked: list[tuple[str, Metrics, list[Metrics], dict[str, int]]] = []
+    for name, params in candidates.items():
+        trades, fold_trades = _collect_sweep_trades(
+            frames, entry_fn, params, folds=folds, market_filter=market_filter,
+        )
+        pos = aggregate_positions(trades)
+        cand_folds = [aggregate_positions(ft) for ft in fold_trades]
+        ranked.append((name, pos, cand_folds, exit_reason_mix(trades)))
+        print()
+        print_metrics(name, pos)
+        for f, fm in enumerate(cand_folds):
+            print_metrics(f"    fold {f} [POS]", fm)
+        print("    exit mix: " + ", ".join(f"{k}={v}" for k, v in ranked[-1][3].items()))
+        print(f"    verdict vs baseline: {_fold_verdict(base_folds, cand_folds, pos)}")
+
+    # Summary table: pooled position-level, sorted by expectancy. Promotion gate
+    # mirrors docs/research/promotion_criteria.md (PF > 1.5, expectancy > 0) and
+    # requires the win-rate to improve in >= 2/3 OOS folds vs live.
+    print("\n--- SUMMARY (pooled POSITION-level, sorted by expectancy) ---")
+    print(f"{'ladder':62s} {'n':>4s} {'win%':>6s} {'exp':>8s} {'PF':>6s} {'maxDD':>7s} folds  gate")
+    print(f"{'LIVE BASELINE':62s} {base_pos.n:4d} {base_pos.win_rate:6.1%} {base_pos.expectancy_pct:+8.2%} "
+          f"{base_pos.profit_factor:6.2f} {base_pos.max_drawdown_pct:7.1%}   —    —")
+    for name, pos, cand_folds, _ in sorted(ranked, key=lambda r: r[1].expectancy_pct, reverse=True):
+        pairs = [(b, c) for b, c in zip(base_folds, cand_folds) if b.n >= 10 and c.n >= 10]
+        wr_up = sum(c.win_rate > b.win_rate for b, c in pairs)
+        gate = (
+            "PASS" if (pos.n >= 30 and pos.expectancy_pct > 0 and pos.profit_factor > 1.5
+                       and len(pairs) >= 2 and wr_up >= 2
+                       and pos.max_drawdown_pct <= base_pos.max_drawdown_pct + 1e-9)
+            else "no"
+        )
+        print(f"{name:62s} {pos.n:4d} {pos.win_rate:6.1%} {pos.expectancy_pct:+8.2%} "
+              f"{pos.profit_factor:6.2f} {pos.max_drawdown_pct:7.1%} {wr_up}/{len(pairs)}   {gate}")
+    print("\nPASS = n>=30, exp>0, PF>1.5, win-rate up in >=2 folds, maxDD not worse than live. "
+          "Advisory only — nothing is applied.")
+
+
+async def main_async(
+    which: str, tf: Timeframe, folds: int, bars: int, market_filter: bool,
+    symbols: list[str] | None = None,
+) -> None:
     print(f"Loading up to {bars} {tf.value} bars per symbol...")
-    frames = await _load_frames(tf, bars)
+    from app.data import OHLCVRepository
+    frames = await _load(OHLCVRepository(), tf, bars, symbols)
     if not frames:
         print("No usable symbols.")
         return
@@ -745,17 +946,25 @@ async def main_async(which: str, tf: Timeframe, folds: int, bars: int, market_fi
         await sweep_stop_stale(frames, folds, market_filter)
     if which in ("breadth", "all"):
         await sweep_breadth(frames, folds, market_filter)
+    if which in ("exits", "all"):
+        await sweep_exits(frames, folds, market_filter)
+    if which in ("ladder", "all"):
+        await sweep_ladder(frames, folds, market_filter)
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("which", choices=["entry", "rsi_exit", "trailing", "stop_stale", "breadth", "all"], default="all", nargs="?")
+    p.add_argument("which", choices=["entry", "rsi_exit", "trailing", "stop_stale", "breadth", "exits", "ladder", "all"], default="all", nargs="?")
     p.add_argument("--timeframe", default="1d", choices=[t.value for t in Timeframe])
     p.add_argument("--folds", type=int, default=3)
     p.add_argument("--bars", type=int, default=1000)
     p.add_argument("--market-filter", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--symbols", nargs="*", default=None,
+                   help="override the symbol universe (default: app.config.SYMBOLS)")
     args = p.parse_args()
-    asyncio.run(main_async(args.which, Timeframe(args.timeframe), args.folds, args.bars, args.market_filter))
+    asyncio.run(main_async(
+        args.which, Timeframe(args.timeframe), args.folds, args.bars, args.market_filter, args.symbols,
+    ))
 
 
 if __name__ == "__main__":

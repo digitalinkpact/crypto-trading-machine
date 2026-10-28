@@ -90,6 +90,25 @@ def test_positions_are_isolated_by_mode(tmp_path):
     assert remaining[0]["mode"] == "paper"
 
 
+def test_discard_position_does_not_fabricate_closed_trade_or_fee_loss(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(
+        symbol="BTCUSDT", mode="live", qty=1.0, entry_price=100.0,
+        agents=["test-agent"],
+    )
+    s.open_position(
+        symbol="BTCUSDT", mode="paper", qty=2.0, entry_price=100.0,
+        agents=["test-agent"],
+    )
+
+    assert s.discard_position(symbol="BTCUSDT", mode="live") is True
+    assert s.discard_position(symbol="BTCUSDT", mode="live") is False
+    assert s.get_position("BTCUSDT", mode="live") is None
+    assert s.get_position("BTCUSDT", mode="paper")["qty"] == 2.0
+    assert s.closed_trades(limit=10) == []
+    assert s.agent_stats() == []
+
+
 def test_closed_positions_groups_partial_exit_rows(tmp_path):
     s = _fresh_storage(tmp_path)
 

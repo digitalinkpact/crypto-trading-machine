@@ -214,7 +214,7 @@ def test_max_long_exposure_cap():
     assert "long_exposure" in why
 
 
-def test_daily_loss_limit_trips_on_todays_realized_losses(monkeypatch):
+def test_daily_loss_limit_trips_on_todays_realized_losses(monkeypatch, tmp_path):
     """Distinct from the cumulative drawdown breaker: sums only TODAY's
     realized pnl and halts new BUYs once it exceeds daily_loss_limit_pct."""
     now = datetime.now(timezone.utc)
@@ -227,7 +227,7 @@ def test_daily_loss_limit_trips_on_todays_realized_losses(monkeypatch):
         # Different mode must not bleed into this mode's total.
         {"mode": "paper", "pnl": -1000.0, "exit_ts": now.isoformat()},
     ]
-    monkeypatch.setattr(risk.storage, "closed_trades", lambda limit=500: trades, raising=True)
+    _patch_daily_trades(monkeypatch, tmp_path, trades)
 
     tripped, today_pnl = risk.is_daily_loss_limit_tripped(
         mode="live", starting_balance=Decimal("1000"), now=now
@@ -236,10 +236,10 @@ def test_daily_loss_limit_trips_on_todays_realized_losses(monkeypatch):
     assert today_pnl == Decimal("-110.0")
 
 
-def test_daily_loss_limit_not_tripped_within_band(monkeypatch):
+def test_daily_loss_limit_not_tripped_within_band(monkeypatch, tmp_path):
     now = datetime.now(timezone.utc)
     trades = [{"mode": "live", "pnl": -10.0, "exit_ts": now.isoformat()}]
-    monkeypatch.setattr(risk.storage, "closed_trades", lambda limit=500: trades, raising=True)
+    _patch_daily_trades(monkeypatch, tmp_path, trades)
 
     tripped, today_pnl = risk.is_daily_loss_limit_tripped(
         mode="live", starting_balance=Decimal("1000"), now=now
@@ -259,6 +259,48 @@ def test_daily_loss_limit_disabled_never_trips(monkeypatch):
     )
     assert tripped is False
     assert pnl == Decimal("0")
+
+
+def _patch_daily_trades(monkeypatch, tmp_path, trades):
+    from app.storage.db import Storage
+
+    store = Storage(path=tmp_path / "daily.db")
+    with store._conn() as c:
+        c.executemany(
+            "INSERT INTO closed_trades "
+            "(mode,symbol,qty,entry_price,exit_price,pnl,pnl_pct,entry_ts,exit_ts,agents) "
+            "VALUES (?, 'BTCUSDT', 1, 100, 100, ?, 0, ?, ?, '[]')",
+            [(t["mode"], t["pnl"], t["exit_ts"], t["exit_ts"]) for t in trades],
+        )
+    monkeypatch.setattr(risk, "storage", store)
+
+
+def test_daily_loss_limit_counts_losses_beyond_latest_500_exits(monkeypatch, tmp_path):
+    now = datetime(2026, 10, 22, 18, tzinfo=timezone.utc)
+    trades = [
+        {"mode": "live", "pnl": -60, "exit_ts": now.isoformat()},
+        *[{"mode": "paper", "pnl": 1, "exit_ts": now.isoformat()} for _ in range(501)],
+    ]
+    _patch_daily_trades(monkeypatch, tmp_path, trades)
+    tripped, pnl = risk.is_daily_loss_limit_tripped(
+        mode="live", starting_balance=Decimal("1000"), now=now
+    )
+    assert tripped
+    assert pnl == Decimal("-60")
+
+
+def test_daily_loss_uses_utc_not_timestamp_local_date(monkeypatch, tmp_path):
+    trades = [
+        {"mode": "live", "pnl": -60, "exit_ts": "2026-10-23T01:00:00+03:00"},
+        {"mode": "live", "pnl": -1000, "exit_ts": "2026-10-22T01:00:00+03:00"},
+    ]
+    _patch_daily_trades(monkeypatch, tmp_path, trades)
+    tripped, pnl = risk.is_daily_loss_limit_tripped(
+        mode="live", starting_balance=Decimal("1000"),
+        now=datetime.fromisoformat("2026-10-23T01:30:00+03:00"),
+    )
+    assert tripped
+    assert pnl == Decimal("-60")
 
 
 def test_lwm_tracks_the_lowest_price_seen():

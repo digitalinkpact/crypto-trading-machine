@@ -179,3 +179,90 @@ def test_open_position_accumulates_entry_fee_across_pyramid_adds(tmp_path):
     )
     pos = s.get_position("ETHUSDT")
     assert pos["entry_fee_usdt"] == pytest.approx(0.042)
+
+
+# ── fee accounting: an unknown leg is modeled, never dropped ──────────────
+
+
+def _taker_fee() -> float:
+    from app.config import get_settings
+
+    return float(get_settings().binance_taker_fee)
+
+
+def test_reduce_position_exit_fee_without_entry_fee_models_entry_leg(tmp_path):
+    """Regression: a real EXIT commission with no recorded entry fee used to
+    book ONLY the exit leg (entry fee silently dropped) under fee_source=actual."""
+    s = _fresh_storage(tmp_path)
+    s.open_position(symbol="ETHUSDT", mode="live", qty=1.0, entry_price=100.0, agents=[])
+    result = s.reduce_position(
+        symbol="ETHUSDT", mode="live", qty=1.0, exit_price=110.0,
+        actual_exit_fee_usdt=0.05,
+    )
+    modeled_entry = 100.0 * 1.0 * _taker_fee()
+    assert result["fee_source"] == "mixed"
+    assert result["fee_amount"] == pytest.approx(modeled_entry + 0.05)
+    assert result["pnl"] == pytest.approx(10.0 - modeled_entry - 0.05)
+
+
+def test_reduce_position_both_legs_real_is_actual(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(
+        symbol="ETHUSDT", mode="live", qty=1.0, entry_price=100.0, agents=[],
+        entry_fee_usdt=0.04,
+    )
+    result = s.reduce_position(
+        symbol="ETHUSDT", mode="live", qty=1.0, exit_price=110.0,
+        actual_exit_fee_usdt=0.05,
+    )
+    assert result["fee_source"] == "actual"
+    assert result["fee_amount"] == pytest.approx(0.09)
+
+
+def test_close_position_exit_fee_only_keeps_entry_leg(tmp_path):
+    """close_position (exchange_stop path) must charge the entry leg when the
+    caller only knows the exit leg's real commission."""
+    s = _fresh_storage(tmp_path)
+    s.open_position(symbol="ADAUSDT", mode="live", qty=100.0, entry_price=1.0, agents=[])
+    result = s.close_position(
+        symbol="ADAUSDT", mode="live", exit_price=0.95, exit_reason="exchange_stop",
+        actual_exit_fee_usdt=0.07,
+    )
+    modeled_entry = 1.0 * 100.0 * _taker_fee()
+    assert result["fee_source"] == "mixed"
+    assert result["fee_amount"] == pytest.approx(modeled_entry + 0.07)
+    assert result["pnl"] == pytest.approx(-5.0 - modeled_entry - 0.07)
+
+
+def test_close_position_exit_fee_with_recorded_entry_fee_is_actual(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(
+        symbol="ADAUSDT", mode="live", qty=100.0, entry_price=1.0, agents=[],
+        entry_fee_usdt=0.02,
+    )
+    result = s.close_position(
+        symbol="ADAUSDT", mode="live", exit_price=1.10, actual_exit_fee_usdt=0.03,
+    )
+    assert result["fee_source"] == "actual"
+    assert result["fee_amount"] == pytest.approx(0.05)
+
+
+def test_close_position_total_actual_fee_still_wins(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(symbol="ADAUSDT", mode="live", qty=100.0, entry_price=1.0, agents=[])
+    result = s.close_position(
+        symbol="ADAUSDT", mode="live", exit_price=1.10, actual_fee_usdt=0.11,
+    )
+    assert result["fee_source"] == "actual"
+    assert result["fee_amount"] == pytest.approx(0.11)
+
+
+def test_get_position_with_mode_never_returns_other_book(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(symbol="BTCUSDT", mode="live", qty=1.0, entry_price=100.0, agents=[])
+    s.open_position(symbol="BTCUSDT", mode="paper", qty=2.0, entry_price=200.0, agents=[])
+    assert s.get_position("BTCUSDT", mode="paper")["qty"] == 2.0
+    assert s.get_position("BTCUSDT", mode="live")["qty"] == 1.0
+    assert s.get_position("ETHUSDT", mode="paper") is None
+    # Legacy mode-less form keeps its live-first preference.
+    assert s.get_position("BTCUSDT")["mode"] == "live"
