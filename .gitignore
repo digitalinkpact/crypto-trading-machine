@@ -16,8 +16,11 @@ build/
 .DS_Store
 data/cache/
 data/cache*/
+data/live_export/
 *.sqlite
 *.db
+*.db-shm
+*.db-wal
 .ipynb_checkpoints/
 logs/
 *.log
