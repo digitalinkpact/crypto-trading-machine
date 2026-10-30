@@ -697,6 +697,22 @@ async def test_execute_sell_rejects_live_balance_without_local_position(monkeypa
         return True
 
     monkeypatch.setattr(autopilot_module, "get_settings", lambda: _Settings())
+    from types import SimpleNamespace
+    from app.trading import risk_manager as risk_manager_module
+    monkeypatch.setattr(
+        risk_manager_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            rollback_max_open_positions=12,
+            rollback_position_pct=0.03,
+            max_long_exposure_pct=0.60,
+            risk_per_trade_pct=0.01,
+            stop_loss_pct=0.04,
+            kelly_fraction_cap=0.25,
+            loss_streak_pause_count=3,
+            loss_streak_pause_minutes=60,
+        ),
+    )
     monkeypatch.setattr(autopilot_module, "portfolio_snapshot", _fake_snapshot)
     monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [])
     monkeypatch.setattr(autopilot_module, "online_regime", autopilot_module.online_regime)
