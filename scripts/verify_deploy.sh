@@ -39,7 +39,10 @@ UNIT_SRC="$APP_DIR/deploy/systemd/$SERVICE.service"
 UNIT_DST="/etc/systemd/system/$SERVICE.service"
 if diff -q "$UNIT_SRC" "$UNIT_DST" >/dev/null 2>&1; then pass "installed unit == repo unit"; else
   fail "installed unit differs from $UNIT_SRC (re-run scripts/bootstrap_droplet.sh)"; fi
-RUN_REV=$(journalctl -u "$SERVICE" --no-pager -o cat 2>/dev/null | grep -o 'BOT_REVISION=[0-9a-f]\{7,40\}' | tail -1 | cut -d= -f2)
+# Only read the journal since the service last (re)started: BOT_REVISION is logged
+# once per start, and scanning the whole journal can take minutes on a long-lived box.
+SINCE=$(systemctl show "$SERVICE" -p ActiveEnterTimestamp --value 2>/dev/null)
+RUN_REV=$(timeout 60 journalctl -u "$SERVICE" --since "${SINCE:-1 hour ago}" --no-pager -o cat 2>/dev/null | grep -o 'BOT_REVISION=[0-9a-f]\{7,40\}' | tail -1 | cut -d= -f2)
 echo "journal BOT_REVISION=${RUN_REV:-<none>}"
 if [[ -n "$RUN_REV" && "$RUN_REV" == "$HEAD_SHA" ]]; then pass "running process loaded HEAD"; else
   fail "running revision (${RUN_REV:-none}) != HEAD — restart: systemctl restart $SERVICE"; fi
