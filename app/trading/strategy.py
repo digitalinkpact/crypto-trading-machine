@@ -250,7 +250,7 @@ class ProfitStreamStrategy:
         # One spread cap for every entry type (the pullback path used to get a
         # 4x looser 1% cap — the lowest-quality setup got the widest book), and
         # an unverifiable spread blocks the entry instead of passing it.
-        max_spread_pct = float(s.max_spread_pct)
+        max_spread_pct = float(s.signal_max_spread_pct)
         if spread_pct is None:
             filt_ok = False
             reasons.append("spread_unknown")

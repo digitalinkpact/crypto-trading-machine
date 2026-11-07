@@ -95,7 +95,7 @@ any mismatch. It checks:
    `universe_size` (<= 75), `final_pairlist_size` (<= 50), `stop_loss_pct` and
    `atr_stop_min_pct` (>= 0.04), `profitstream_score_threshold` (>= 80),
    `win_rate_position_level` (true), `mean_reversion_exit_enabled` (false), the
-   trend/BTC/pullback gates, and the spread caps;
+   trend/BTC/pullback/breadth gates, and the signal spread cap (the execution order-book spread caps are reported as advisory warnings);
 3. `crypto-bot` is active, its unit file equals `deploy/systemd/crypto-bot.service`,
    and the LAST `BOT_REVISION=` line in the journal equals `HEAD` (so the running
    process loaded the code you pulled, not an older commit);

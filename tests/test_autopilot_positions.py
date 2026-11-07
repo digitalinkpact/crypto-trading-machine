@@ -709,6 +709,22 @@ async def test_execute_sell_rejects_live_balance_without_local_position(monkeypa
         return True
 
     monkeypatch.setattr(autopilot_module, "get_settings", lambda: _Settings())
+    from types import SimpleNamespace
+    from app.trading import risk_manager as risk_manager_module
+    monkeypatch.setattr(
+        risk_manager_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            rollback_max_open_positions=12,
+            rollback_position_pct=0.03,
+            max_long_exposure_pct=0.60,
+            risk_per_trade_pct=0.01,
+            stop_loss_pct=0.04,
+            kelly_fraction_cap=0.25,
+            loss_streak_pause_count=3,
+            loss_streak_pause_minutes=60,
+        ),
+    )
     monkeypatch.setattr(autopilot_module, "portfolio_snapshot", _fake_snapshot)
     monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [])
     monkeypatch.setattr(autopilot_module, "online_regime", autopilot_module.online_regime)
@@ -1473,7 +1489,8 @@ async def test_correlation_basket_gate_symbol_not_in_group_allows(monkeypatch):
 
 
 async def _run_ob_retry(monkeypatch, *, market=(True, "ok"), regime=2, breaker=False,
-                        halt=None, trend=(True, "ok"), blocked=(), quality=100):
+                        halt=None, trend=(True, "ok"), blocked=(), quality=100,
+                        breadth=(True, "ok")):
     """Drive _retry_orderbook_recheck with all collaborators stubbed; returns
     the list of BUYs it actually placed."""
     ap = Autopilot()
@@ -1502,6 +1519,9 @@ async def _run_ob_retry(monkeypatch, *, market=(True, "ok"), regime=2, breaker=F
         _self._last_regime_score = regime
         return market
 
+    async def _breadth_gate(_self):
+        return breadth
+
     monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
     monkeypatch.setattr(autopilot_module, "portfolio_snapshot", _snapshot)
     monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [])
@@ -1509,6 +1529,7 @@ async def _run_ob_retry(monkeypatch, *, market=(True, "ok"), regime=2, breaker=F
     monkeypatch.setattr(Autopilot, "_entry_block_reason", lambda _self: halt, raising=True)
     monkeypatch.setattr(Autopilot, "_check_circuit_breaker", lambda *_a, **_k: asyncio.sleep(0, result=breaker), raising=True)
     monkeypatch.setattr(Autopilot, "_market_gate", _market_gate, raising=True)
+    monkeypatch.setattr(Autopilot, "_breadth_gate", _breadth_gate, raising=True)
     monkeypatch.setattr(Autopilot, "_trend_gate", lambda *_a, **_k: asyncio.sleep(0, result=trend), raising=True)
     monkeypatch.setattr(Autopilot, "_price", lambda *_a, **_k: asyncio.sleep(0, result=Decimal("10")), raising=True)
     monkeypatch.setattr(Autopilot, "_place_buy", _place_buy, raising=True)
@@ -1540,6 +1561,7 @@ async def test_orderbook_retry_places_buy_when_every_gate_still_passes(monkeypat
     "kwargs",
     [
         {"market": (False, "BTC bear")},
+        {"breadth": (False, "breadth 20%<50%")},
         {"breaker": True},
         {"halt": "emergency_halt"},
         {"trend": (False, "downtrend")},

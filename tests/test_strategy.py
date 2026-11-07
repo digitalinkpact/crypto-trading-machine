@@ -647,3 +647,21 @@ async def test_pullback_score_is_capped_by_richer_candidate_score(monkeypatch):
     assert marginal.action == SignalAction.BUY
     assert marginal.score == 75 < 80
     assert marginal.indicators["pullback_candidate_score"] == 75
+
+
+async def test_signal_spread_cap_is_independent_of_execution_gate_setting(monkeypatch):
+    """A loose MAX_SPREAD_PCT in .env (execution order-book gate) must NOT loosen
+    which setups become BUY signals."""
+    import app.trading.strategy as strategy_module
+    from app.config import get_settings as real_get_settings
+
+    strategy = ProfitStreamStrategy()
+    _pullback_setup_env(monkeypatch, strategy, _pullback_frame(close=101, rsi=50, ema20=100), 0.004)
+    real = real_get_settings()
+    monkeypatch.setattr(
+        strategy_module, "get_settings",
+        lambda: real.model_copy(update={"max_spread_pct": 0.005, "aggressive_max_spread_pct": 0.005}),
+    )
+    decision = await strategy.analyze_symbol("ETHUSDT", mode="live")
+    assert decision.action == SignalAction.HOLD
+    assert "spread_wide:0.4000%>0.2500%" in decision.reasons

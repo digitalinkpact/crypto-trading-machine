@@ -71,6 +71,11 @@ async def test_startup_blocks_entries_when_prior_order_outcome_is_unknown(monkey
         main.watchdog, "trigger_emergency_halt",
         lambda reason, *, level: halts.append((reason, level)),
     )
+    monkeypatch.setattr(
+        main.watchdog,
+        "_verify_safe_to_resume",
+        lambda _mode: _async_result((True, "balances/positions/orders verified")),
+    )
 
     await main.verify_before_trading()
 
@@ -148,6 +153,11 @@ async def test_startup_accepts_expected_protective_stops(monkeypatch):
     monkeypatch.setattr(
         main.watchdog, "trigger_emergency_halt",
         lambda reason, *, level: halts.append((reason, level)),
+    )
+    monkeypatch.setattr(
+        main.watchdog,
+        "_verify_safe_to_resume",
+        lambda mode: _async_result((True, "verified")),
     )
 
     await main.verify_before_trading()

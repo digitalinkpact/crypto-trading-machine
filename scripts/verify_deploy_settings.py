@@ -32,6 +32,14 @@ GUARDRAILS: tuple[tuple[str, str, object], ...] = (
     ("btc_alignment_hard_gate", "==", True),
     ("pullback_require_candidate_confirmation", "==", True),
     ("market_regime_gate_enabled", "==", True),
+    ("signal_max_spread_pct", "<=", 0.0025),
+    ("breadth_gate_enabled", "==", True),
+)
+
+# Execution order-book gate caps: tighter is better for entry quality, but a
+# looser production value is a deliberate historical choice (the old code default
+# was 0.005), so it is reported as a WARNING, not a failure.
+ADVISORY: tuple[tuple[str, str, object], ...] = (
     ("max_spread_pct", "<=", 0.0025),
     ("aggressive_max_spread_pct", "<=", 0.0025),
 )
@@ -59,6 +67,11 @@ def main() -> int:
         else:
             status = "ok"
         print(f"{name:<42} {value!s:>12} {op + ' ' + str(locked):>12} {default!s:>13}  {status}")
+    print("\nadvisory (execution order-book gate):")
+    for name, op, locked in ADVISORY:
+        value = getattr(s, name)
+        status = "ok" if _holds(value, op, locked) else "WARN looser than 0.25% — consider setting it in .env"
+        print(f"{name:<42} {value!s:>12} {op + ' ' + str(locked):>12}  {status}")
     print(
         f"\nmode: live_mode={s.live_mode} paper_trading={s.paper_trading} dry_run={s.dry_run} "
         f"live_buys_enabled={s.live_buys_enabled}"
