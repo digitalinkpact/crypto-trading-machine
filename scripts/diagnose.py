@@ -1,4 +1,4 @@
-"""One-shot debug dump: trades, win rates, recent skip reasons, signal stats.
+"""One-shot debug dump: position- and row-level win rates, recent skip reasons, signal stats.
 
 Run from repo root:
 
@@ -8,9 +8,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from pathlib import Path
 
 from app.config import get_settings
+from app.trading.win_rate import (
+    REBASELINE_NOTE,
+    collapse_to_positions,
+    format_win_rate_block,
+    open_position_keys,
+    win_rate_summary,
+)
 
 
 def _conn() -> sqlite3.Connection:
@@ -34,7 +40,12 @@ def main() -> None:
     _hdr("Config snapshot")
     print(f"paper_trading            = {s.paper_trading}")
     print(f"min_signal_confidence    = {s.min_signal_confidence}")
-    print(f"max_open_positions       = {s.max_open_positions}")
+    print(f"max_open_positions       = {s.max_open_positions} "
+          f"(aggressive={s.aggressive_max_open_positions} rollback={s.rollback_max_open_positions})")
+    print(f"universe_size/final_size = {s.universe_size} / {s.final_pairlist_size}")
+    print(f"profitstream_score_thr   = {s.profitstream_score_threshold}")
+    print(f"mean_reversion_exit      = {s.mean_reversion_exit_enabled}")
+    print(f"win_rate_position_level  = {s.win_rate_position_level}")
     print(f"max_long_exposure_pct    = {s.max_long_exposure_pct}")
     print(f"max_position_pct         = {s.max_position_pct}")
     print(f"stop_loss_pct            = {s.stop_loss_pct}")
@@ -46,49 +57,39 @@ def main() -> None:
 
     c = _conn()
 
-    _hdr("Closed trades summary")
-    rows = c.execute(
-        "SELECT mode, COUNT(*) n, "
-        "SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) wins, "
-        "SUM(CASE WHEN pnl<=0 THEN 1 ELSE 0 END) losses, "
-        "ROUND(SUM(pnl),2) total_pnl, "
-        "ROUND(AVG(pnl_pct),3) avg_pct, "
-        "ROUND(MIN(pnl_pct),2) worst, ROUND(MAX(pnl_pct),2) best "
-        "FROM closed_trades GROUP BY mode"
-    ).fetchall()
-    if not rows:
+    _hdr("Win rate — position-level (target) vs row-level (legacy), by mode")
+    all_rows = [dict(r) for r in c.execute("SELECT * FROM closed_trades ORDER BY id ASC").fetchall()]
+    open_keys = open_position_keys(
+        dict(r) for r in c.execute("SELECT symbol, mode, entry_ts FROM positions").fetchall()
+    )
+    if not all_rows:
         print("(no closed trades)")
-    for r in rows:
-        wr = (r["wins"] / r["n"] * 100) if r["n"] else 0
-        print(f"{r['mode']:6s} n={r['n']:4d} wins={r['wins']:4d} "
-              f"losses={r['losses']:4d} win_rate={wr:5.1f}% "
-              f"total_pnl=${r['total_pnl']:.2f} "
-              f"avg={r['avg_pct']}% worst={r['worst']}% best={r['best']}%")
+    for mode in sorted({r["mode"] for r in all_rows}):
+        rows = [r for r in all_rows if r["mode"] == mode]
+        for line in format_win_rate_block(win_rate_summary(rows, open_keys), label=mode):
+            print(line)
+        positions = collapse_to_positions(rows, open_keys)
+        pnl_pcts = [p["pnl_pct"] for p in positions]
+        if positions:
+            print(
+                f"  fee-adjusted position pnl=${sum(p['pnl'] for p in positions):.2f} "
+                f"avg={sum(pnl_pcts) / len(pnl_pcts):+.2f}% "
+                f"worst={min(pnl_pcts):+.2f}% best={max(pnl_pcts):+.2f}%"
+            )
 
-    _hdr("Exit reasons (last 200 closed)")
-    rows = c.execute(
-        "SELECT agents, pnl, pnl_pct FROM closed_trades ORDER BY id DESC LIMIT 200"
-    ).fetchall()
+    _hdr("Final exit reason per closed position (last 200 positions, position-level win%)")
     buckets: dict[str, list[float]] = {}
-    for r in rows:
-        try:
-            agents = json.loads(r["agents"] or "[]")
-        except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.exception(f"Trade execution failure: {e}")
-            raise
-        reason = next((a.split(":", 1)[1] for a in agents if a.startswith("risk:")), "signal")
-        buckets.setdefault(reason, []).append(float(r["pnl_pct"]))
+    for p in collapse_to_positions(all_rows, open_keys)[-200:]:
+        buckets.setdefault(p.get("exit_reason") or "unknown", []).append(float(p["pnl"]))
     if not buckets:
         print("(none)")
-    for reason, pcts in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
-        wins = sum(1 for p in pcts if p > 0)
-        avg = sum(pcts) / len(pcts)
-        print(f"  {reason:18s} n={len(pcts):4d} wins={wins:4d} "
-              f"win_rate={wins/len(pcts)*100:5.1f}% avg={avg:+.2f}%")
+    for reason, pnls in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
+        wins = sum(1 for x in pnls if x > 0)
+        print(f"  {reason:22s} n={len(pnls):4d} wins={wins:4d} "
+              f"win_rate={wins / len(pnls) * 100:5.1f}% pnl=${sum(pnls):+.2f}")
+    print(f"  {REBASELINE_NOTE}")
 
-    _hdr("Per-agent stats")
+    _hdr("Per-agent stats (credited once per closed position since the 2026-11 fix; older rows are per-leg)")
     rows = c.execute(
         "SELECT agent, wins, losses, total_pnl FROM agent_stats ORDER BY total_pnl DESC"
     ).fetchall()
@@ -109,14 +110,17 @@ def main() -> None:
         print(f"  {r['symbol']:10s} qty={r['qty']:.6f} entry=${r['entry_price']:.4f} "
               f"since={r['entry_ts']} mode={r['mode']}")
 
-    _hdr("Worst symbols (avg pnl_pct, min 2 trades)")
-    rows = c.execute(
-        "SELECT symbol, COUNT(*) n, ROUND(AVG(pnl_pct),2) avg_pct, "
-        "ROUND(SUM(pnl),2) total FROM closed_trades GROUP BY symbol "
-        "HAVING n>=2 ORDER BY avg_pct ASC LIMIT 10"
-    ).fetchall()
-    for r in rows:
-        print(f"  {r['symbol']:10s} n={r['n']:3d} avg={r['avg_pct']:+.2f}% total=${r['total']:.2f}")
+    _hdr("Worst symbols (position-level avg pnl_pct, min 2 positions)")
+    by_symbol: dict[str, list[dict]] = {}
+    for p in collapse_to_positions(all_rows, open_keys):
+        by_symbol.setdefault(p["symbol"], []).append(p)
+    worst = sorted(
+        ((sym, ps) for sym, ps in by_symbol.items() if len(ps) >= 2),
+        key=lambda kv: sum(p["pnl_pct"] for p in kv[1]) / len(kv[1]),
+    )[:10]
+    for sym, ps in worst:
+        print(f"  {sym:10s} n={len(ps):3d} avg={sum(p['pnl_pct'] for p in ps) / len(ps):+.2f}% "
+              f"total=${sum(p['pnl'] for p in ps):.2f}")
 
     _hdr("Recent autopilot skip reasons (from kv:autopilot_skip_stats)")
     row = c.execute("SELECT value FROM kv WHERE key='autopilot_skip_stats'").fetchone()

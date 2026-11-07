@@ -57,21 +57,11 @@ systemctl status crypto-bot --no-pager -l
 journalctl -u crypto-bot -f
 ```
 
-## 6. Enable app authentication (recommended)
+## 6. Enable app authentication (required)
 
-Set both values in .env:
-
-- APP_BASIC_AUTH_USER
-- APP_BASIC_AUTH_PASSWORD
-
-Then restart:
-
-```bash
-systemctl restart crypto-bot
-```
-
-All routes are protected with HTTP Basic auth when both values are set.
-Health endpoint remains open at /healthz.
+Set `SESSION_SECRET` (and `BASE_URL`, `FORCE_HTTPS` behind a proxy) in .env, then
+restart `crypto-bot`. All routes except `/healthz` and `/health` require a login
+session. See docs/SECURITY_HARDENING.md.
 
 ## 7. Security checklist
 
@@ -82,11 +72,35 @@ Health endpoint remains open at /healthz.
 - Run host hardening script once: scripts/harden_server.sh
 - Follow docs/SECURITY_HARDENING.md
 
-## 8. Tomorrow quick start
+## 8. Update an existing droplet
 
 ```bash
 ssh root@YOUR_PUBLIC_IPV4
 cd /opt/crypto-trading-machine
 git pull --ff-only origin main
-bash scripts/bootstrap_droplet.sh
+bash scripts/bootstrap_droplet.sh        # reinstalls deps + unit, restarts crypto-bot
+bash scripts/verify_deploy.sh            # MUST pass before you trust the deploy
 ```
+
+## 9. Verify the droplet matches the repo
+
+`scripts/verify_deploy.sh [EXPECTED_COMMIT]` is read-only and exits non-zero on
+any mismatch. It checks:
+
+1. the checkout is clean and `HEAD` equals `origin/main` (and `EXPECTED_COMMIT`
+   when given);
+2. the EFFECTIVE value of every win-rate guardrail (`.env` + environment, as the
+   app loads it) against the evidence-locked values: `max_open_positions`,
+   `aggressive_max_open_positions`, `rollback_max_open_positions` (<= 12),
+   `universe_size` (<= 75), `final_pairlist_size` (<= 50), `stop_loss_pct` and
+   `atr_stop_min_pct` (>= 0.04), `profitstream_score_threshold` (>= 80),
+   `win_rate_position_level` (true), `mean_reversion_exit_enabled` (false), the
+   trend/BTC/pullback gates, and the spread caps;
+3. `crypto-bot` is active, its unit file equals `deploy/systemd/crypto-bot.service`,
+   and the LAST `BOT_REVISION=` line in the journal equals `HEAD` (so the running
+   process loaded the code you pulled, not an older commit);
+4. `python -m scripts.daily_forensic_report --days 30` runs and prints BOTH the
+   position-level (target) and row-level (legacy) win rates.
+
+Win rate is position-level and fee-adjusted. Any historical ~94-95% figure must be
+re-validated under that definition before it is used as a target.

@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from app.storage import storage
 from app.logging_setup import get_logger
+from app.trading.win_rate import format_win_rate_block, win_rate_summary_from_storage
 
 log = get_logger(__name__)
 
@@ -53,6 +54,9 @@ class TradeMonitor:
                 print(f"\n[{ts}] TRADE EXECUTION STATS")
                 print(f"  ✅ BUY executed:  {self.buy_executed:3}")
                 print(f"  ✅ SELL executed: {self.sell_executed:3}")
+                print()
+                for line in format_win_rate_block(win_rate_summary_from_storage()):
+                    print(f"  {line}")
                 print(f"\n  Top rejection reasons:")
                 
                 for reason, count in sorted(self.rejected_reasons.items(), key=lambda x: -x[1])[:5]:

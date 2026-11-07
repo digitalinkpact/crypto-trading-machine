@@ -1,19 +1,23 @@
 """Risk gates — evaluated on every tick BEFORE looking at agent signals.
 
-Five hard rules enforced here:
-  1. Hard stop-loss   (loss > stop_loss_pct          → force SELL)
-  2. Take-profit      (gain > take_profit_pct        → force SELL)
-  3. Trailing stop    (price drops trailing_stop_pct from HWM after take_profit/2 hit)
-  4. Max hold time    (entry_ts > max_hold_hours ago → force SELL)
-  5. Drawdown breaker (paper/live PnL < -drawdown_pct → halt new BUYs)
+Exit rules enforced by `evaluate_exits` (first match wins, in this order):
+  1. Hard stop-loss   (loss >= dynamic_stop_pct: ATR-scaled, never tighter than
+                       stop_loss_pct=4%)                      -> SELL all
+  2. Take-profit      TP1 at +take_profit_1_pct (sell 50%), TP2 at
+                       +take_profit_2_pct (sell 25% of the original) -> partial SELL
+  3. Trailing stop    armed once HWM > entry * (1 + trailing_activation_pct);
+                       exits at trailing_stop_pct below the HWM -> SELL all
+  4. Stale exit       held > stale_exit_hours with PnL < stale_exit_max_pnl_pct
+  5. Max hold         held > max_hold_hours                       -> SELL all
 
-Plus:
-  - Volatility-scaled position sizing (size ∝ baseline / atr_pct, clamped)
-  - Max open positions cap
-  - Max long exposure cap (don't put >X% of equity in non-USDT)
+Entry-side helpers:
+  - Drawdown breaker / daily loss limit (halt new BUYs)
+  - Volatility-scaled position sizing
+  - Max open positions / max long exposure caps
 
 Stored state:
-  - kv:hwm:{symbol}  → high-water-mark price seen for the open position
+  - kv:hwm:{symbol} / kv:lwm:{symbol}  → high/low-water marks (trailing, MFE/MAE)
+  - kv:tp1:{symbol} / kv:tp2:{symbol}  → scale-out flags
 """
 from __future__ import annotations
 

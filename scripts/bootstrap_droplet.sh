@@ -47,6 +47,9 @@ systemctl restart crypto-bot
 echo "Service status:"
 systemctl status crypto-bot --no-pager -l || true
 
+echo "Deployed commit: $(git rev-parse HEAD)"
+echo "Verify parity (read-only, non-zero exit on mismatch):"
+echo "  bash scripts/verify_deploy.sh"
 echo "Done. Useful commands:"
 echo "  journalctl -u crypto-bot -f"
 echo "  systemctl restart crypto-bot"

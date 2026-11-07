@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     # fetch_dynamic_symbols then the static list on any API failure.
     #
     # UNIT FOOTGUN: `max_spread_percent` is a PERCENT (0.50 = 0.50%), whereas the
-    # execution-time `max_spread_pct` below is a FRACTION (0.0015 = 0.15%). The
+    # execution-time `max_spread_pct` below is a FRACTION (0.0025 = 0.25%). The
     # universe filter is a coarse compute-saver; the execution gate is the hard
     # money-guard and is intentionally kept stricter.
     #
@@ -125,7 +125,7 @@ class Settings(BaseSettings):
     #     -$2.43/53% wr were negative too, but within fee-noise / with healthy
     #     win rates, so deliberately NOT blocked.)
     #  B) Structurally thin order books — top-of-book spread measured twice,
-    #     identical, on Binance.US; each is >=15x the 0.45% universe spread cap.
+    #     identical, on Binance.US; each is >=8x the 0.50% universe spread cap.
     #     The universe spread probe FAILS OPEN on error, so these are a hard
     #     backstop against that path. (ONE 5.4%, PROM 5.4%, BTRST 4.9%, DGB 4.4%
     #     also trip the gate but are left to the dynamic spread filter.)
@@ -317,17 +317,22 @@ class Settings(BaseSettings):
     max_position_pct: float = Field(0.05, ge=0.005, le=1.0)      # per-position sizing cap
     max_portfolio_risk_pct: float = Field(0.25, ge=0.0, le=1.0)
     kelly_fraction_cap: float = Field(0.25, ge=0.005, le=1.0)
-    max_open_positions: int = Field(12, ge=1, le=50)             # cap concurrent positions
+    max_open_positions: int = Field(12, ge=1, le=50)             # hard ceiling on concurrent positions (12 = 2026-09-29 revert)
     max_long_exposure_pct: float = Field(0.60, ge=0.0, le=1.0)   # ≤ 60% of equity in non-USDT
     aggressive_mode_enabled: bool = True
     aggressive_rollback_min_trades: int = Field(30, ge=1, le=10_000)
     aggressive_rollback_min_win_rate: float = Field(0.50, ge=0.0, le=1.0)
-    # Win rate is measured per POSITION (rows grouped by symbol+entry_ts, a
-    # position wins if its summed pnl > 0), not per partial-exit row. Winners
+    # Win rate is measured per POSITION (rows grouped by symbol+mode+entry_ts, a
+    # position wins iff its summed FEE-ADJUSTED pnl > 0; book-keeping closes and
+    # positions still open after a TP1/TP2 partial are excluded — single
+    # definition in app/trading/win_rate.py), not per partial-exit row. Winners
     # exit in several rows (TP1/TP2/trailing) while losers exit in one, so a
     # row-level win rate reads several points too high and kept the aggressive
     # sizing engaged through losing regimes. Position-level is the safer default;
     # set WIN_RATE_POSITION_LEVEL=false to restore the legacy per-row behaviour.
+    # Reports/dashboards ALWAYS print both numbers side by side. Any historical
+    # ~94-95% figure must be re-validated under the position-level definition
+    # (live 2026-10-12: 63% row-level vs 33% position-level).
     win_rate_position_level: bool = True
     aggressive_max_spread_pct: float = Field(0.0025, ge=0.0, le=0.05)
     rollback_max_spread_pct: float = Field(0.0015, ge=0.0, le=0.05)
@@ -347,7 +352,7 @@ class Settings(BaseSettings):
     aggressive_signal_exit_enabled: bool = False
     trend_gate_bypass_confidence: float = Field(0.85, ge=0.0, le=1.0)
     trend_gate_bypass_ml_proba: float = Field(0.55, ge=0.0, le=1.0)
-    pyramid_confidence_threshold: float = Field(0.85, ge=0.0, le=1.0)
+    pyramid_confidence_threshold: float = Field(0.85, ge=0.0, le=1.0)  # DEAD — autopilot hardcodes 0.75; ProfitStream returns HOLD for held coins so pyramiding never triggers
     pyramid_add_fraction: float = Field(0.50, ge=0.0, le=2.0)
     orderbook_retry_enabled: bool = True
     orderbook_retry_delay_seconds: int = Field(60, ge=1, le=3600)
@@ -422,12 +427,13 @@ class Settings(BaseSettings):
     trailing_stop_pct: float = Field(0.03, ge=0.005, le=0.20)    # 3.0% trail from HWM
     trailing_activation_pct: float = Field(0.05, ge=0.005, le=0.50)  # arm trailing after +5%
     # Arm the trailing stop as soon as a position gains `trailing_activation_pct`
-    # (+2%), WITHOUT waiting for the +8% TP1 to bank first. Live forensics
+    # (+5% now; it was +2% when this was measured), WITHOUT waiting for the +8%
+    # TP1 to bank first. Live forensics
     # (2026-09-14): on thin Binance.US, +8% moves are rare — take_profit_1 fired
     # only twice ever, while trailing_stop was the single largest winner bucket.
     # Requiring TP1 first therefore left the common +2-6% winners with NO profit
     # protection: they rode the hard stop back down or gave the gain back to the
-    # stale/max-hold exit near breakeven. Arming at +2% lets the trail protect a
+    # stale/max-hold exit near breakeven. Arming early lets the trail protect a
     # run-up in proportion to how far it ran (this is the config the profitable
     # walk-forward/strategy_lab backtest actually models). Set True to restore
     # the delayed-trailing behavior.
@@ -465,6 +471,11 @@ class Settings(BaseSettings):
     stale_exit_max_pnl_pct: float = Field(0.02, ge=0.0, le=0.50)
 
     # Entry gates
+    # NOTE (config-vs-behaviour): ProfitStream BUYs are gated by
+    # `profitstream_score_threshold` (runner.py) and the autopilot's hardcoded
+    # 0.40 confidence floor (`_signal_min_confidence`). This field and the
+    # dynamic-threshold delta below are only logged/displayed — they do NOT gate
+    # a live BUY.
     min_signal_confidence: float = Field(0.65, ge=0.0, le=1.0)
     buy_cooldown_minutes: int = Field(20, ge=0, le=1440)
 
@@ -472,6 +483,9 @@ class Settings(BaseSettings):
     profitstream_enabled: bool = True
     profitstream_use_legacy_agents: bool = False
     profitstream_score_threshold: int = Field(80, ge=0, le=100)
+    # profitstream_rsi_*/volume_spike/btc_volatility below are read ONLY by the
+    # research/backtest scripts (profitstream_backtest_suite, profitstream_research),
+    # not by the live strategy (which uses the daily dip/pullback setups).
     profitstream_rsi_min: int = Field(40, ge=1, le=99)
     profitstream_rsi_max: int = Field(65, ge=1, le=99)
     profitstream_volume_spike_multiple: float = Field(1.5, ge=1.0, le=10.0)
@@ -702,9 +716,10 @@ class Settings(BaseSettings):
     # or wide books. Fails OPEN (allows the trade) if the book can't be fetched.
     orderbook_gate_enabled: bool = True
     orderbook_depth_limit: int = Field(10, ge=5, le=100)
-    # Reject entry if (ask-bid)/mid exceeds this (0.005 = 0.50%). Aligned with
-    # the universe `max_spread_percent` (0.50%) — Binance.US is thin, so the old
-    # 0.15% was effectively un-satisfiable and starved the bot of entries.
+    # Reject entry if (ask-bid)/mid exceeds this (0.0025 = 0.25%). Stricter than
+    # the coarse universe `max_spread_percent` (0.50%); Binance.US is thin, so
+    # the old 0.15% was effectively un-satisfiable and starved the bot of
+    # entries. The same cap applies to every entry type (dip and pullback).
     max_spread_pct: float = Field(0.0025, ge=0.0, le=0.05)
     # Require resting depth near mid >= this multiple of the trade notional.
     min_depth_trade_multiple: float = Field(2.0, ge=0.0, le=100.0)

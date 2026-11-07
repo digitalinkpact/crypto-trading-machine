@@ -163,3 +163,24 @@ def test_widening_a_win_rate_guardrail_is_logged_loudly(caplog):
     for name in ("universe_size", "final_pairlist_size", "aggressive_max_open_positions",
                  "stop_loss_pct", "mean_reversion_exit_enabled"):
         assert f"WIN-RATE GUARDRAIL OVERRIDDEN: {name}=" in caplog.text
+
+
+def test_env_example_matches_code_defaults():
+    """.env.example is what operators copy to the droplet: every active setting
+    that maps to a Settings field must equal the code default, so a fresh
+    deploy can never silently widen a guardrail or loosen a spread cap."""
+    import re
+    from pathlib import Path
+
+    defaults = Settings(_env_file=None)
+    example = Path(__file__).resolve().parent.parent / ".env.example"
+    checked = 0
+    for line in example.read_text().splitlines():
+        m = re.match(r"^([A-Z0-9_]+)=(.*)$", line.strip())
+        if not m or m.group(1).lower() not in Settings.model_fields:
+            continue
+        name = m.group(1).lower()
+        parsed = getattr(Settings(_env_file=None, **{name: m.group(2)}), name)
+        assert parsed == getattr(defaults, name), f".env.example {name}={m.group(2)} != code default"
+        checked += 1
+    assert checked > 20

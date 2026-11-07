@@ -633,3 +633,17 @@ def test_candidates_not_ready_when_no_setup_present():
     for name, c in candidates.items():
         assert c.ready is False, name
         assert c.score == 0, name
+
+async def test_pullback_score_is_capped_by_richer_candidate_score(monkeypatch):
+    """1% from EMA20 -> candidate 82 (passes the 80 threshold); 1.9% from EMA20
+    still confirms the setup but scores 75, so the runner would drop it."""
+    strategy = ProfitStreamStrategy()
+    _pullback_setup_env(monkeypatch, strategy, _pullback_frame(close=101, rsi=50, ema20=100), 0.001)
+    tight = await strategy.analyze_symbol("ETHUSDT", mode="live")
+    assert tight.action == SignalAction.BUY and tight.score == 82
+
+    _pullback_setup_env(monkeypatch, strategy, _pullback_frame(close=101.9, rsi=50, ema20=100), 0.001)
+    marginal = await strategy.analyze_symbol("ETHUSDT", mode="live")
+    assert marginal.action == SignalAction.BUY
+    assert marginal.score == 75 < 80
+    assert marginal.indicators["pullback_candidate_score"] == 75

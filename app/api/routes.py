@@ -19,6 +19,7 @@ from app.trading.autopilot import autopilot
 from app.trading.portfolio import portfolio_snapshot
 from app.exchange.ws_stream import live_prices
 from app.exchange.telemetry import exchange_telemetry
+from app.trading.win_rate import win_rate_summary_from_storage
 
 router = APIRouter()
 
@@ -289,7 +290,7 @@ async def dashboard() -> str:
   <h2>Agent learning</h2>
   <div class='muted'>Per-agent stats accumulate across PAPER and LIVE so the live system inherits everything.</div>
   <table style='margin-top:0.75rem;'>
-    <thead><tr><th>Agent</th><th class='num'>Trades</th><th class='num'>Win rate</th><th class='num'>Total P&amp;L</th></tr></thead>
+    <thead><tr><th>Agent</th><th class='num'>Positions</th><th class='num'>Win rate (per position)</th><th class='num'>Total P&amp;L</th></tr></thead>
     <tbody>{rows}</tbody>
   </table>
 </div>
@@ -731,6 +732,39 @@ async def config_summary() -> dict:
             "max_portfolio_risk_pct": s.max_portfolio_risk_pct,
             "kelly_fraction_cap": s.kelly_fraction_cap,
         },
+    }
+
+
+@router.get("/win-rate")
+async def win_rate(mode: str | None = None) -> dict:
+    """Win rate under BOTH definitions, clearly labelled.
+
+    `position` is the target (legs grouped by symbol+entry_ts, fee-adjusted,
+    book-keeping closes and still-open partials excluded). `row` is the legacy
+    per-row number, inflated by partial TP legs — never compare it to the target.
+    """
+    if mode not in (None, "live", "paper"):
+        raise HTTPException(status_code=400, detail="mode must be 'live' or 'paper'")
+    sm = win_rate_summary_from_storage(mode=mode)
+    return {
+        "mode": mode or "all",
+        "configured_definition": (
+            "position" if get_settings().win_rate_position_level else "row"
+        ),
+        "position": {
+            "win_rate": sm["position_win_rate"], "wins": sm["position_wins"], "n": sm["position_n"],
+            "label": "POSITION-level, fee-adjusted (TARGET)",
+        },
+        "row": {
+            "win_rate": sm["row_win_rate"], "wins": sm["row_wins"], "n": sm["row_n"],
+            "label": "ROW-level, legacy (inflated by partial TP legs)",
+        },
+        "excluded": {
+            "bookkeeping_rows": sm["excluded_bookkeeping_rows"],
+            "open_partial_positions": sm["excluded_open_positions"],
+        },
+        "fee_flipped_positions": sm["fee_flipped_positions"],
+        "note": sm["note"],
     }
 
 

@@ -2,7 +2,26 @@
 
 The original low-timeframe momentum stack was negative out of sample on this
 repository's walk-forward harness. ProfitStream uses daily dip-buy mean
-reversion plus trend pullbacks, with BTC trend retained as soft score context.
+reversion plus trend pullbacks. BTC alignment, spread, volume, falling-knife
+extension and the news blackout are HARD entry gates (`filt_ok`).
+
+Scoring (single, documented source of truth)
+--------------------------------------------
+`analyze_symbol` emits one integer score that the runner compares with
+`profitstream_score_threshold` (80) and the autopilot compares with
+threshold + `market_regime_sideways_score_bonus` (95) in a sideways BTC regime:
+
+* dip entry      : 70 (setup) + 20 (BTC aligned) + 10 (filters ok) = 100
+* pullback entry : 60 + 20 + 10 = 90, then capped at the richer
+                   `pullback_to_ema` candidate score (75..90, i.e. >=80 only
+                   when within ~1.3% of EMA20) so a loose pullback can never be
+                   scored like a tight one.
+* The additive score is kept for dips because the richer `oversold_bounce`
+  candidate hard-codes RSI<40 and only reaches 80+ at RSI<=13, which would veto
+  nearly every dip the walk-forward validated; its detail is logged for
+  forensics only. With the hard gates above, a BUY can only be 90 or 100, so
+  the score is effectively a setup label: the sideways bonus (95) admits dip
+  entries only.
 """
 from __future__ import annotations
 
@@ -263,6 +282,10 @@ class ProfitStreamStrategy:
         score += 10 if filt_ok else 0
         score -= btc_score_penalty
         score = _clamp(score, 0, 100)
+        if pullback_ready and not dip_ready and s.pullback_require_candidate_confirmation:
+            pullback_candidate_score = scored_candidates["pullback_to_ema"].score
+            indicators["pullback_candidate_score"] = pullback_candidate_score
+            score = min(score, pullback_candidate_score)
 
         if not dip_ready:
             rsi_bar = s.oversold_bounce_rsi_max if s.entry_strategy == "oversold_bounce" else 45

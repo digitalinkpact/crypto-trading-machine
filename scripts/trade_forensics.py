@@ -14,14 +14,18 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from statistics import mean
-from typing import Any
 
 import pandas as pd
 
 from app.config import get_settings
 from app.storage import storage
 from app.ta import add_indicators
+from app.trading.win_rate import (
+    collapse_to_positions,
+    format_win_rate_block,
+    open_position_keys,
+    win_rate_summary_from_storage,
+)
 
 
 @dataclass
@@ -140,42 +144,12 @@ def _pct(count: int, total: int) -> float:
     return (count / total * 100.0) if total else 0.0
 
 
-def _collapse_to_positions(rows: list[dict]) -> list[dict]:
-    """Group closed_trades leg rows into positions (symbol, mode, entry_ts).
-
-    Mirrors Storage.closed_positions: pnl is the fee-adjusted sum of all legs,
-    book-keeping closes are dropped, and positions still open after a partial
-    TP1/TP2 are excluded — so `won` is a position-level outcome, not a leg.
-    """
-    open_keys = {
-        (p["symbol"], p["mode"], p["entry_ts"]) for p in storage.all_positions()
-    }
-    grouped: dict[tuple, list[dict]] = {}
-    for row in rows:
-        reason = str(row.get("exit_reason") or "")
-        if reason == "reconcile_stale" or reason.endswith("_stale_dust"):
-            continue
-        key = (row.get("symbol"), row.get("mode"), row.get("entry_ts"))
-        if key in open_keys:
-            continue
-        grouped.setdefault(key, []).append(row)
-    out: list[dict] = []
-    for legs in grouped.values():
-        legs = sorted(legs, key=lambda r: r.get("id") or 0)
-        notional = sum(float(r.get("entry_price") or 0) * float(r.get("qty") or 0) for r in legs)
-        pnl = sum(float(r.get("pnl") or 0) for r in legs)
-        merged = dict(legs[-1])
-        merged["entry_ts"] = legs[0].get("entry_ts")
-        merged["pnl"] = pnl
-        merged["pnl_pct"] = (pnl / notional * 100.0) if notional else 0.0
-        out.append(merged)
-    return out
-
-
 def build_trade_contexts() -> list[TradeContext]:
     settings = get_settings()
     cache_dir = settings.data_cache_dir
-    closed = _collapse_to_positions(storage.closed_trades(limit=5000))
+    closed = collapse_to_positions(
+        storage.closed_trades(limit=5000), open_position_keys(storage.all_positions())
+    )
     btc_1d = _load_frame(cache_dir, "BTCUSDT", "1d")
     frame_cache: dict[tuple[str, str], pd.DataFrame | None] = {("BTCUSDT", "1d"): btc_1d}
     contexts: list[TradeContext] = []
@@ -236,7 +210,7 @@ def print_report(contexts: list[TradeContext], *, limit: int) -> None:
     losses = [ctx for ctx in contexts if not ctx.won]
     wins = [ctx for ctx in contexts if ctx.won]
 
-    print(f"trades={len(contexts)} wins={len(wins)} losses={len(losses)}")
+    print(f"positions={len(contexts)} wins={len(wins)} losses={len(losses)}")
     if not losses:
         return
 
@@ -298,6 +272,9 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=25, help="how many recent losing trades to print")
     args = parser.parse_args()
 
+    for line in format_win_rate_block(win_rate_summary_from_storage(), label="all modes"):
+        print(line)
+    print("\nEverything below is POSITION-level (one context per closed position).\n")
     contexts = build_trade_contexts()
     print_report(contexts, limit=args.limit)
 

@@ -71,7 +71,6 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
     # --- ML model gating for LLM signals ---
     import numpy as np
     ML_MODEL_NAME = "signal_quality_v1"
-    ml_confidence_threshold = settings.ml_gate_threshold
     ml_model_artifact = storage.load_model_artifact(ML_MODEL_NAME)
     ml_model = ml_model_artifact["model"] if ml_model_artifact else None
 

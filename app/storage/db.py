@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from app.config import get_settings
+from app.trading.win_rate import is_bookkeeping_exit
 from app.logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -212,14 +213,9 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# Book-keeping closes (phantom/stale rows closed at the entry price) are not
-# trades: they must not count as wins or losses in any win-rate measure.
+# SQL twin of app.trading.win_rate.is_bookkeeping_exit — phantom/stale rows
+# closed at the entry price are not trades and never count toward win rate.
 _BOOKKEEPING_EXIT_SQL = "(COALESCE(exit_reason, '') = 'reconcile_stale' OR COALESCE(exit_reason, '') LIKE '%\\_stale\\_dust' ESCAPE '\\')"
-
-
-def _is_bookkeeping_exit(reason: Optional[str]) -> bool:
-    r = str(reason or "")
-    return r == "reconcile_stale" or r.endswith("_stale_dust")
 
 
 def _record_position_outcome(
@@ -665,7 +661,7 @@ class Storage:
             else:
                 fee_amount = (entry * qty * taker_fee) + (exit_p * qty * taker_fee)
                 fee_source = "modeled"
-            if _is_bookkeeping_exit(exit_reason):
+            if is_bookkeeping_exit(exit_reason):
                 # Closed at entry to clear a phantom row: no trade happened, so
                 # no fee either — otherwise it books a fake loss.
                 fee_amount = 0.0
@@ -695,7 +691,7 @@ class Storage:
                  entry_confidence, entry_strategy, entry_btc_regime,
                  gross_pnl, fee_amount, fee_source, pnl, pnl_pct),
             )
-            if not _is_bookkeeping_exit(reason):
+            if not is_bookkeeping_exit(reason):
                 _record_position_outcome(
                     c, symbol=symbol, mode=mode, entry_ts=entry_ts,
                     agents=agents_list, now=now,
@@ -769,7 +765,7 @@ class Storage:
             else:
                 fee_amount = (entry * reduce_qty * taker_fee) + (exit_p * reduce_qty * taker_fee)
                 fee_source = "modeled"
-            if _is_bookkeeping_exit(exit_reason):
+            if is_bookkeeping_exit(exit_reason):
                 fee_amount = 0.0
                 fee_source = "none"
             pnl = gross_pnl - fee_amount
@@ -808,7 +804,7 @@ class Storage:
                  entry_confidence, entry_strategy, entry_btc_regime,
                  gross_pnl, fee_amount, fee_source, pnl, pnl_pct),
             )
-            if remaining <= 1e-12 and not _is_bookkeeping_exit(reason):
+            if remaining <= 1e-12 and not is_bookkeeping_exit(reason):
                 _record_position_outcome(
                     c, symbol=symbol, mode=mode, entry_ts=entry_ts,
                     agents=agents_list, now=now,

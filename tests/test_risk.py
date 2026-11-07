@@ -329,7 +329,7 @@ def test_entry_cap_cannot_exceed_max_open_positions(monkeypatch):
         loss_streak_pause_minutes = 60
 
     monkeypatch.setattr(rm, "get_settings", lambda: _S())
-    monkeypatch.setattr(rm.storage, "closed_trades", lambda limit=100: [])
+    monkeypatch.setattr(rm.storage, "closed_positions", lambda limit=100, mode=None: [])
     d = rm.RiskManager().evaluate_entry(
         mode="live", total_equity_usdt=Decimal("1000"), open_positions=5,
         long_exposure_pct=0.1, entry_price=Decimal("10"), aggressive_mode=True,

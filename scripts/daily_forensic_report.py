@@ -1,8 +1,9 @@
 """Daily forensic report: which conditions are actually making/losing money.
 
-Win rate here is POSITION-level and fee-adjusted (legs grouped by symbol+entry_ts,
-book-keeping closes and still-open partials excluded) — the same definition the
-bot's rollback guard uses.
+Win rate is reported BOTH ways, side by side and labelled: POSITION-level (the
+target; legs grouped by symbol+entry_ts, fee-adjusted, book-keeping closes and
+still-open partials excluded — the bot's own rollback-guard definition) and the
+legacy ROW-level number (inflated by partial TP legs). See app/trading/win_rate.py.
 
 Breaks down realized trade performance by BTC regime (recomputed via the
 scored -2..+2 regime, not just a binary flag), symbol, exit reason, and hour
@@ -24,7 +25,6 @@ import sqlite3
 import statistics
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -33,6 +33,12 @@ from app.config import Timeframe, get_settings
 from app.data import OHLCVRepository
 from app.regime.btc_regime import compute_btc_regime_score
 from app.ta import add_indicators
+from app.trading.win_rate import (
+    collapse_to_positions,
+    format_win_rate_block,
+    open_position_keys,
+    win_rate_summary,
+)
 
 
 def _conn() -> sqlite3.Connection:
@@ -74,55 +80,6 @@ async def _btc_regime_by_day() -> dict:
     return out
 
 
-def _is_bookkeeping(reason: Optional[str]) -> bool:
-    r = str(reason or "")
-    return r == "reconcile_stale" or r.endswith("_stale_dust")
-
-
-def _to_positions(rows: list[dict], open_keys: set[tuple[str, str, str]]) -> list[dict]:
-    """Collapse closed_trades leg rows into POSITIONS (symbol, mode, entry_ts).
-
-    A position's pnl is the sum of its legs' fee-adjusted pnl, it wins iff that
-    sum > 0, and it is labelled with the reason of its LAST leg. Book-keeping
-    closes and positions still open after a partial (TP1/TP2) are excluded —
-    the same rules as Storage.closed_positions, which the live rollback guard
-    uses, so this report and the bot measure win rate identically.
-    """
-    grouped: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
-    for r in rows:
-        if _is_bookkeeping(r.get("exit_reason")):
-            continue
-        key = (r["symbol"], r.get("mode") or "", r.get("entry_ts") or "")
-        if key in open_keys:
-            continue
-        grouped[key].append(r)
-    out: list[dict] = []
-    for (symbol, _mode, entry_ts), legs in grouped.items():
-        legs.sort(key=lambda r: r.get("id") or 0)
-        last = legs[-1]
-        notional = sum((r.get("entry_price") or 0.0) * (r.get("qty") or 0.0) for r in legs)
-        pnl = sum(r.get("pnl") or 0.0 for r in legs)
-        gross = sum(
-            r["gross_pnl"] if r.get("gross_pnl") is not None else (r.get("pnl") or 0.0)
-            for r in legs
-        )
-        out.append({
-            "symbol": symbol,
-            "entry_ts": entry_ts,
-            "pnl": pnl,
-            "gross_pnl": gross,
-            "pnl_pct": (pnl / notional * 100.0) if notional else 0.0,
-            "exit_reason": last.get("exit_reason"),
-            "legs": len(legs),
-            "entry_strategy": legs[0].get("entry_strategy"),
-            "entry_confidence": legs[0].get("entry_confidence"),
-            "entry_btc_regime": legs[0].get("entry_btc_regime"),
-            "mfe_pct": last.get("mfe_pct"),
-            "mae_pct": last.get("mae_pct"),
-        })
-    return out
-
-
 def _score_label(conf: Optional[float]) -> str:
     if conf is None:
         return "unknown"
@@ -152,10 +109,10 @@ def _print_table(title: str, buckets: dict[str, list[dict]]) -> None:
     _hdr(title)
     rows = [(k, _bucket_stats(v)) for k, v in buckets.items()]
     rows.sort(key=lambda kv: kv[1]["total_pnl"])
-    print(f"{'condition':<28} {'n':>5} {'win%':>7} {'avg%':>8} {'total_pnl':>12}")
+    print(f"{'condition':<28} {'n':>5} {'pos.win%':>8} {'avg%':>8} {'total_pnl':>12}")
     for label, stat in rows:
         print(
-            f"{label:<28} {stat['n']:>5} {stat['win_rate']:>6.1f}% "
+            f"{label:<28} {stat['n']:>5} {stat['win_rate']:>7.1f}% "
             f"{stat['avg_pct']:>7.2f}% {stat['total_pnl']:>12.4f}"
         )
 
@@ -175,36 +132,31 @@ def main() -> None:
         ).fetchall()
     ]
     trades = [t for t in trades if (_parse_ts(t.get("entry_ts")) or cutoff) >= cutoff]
-    leg_rows = [t for t in trades if not _is_bookkeeping(t.get("exit_reason"))]
-    open_keys = {
-        (r["symbol"], r["mode"], r["entry_ts"])
-        for r in c.execute("SELECT symbol, mode, entry_ts FROM positions").fetchall()
-    }
-    positions = _to_positions(trades, open_keys)
+    open_keys = open_position_keys(
+        dict(r) for r in c.execute("SELECT symbol, mode, entry_ts FROM positions").fetchall()
+    )
+    positions = collapse_to_positions(trades, open_keys)
+    summary = win_rate_summary(trades, open_keys)
 
     _hdr(
         f"Daily forensic report — mode={args.mode} window={args.days}d "
-        f"positions={len(positions)} leg_rows={len(leg_rows)}"
+        f"positions={len(positions)} leg_rows={len(trades)}"
     )
+    # HEADLINE: both definitions side by side. Every table below is
+    # position-level and fee-adjusted unless it says "leg".
+    for line in format_win_rate_block(summary, label=f"{args.mode}, {args.days}d window"):
+        print(line)
+    if args.mode == "paper":
+        print("  note: paper fills have no slippage/spread: compare live-to-live only")
     if not positions:
         print("(no closed positions in this window)")
         return
 
-    # HEADLINE = position-level, fee-adjusted (the bot's own definition).
     overall = _bucket_stats(positions)
-    row_overall = _bucket_stats(leg_rows)
-    fee_flipped = sum(1 for p in positions if p["gross_pnl"] > 0 >= p["pnl"])
     print(
-        f"POSITION win_rate={overall['win_rate']:.1f}% avg_pct={overall['avg_pct']:.2f}% "
-        f"total_pnl={overall['total_pnl']:.4f}  (fee-adjusted; fee-flipped winners: {fee_flipped})"
+        f"avg_pct={overall['avg_pct']:.2f}% total_pnl={overall['total_pnl']:.4f} "
+        f"(position-level, fee-adjusted)"
     )
-    print(
-        f"leg-row  win_rate={row_overall['win_rate']:.1f}% over {row_overall['n']} rows "
-        f"(inflated by partial TP legs; do NOT compare to the 94% target)"
-    )
-    paper_note = "paper fills have no slippage/spread: compare live-to-live only" if args.mode == "paper" else ""
-    if paper_note:
-        print(f"note: {paper_note}")
 
     regime_by_day = asyncio.run(_btc_regime_by_day())
 

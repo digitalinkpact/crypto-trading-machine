@@ -20,6 +20,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from app.config import get_settings
+from app.revision import get_revision
 from app.exchange import BinanceUSClient
 from app.exchange.telemetry import exchange_telemetry
 from app.exchange.ws_stream import live_prices
@@ -107,6 +108,17 @@ async def startup_report() -> dict:
         "drawdown_circuit_breaker_pct": settings.drawdown_circuit_breaker_pct,
         "max_spread_pct": settings.max_spread_pct,
         "min_depth_trade_multiple": settings.min_depth_trade_multiple,
+        # Win-rate guardrails: the droplet's effective values, as loaded.
+        "universe_size": settings.universe_size,
+        "final_pairlist_size": settings.final_pairlist_size,
+        "aggressive_max_open_positions": settings.aggressive_max_open_positions,
+        "rollback_max_open_positions": settings.rollback_max_open_positions,
+        "atr_stop_min_pct": settings.atr_stop_min_pct,
+        "win_rate_position_level": settings.win_rate_position_level,
+        "mean_reversion_exit_enabled": settings.mean_reversion_exit_enabled,
+        "trend_filter_enabled": settings.trend_filter_enabled,
+        "trend_gate_bypass_enabled": settings.trend_gate_bypass_enabled,
+        "profitstream_trend_soft_penalty": settings.profitstream_trend_soft_penalty,
     }
 
     exchange_connected = False
@@ -148,8 +160,10 @@ async def startup_report() -> dict:
         active_exchange_client = "BinanceUSClient(LIVE)"
     places_real_orders = (not settings.paper_trading) and (not settings.dry_run)
 
+    revision = get_revision()
     report = {
         "timestamp": _now_iso(),
+        "revision": revision,
         "trading_mode": mode,
         "env": env,
         "active_exchange_client": active_exchange_client,
@@ -162,6 +176,8 @@ async def startup_report() -> dict:
         "websocket": ws_status,
     }
     storage.kv_set("startup_report", report)
+    # Greppable single line for `journalctl -u crypto-bot | grep BOT_REVISION`.
+    log.info("BOT_REVISION=%s mode=%s places_real_orders=%s", revision, mode, places_real_orders)
     log.info("startup report: %s", report)
     return report
 

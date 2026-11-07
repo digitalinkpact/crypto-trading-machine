@@ -17,7 +17,6 @@ import asyncio
 import hashlib
 import json
 import os
-import subprocess
 import time
 import uuid
 from collections import Counter
@@ -36,6 +35,7 @@ from app.exchange.ws_stream import live_prices
 from app.exchange.telemetry import exchange_telemetry
 from app.logging_setup import get_logger
 from app.regime import online_regime
+from app.revision import get_revision
 from app.signals import SignalAction
 from app.storage import storage
 from app.trading.audit import trade_audit_logger
@@ -169,20 +169,7 @@ def _jsonable(value):
 
 
 def _active_revision() -> str:
-    configured = os.getenv("GIT_REVISION")
-    if configured:
-        return configured
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return "unknown"
+    return get_revision()
 
 
 class Autopilot:
@@ -763,224 +750,6 @@ class Autopilot:
         log.warning("drawdown recovery recorded; new entries remain subject to all other gates")
 
     # ── execution ──────────────────────────────────────────────────────
-    async def _execute_signal(self, symbol: str, sig, *, allow_buys: bool) -> tuple[bool, str]:
-        """Execute one aggregated signal through Validate -> Risk -> Execute -> Log."""
-        s = get_settings()
-        snap = await portfolio_snapshot(mode=self.state.mode)
-        balance_source = snap.get("free_balances") or snap.get("all_balances") or {}
-        balances: dict[str, Decimal] = {
-            asset: Decimal(str(qty)) for asset, qty in balance_source.items()
-        }
-        usdt_free = Decimal(str(snap["usdt_cash"]))
-        total_eq = Decimal(str(snap["total_usdt"]))
-        open_positions = [
-            p for p in storage.all_positions() if p["mode"] == self.state.mode
-        ]
-        position_exists = any(p["symbol"] == symbol for p in open_positions)
-
-        if sig.action == SignalAction.HOLD:
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                final_outcome="rejected: hold",
-                detail={"reason": "signal_hold"},
-            )
-            return False, "hold"
-
-        if sig.confidence < s.min_signal_confidence:
-            reason = "Confidence below threshold"
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                final_outcome=f"rejected: {reason}",
-                detail={"threshold": s.min_signal_confidence},
-            )
-            return False, reason
-
-        if sig.action == SignalAction.BUY and not allow_buys:
-            reason = "Max exposure exceeded"
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=False,
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                final_outcome=f"rejected: {reason}",
-            )
-            return False, reason
-
-        if sig.action == SignalAction.BUY and position_exists:
-            reason = "Position already exists"
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=True,
-                position_exists=True,
-                available_balance=usdt_free,
-                final_outcome=f"rejected: {reason}",
-            )
-            return False, reason
-
-        if sig.action == SignalAction.SELL:
-            base = symbol.removesuffix("USDT")
-            free = balances.get(base, Decimal("0"))
-            tracked_qty = next(
-                (
-                    Decimal(str(p.get("qty") or 0))
-                    for p in open_positions
-                    if p["symbol"] == symbol and p["mode"] == self.state.mode
-                ),
-                Decimal("0"),
-            )
-            sell_qty = min(tracked_qty, free)
-            if tracked_qty <= 0:
-                reason = "SELL rejected: no tracked position"
-                trade_audit_logger.log_event(
-                    mode=self.state.mode, symbol=symbol, signal=sig.action.value,
-                    confidence=float(sig.confidence), risk_passed=False,
-                    position_exists=False, available_balance=free,
-                    execution_attempted=False, final_outcome=f"rejected: {reason}",
-                )
-                return False, reason
-            if sell_qty <= 0:
-                reason = "SELL rejected: no exchange balance"
-                trade_audit_logger.log_event(
-                    mode=self.state.mode,
-                    symbol=symbol,
-                    signal=sig.action.value,
-                    confidence=float(sig.confidence),
-                    risk_passed=True,
-                    position_exists=True,
-                    available_balance=free,
-                    execution_attempted=False,
-                    final_outcome=f"rejected: {reason}",
-                )
-                return False, reason
-            order = await self._submit(symbol, OrderSide.SELL, sell_qty, list(getattr(sig, "contributing_agents", []) or []))
-            ok = self._order_filled(order)
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=True,
-                position_exists=position_exists,
-                available_balance=sell_qty,
-                execution_attempted=True,
-                min_notional_passed=True,
-                binance_response=(getattr(order, "status", "NONE") if order else "NONE"),
-                final_outcome=("executed" if ok else "rejected: Binance rejected order"),
-                detail={"order_id": getattr(order, "exchange_order_id", None) if order else None},
-            )
-            return ok, ("executed" if ok else "Binance rejected order")
-
-        # BUY path
-        entry_block_reason = self._entry_block_reason()
-        if entry_block_reason:
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=False,
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                final_outcome=f"rejected: {entry_block_reason}",
-            )
-            return False, entry_block_reason
-
-        long_exposure_pct = float(
-            (total_eq - usdt_free) / total_eq if total_eq > 0 else Decimal("0")
-        )
-        open_count = len(open_positions)
-        ok_risk, why = risk.can_open_new_position(
-            open_positions=open_count,
-            long_exposure_pct=long_exposure_pct,
-        )
-        if not ok_risk:
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=False,
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                final_outcome="rejected: Max exposure exceeded",
-                detail={"reason": why},
-            )
-            return False, why
-
-        atr_pct = await self._atr_pct(symbol)
-        eff_pct = risk.volatility_scaled_pct(s.max_position_pct, atr_pct)
-        per_trade_usdt = usdt_free * Decimal(str(eff_pct))
-        if per_trade_usdt < 10:
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=True,
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                min_notional_passed=False,
-                final_outcome="rejected: No available funds",
-                detail={"required_min_usdt": 10, "computed_usdt": str(per_trade_usdt)},
-            )
-            return False, "No available funds"
-
-        plan = await self._buy_order_plan(symbol, per_trade_usdt)
-        meets_min = bool(plan["meets_min"])
-        if not meets_min:
-            trade_audit_logger.log_event(
-                mode=self.state.mode,
-                symbol=symbol,
-                signal=sig.action.value,
-                confidence=float(sig.confidence),
-                risk_passed=True,
-                position_exists=position_exists,
-                available_balance=usdt_free,
-                min_notional_passed=False,
-                final_outcome="rejected: Min notional check failed",
-                detail={"plan": _jsonable(plan)},
-            )
-            return False, "Min notional check failed"
-
-        order = await self._submit(
-            symbol,
-            OrderSide.BUY,
-            plan["rounded_qty"],
-            list(getattr(sig, "contributing_agents", []) or []),
-        )
-        ok = self._order_filled(order)
-        trade_audit_logger.log_event(
-            mode=self.state.mode,
-            symbol=symbol,
-            signal=sig.action.value,
-            confidence=float(sig.confidence),
-            risk_passed=True,
-            position_exists=position_exists,
-            available_balance=usdt_free,
-            min_notional_passed=True,
-            execution_attempted=True,
-            binance_response=(getattr(order, "status", "NONE") if order else "NONE"),
-            final_outcome=("executed" if ok else "rejected: Binance rejected order"),
-            detail={"plan": _jsonable(plan), "order_id": getattr(order, "exchange_order_id", None) if order else None},
-        )
-        return ok, ("executed" if ok else "Binance rejected order")
-
     async def _execute(self, signals, *, allow_buys: bool = True) -> None:
         skip_counter: Counter[str] = Counter()
         tick_debug: dict[str, dict] = {}
@@ -2808,7 +2577,6 @@ class Autopilot:
                     # fully modeled estimate for the whole trade rather than
                     # fabricate a partial number.
                     actual_exit_fee_usdt = None
-                    entry_fee = (pos or {}).get("entry_fee_usdt")
                     if order.commission is not None and order.commission_asset == "USDT":
                         actual_exit_fee_usdt = float(order.commission)
                     storage.reduce_position(

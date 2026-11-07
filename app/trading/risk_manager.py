@@ -83,7 +83,10 @@ class RiskManager:
 
     def _loss_cooldown_active(self, mode: str) -> tuple[bool, str]:
         s = get_settings()
-        trades = [t for t in storage.closed_trades(limit=100) if t.get("mode") == mode]
+        # Loss streak is counted per closed POSITION (fee-adjusted, partial TP
+        # legs summed), not per leg row, so it matches the win-rate definition
+        # the aggressive-mode guard uses.
+        trades = storage.closed_positions(limit=100, mode=mode)
         if not trades:
             return False, "ok"
 

@@ -16,12 +16,11 @@ chmod 600 /opt/crypto-trading-machine/.env
 
 ## 2. App protection
 
-The app supports optional HTTP Basic auth for all routes except /healthz.
-
-Set both values in .env:
-
-- APP_BASIC_AUTH_USER
-- APP_BASIC_AUTH_PASSWORD
+All routes except /healthz and /health require a login session
+(app/auth/middleware.py). Set a long random `SESSION_SECRET` in .env
+(`python -c "import secrets; print(secrets.token_urlsafe(48))"`), set `BASE_URL`
+and `FORCE_HTTPS=true` behind a TLS-terminating proxy, and optionally restrict
+`AUTH_IP_ALLOWLIST`. Reset a password with `python -m scripts.reset_password`.
 
 Then restart:
 

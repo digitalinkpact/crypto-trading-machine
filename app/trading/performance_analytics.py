@@ -8,12 +8,16 @@ import json
 import math
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 from statistics import mean, pstdev
 
 from app.config import get_settings
 from app.logging_setup import get_logger
 from app.storage import storage
+from app.trading.win_rate import (
+    collapse_to_positions,
+    open_position_keys,
+    win_rate_summary,
+)
 
 log = get_logger(__name__)
 
@@ -84,30 +88,19 @@ def build_performance_snapshot(*, mode: str, lookback_days: int = 180) -> dict:
     closed = [r for r in storage.closed_trades(limit=5000) if r.get("mode") == mode]
     closed = [r for r in closed if (_parse_dt(str(r.get("exit_ts") or "")) or cutoff) >= cutoff]
 
-    # Win-rate KPIs are measured per POSITION (rows grouped by symbol+entry_ts)
-    # so a winner scaled out across TP1/TP2/trailing legs counts once, not
-    # several times (see Settings.win_rate_position_level).
-    if getattr(get_settings(), "win_rate_position_level", True):
-        # Same rules as Storage.closed_positions: book-keeping closes aren't
-        # trades, and a position still open after a TP1/TP2 partial isn't a
-        # closed position yet (its banked leg alone would read as a win).
-        try:
-            open_keys = {
-                (str(p.get("symbol") or ""), str(p.get("entry_ts") or ""))
-                for p in storage.all_positions() if p.get("mode") == mode
-            }
-        except Exception:  # noqa: BLE001
-            open_keys = set()
-        _grouped: dict[tuple[str, str], float] = defaultdict(float)
-        for r in closed:
-            reason = str(r.get("exit_reason") or "")
-            if reason == "reconcile_stale" or reason.endswith("_stale_dust"):
-                continue
-            key = (str(r.get("symbol") or ""), str(r.get("entry_ts") or ""))
-            if key in open_keys:
-                continue
-            _grouped[key] += _to_float(r.get("pnl", 0.0))
-        pnls = list(_grouped.values())
+    # Both win-rate definitions are always computed and published side by side
+    # (see app/trading/win_rate.py). The headline `win_rate` KPI follows
+    # Settings.win_rate_position_level (default True = per position, fee-adjusted).
+    try:
+        open_keys = open_position_keys(
+            p for p in storage.all_positions() if p.get("mode") == mode
+        )
+    except Exception:  # noqa: BLE001
+        open_keys = set()
+    wr = win_rate_summary(closed, open_keys)
+    position_level = getattr(get_settings(), "win_rate_position_level", True)
+    if position_level:
+        pnls = [_to_float(p["pnl"]) for p in collapse_to_positions(closed, open_keys)]
     else:
         pnls = [_to_float(r.get("pnl", 0.0)) for r in closed]
     wins = [p for p in pnls if p > 0]
@@ -193,6 +186,11 @@ def build_performance_snapshot(*, mode: str, lookback_days: int = 180) -> dict:
         "trade_count": trade_count,
         "closed_row_count": len(closed),
         "win_rate": win_rate,
+        "win_rate_definition": "position" if position_level else "row",
+        "win_rate_position_level": wr["position_win_rate"],
+        "win_rate_row_level": wr["row_win_rate"],
+        "win_rate_position_n": wr["position_n"],
+        "win_rate_note": wr["note"],
         "profit_factor": profit_factor,
         "expectancy": expectancy,
         "average_winner": avg_winner,
@@ -217,10 +215,12 @@ def build_performance_snapshot(*, mode: str, lookback_days: int = 180) -> dict:
 def run_and_log_snapshot(*, mode: str, lookback_days: int = 180) -> dict:
     snapshot = build_performance_snapshot(mode=mode, lookback_days=lookback_days)
     log.info(
-        "analytics mode=%s trades=%d win_rate=%.2f%% pf=%.2f sharpe=%.2f max_dd=%.2f%%",
+        "analytics mode=%s trades=%d win_rate[position]=%.2f%% win_rate[row,legacy]=%.2f%% "
+        "pf=%.2f sharpe=%.2f max_dd=%.2f%%",
         mode,
         snapshot["trade_count"],
-        snapshot["win_rate"] * 100,
+        snapshot["win_rate_position_level"] * 100,
+        snapshot["win_rate_row_level"] * 100,
         snapshot["profit_factor"] if snapshot["profit_factor"] != float("inf") else 999.0,
         snapshot["sharpe_ratio"],
         snapshot["maximum_drawdown"] * 100,
