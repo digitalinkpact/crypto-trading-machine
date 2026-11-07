@@ -43,7 +43,7 @@ def _is_stable_pair(symbol: str) -> bool:
     return base.startswith("USD") or base.endswith("USD")
 
 
-async def fetch_dynamic_symbols() -> List[str]:
+async def fetch_dynamic_symbols(top_n_override: Optional[int] = None) -> List[str]:
     """Fetch tradable USDT pairs from Binance.US (status=TRADING).
 
     Excludes leveraged ETF tokens and stablecoin->stablecoin pairs. When
@@ -51,18 +51,24 @@ async def fetch_dynamic_symbols() -> List[str]:
     floor (a liquidity guard against thin-book slippage). When `max_symbols > 0`,
     caps the result to the top-N pairs ranked by 24h quote volume (most liquid).
     Cached for `symbols_cache_minutes`. Falls back to the static list on any
-    API failure.
+    API failure. `top_n_override` (used by the liquid-universe fallback) forces
+    the volume-ranked cap and bypasses the shared cache so a capped list is
+    never served to, or poisoned by, the uncapped path.
     """
     s = get_settings()
     cache_minutes = getattr(s, "symbols_cache_minutes", 60)
     now = time.time()
-    if _SYMBOLS_CACHE["symbols"] and (now - _SYMBOLS_CACHE["timestamp"] < cache_minutes * 60):
+    if top_n_override is None and _SYMBOLS_CACHE["symbols"] and (
+        now - _SYMBOLS_CACHE["timestamp"] < cache_minutes * 60
+    ):
         return _SYMBOLS_CACHE["symbols"]
 
     base_url = s.binance_base_url.rstrip("/")
     exclude_leveraged = getattr(s, "exclude_leveraged_tokens", True)
     floor = float(getattr(s, "min_quote_volume_usdt", 0.0) or 0.0)
     top_n = int(getattr(s, "max_symbols", 0) or 0)
+    if top_n_override is not None:
+        top_n = top_n_override if top_n <= 0 else min(top_n, top_n_override)
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(f"{base_url}/api/v3/exchangeInfo")
@@ -93,8 +99,9 @@ async def fetch_dynamic_symbols() -> List[str]:
                     )[:top_n]
 
             symbols.sort()
-            _SYMBOLS_CACHE["symbols"] = symbols
-            _SYMBOLS_CACHE["timestamp"] = now
+            if top_n_override is None:
+                _SYMBOLS_CACHE["symbols"] = symbols
+                _SYMBOLS_CACHE["timestamp"] = now
             log.info(
                 "dynamic symbols: %d USDT pairs (leveraged_excluded=%s, vol_floor=%.0f, top_n=%d)",
                 len(symbols), exclude_leveraged, floor, top_n,
@@ -256,10 +263,10 @@ async def fetch_liquid_universe(
             log.warning(
                 "[UNIVERSE] staged pipeline yielded 0 survivors "
                 "(min_24h_volume=$%.0f, max_spread=%.2f%%). Falling back to "
-                "fetch_dynamic_symbols.",
-                min_vol, max_spread,
+                "fetch_dynamic_symbols (capped at top-%d by volume).",
+                min_vol, max_spread, final_size,
             )
-            return await fetch_dynamic_symbols()
+            return await fetch_dynamic_symbols(top_n_override=final_size)
 
         _LIQUID_CACHE["symbols"] = final
         _LIQUID_CACHE["timestamp"] = now
@@ -271,7 +278,9 @@ async def fetch_liquid_universe(
     except Exception as exc:  # noqa: BLE001
         log.warning("[UNIVERSE] liquid pairlist build failed: %s. Falling back.", exc)
         try:
-            return await fetch_dynamic_symbols()
+            # Uncapped, this fallback would scan the whole ~198-pair universe —
+            # the exact widening that dropped win rate ~95% -> ~69%.
+            return await fetch_dynamic_symbols(top_n_override=final_size)
         except Exception as e:  # noqa: BLE001
             log.exception("Trade execution failure: %s", e)
             return list(getattr(s, "static_symbols", []))

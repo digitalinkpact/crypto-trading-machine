@@ -114,7 +114,9 @@ async def test_profitstream_buys_daily_dip_with_btc_risk_on(monkeypatch):
     assert decision.score >= 90
 
 
-async def test_profitstream_btc_risk_off_is_soft_penalty(monkeypatch):
+async def test_profitstream_btc_risk_off_is_hard_gate_by_default(monkeypatch):
+    """BTC not aligned blocks the entry outright; it no longer relies on a
+    -10 score penalty happening to land under the score threshold."""
     import app.trading.strategy as strategy_module
     from app.config import get_settings as real_get_settings
 
@@ -135,9 +137,19 @@ async def test_profitstream_btc_risk_off_is_soft_penalty(monkeypatch):
     monkeypatch.setattr(strategy_module, "get_settings", lambda: real.model_copy(update={"entry_strategy": "dip_buy"}))
 
     decision = await strategy.analyze_symbol("ETHUSDT", mode="paper")
+    assert decision.action == SignalAction.HOLD
+    assert "btc_trend_not_aligned" in decision.reasons
 
-    assert decision.action == SignalAction.BUY
-    assert "btc_trend_not_aligned_soft" in decision.reasons
+    # Legacy soft-penalty behaviour stays reachable behind the flag.
+    monkeypatch.setattr(
+        strategy_module,
+        "get_settings",
+        lambda: real.model_copy(update={"entry_strategy": "dip_buy", "btc_alignment_hard_gate": False}),
+    )
+    soft = await strategy.analyze_symbol("ETHUSDT", mode="paper")
+    assert soft.action == SignalAction.BUY
+    assert "btc_trend_not_aligned_soft" in soft.reasons
+    assert soft.score < 80  # runner would still drop it at the 80 threshold
 
 
 async def test_profitstream_bull_regime_pending_golden_cross_scores_high(monkeypatch):
@@ -188,71 +200,77 @@ async def test_profitstream_bull_regime_pending_golden_cross_scores_high(monkeyp
     assert "btc_trend_not_aligned_soft" not in decision.reasons
 
 
-async def test_profitstream_buys_pullback_and_keeps_spread_filter(monkeypatch):
-    strategy = ProfitStreamStrategy()
+def _pullback_frame(*, close: float, rsi: float, ema20: float) -> pd.DataFrame:
+    df = _frame(
+        close=close, rsi=rsi, bb_lower=80, bb_mid=98, ema20=ema20, ema50=95,
+        ema200=90, macd_hist=[0.1, 0.2],
+    )
+    df["vol_sma_20"] = 10.0
+    return df
+
+
+def _pullback_setup_env(monkeypatch, strategy, eth_df, spread):
     frames = {
-        ("ETHUSDT", "1d"): _frame(
-            close=107,
-            rsi=70,
-            bb_lower=90,
-            bb_mid=98,
-            ema20=100,
-            ema50=95,
-            ema200=90,
-        ),
+        ("ETHUSDT", "1d"): eth_df,
         ("BTCUSDT", "1d"): _frame(
-            close=90000,
-            rsi=55,
-            bb_lower=85000,
-            bb_mid=88000,
-            ema50=87000,
-            ema200=97000,
+            close=100000, rsi=55, bb_lower=95000, bb_mid=98000, ema50=99000, ema200=97000,
         ),
     }
 
     async def _candles(self, symbol: str, interval: str, limit: int):
         return frames[(symbol, interval)]
 
-    async def _tight_spread(*_args, **_kwargs):
-        return 0.01
+    async def _spread(*_args, **_kwargs):
+        return spread
 
     monkeypatch.setattr(ProfitStreamStrategy, "_candles", _candles, raising=True)
-    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", _tight_spread, raising=True)
+    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", _spread, raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_near_news_event", lambda *_a, **_k: (False, ""), raising=True)
     monkeypatch.setattr(ProfitStreamStrategy, "_is_held", lambda *_a, **_k: False, raising=True)
 
-    decision = await strategy.analyze_symbol("ETHUSDT", mode="live")
 
+async def test_profitstream_buys_tight_pullback_with_single_spread_cap(monkeypatch):
+    strategy = ProfitStreamStrategy()
+    _pullback_setup_env(monkeypatch, strategy, _pullback_frame(close=101, rsi=50, ema20=100), 0.001)
+
+    decision = await strategy.analyze_symbol("ETHUSDT", mode="live")
     assert decision.action == SignalAction.BUY
     assert decision.indicators["entry_strategy"] == "pullback"
     assert decision.indicators["pullback_ready"] is True
-    assert "btc_trend_not_aligned_soft" in decision.reasons
+    assert decision.score >= 80
 
-    async def _wide_spread(*_args, **_kwargs):
-        return 0.011
+    # The pullback path no longer gets a 1% spread allowance: 0.25% for all.
+    _pullback_setup_env(monkeypatch, strategy, _pullback_frame(close=101, rsi=50, ema20=100), 0.003)
+    wide = await strategy.analyze_symbol("ETHUSDT", mode="live")
+    assert wide.action == SignalAction.HOLD
+    assert "spread_wide:0.3000%>0.2500%" in wide.reasons
 
-    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", _wide_spread, raising=True)
-    blocked = await strategy.analyze_symbol("ETHUSDT", mode="live")
+    # An unverifiable spread blocks the entry instead of passing it.
+    _pullback_setup_env(monkeypatch, strategy, _pullback_frame(close=101, rsi=50, ema20=100), None)
+    unknown = await strategy.analyze_symbol("ETHUSDT", mode="live")
+    assert unknown.action == SignalAction.HOLD
+    assert "spread_unknown" in unknown.reasons
 
-    assert blocked.action == SignalAction.HOLD
-    assert any(reason.startswith("spread_wide:") for reason in blocked.reasons)
 
-    frames[("ETHUSDT", "1d")] = _frame(
-        close=90,
-        rsi=25,
-        bb_lower=95,
-        bb_mid=105,
-        ema20=100,
-        ema50=95,
-        ema200=90,
-    )
+async def test_profitstream_loose_pullback_needs_tight_candidate_confirmation(monkeypatch):
+    """Close 6% above EMA20 with RSI 60 passes the loose `_pullback_setup` (any
+    uptrend coin does) but is not a pullback per the tight candidate."""
+    strategy = ProfitStreamStrategy()
+    _pullback_setup_env(monkeypatch, strategy, _pullback_frame(close=106, rsi=60, ema20=100), 0.001)
 
-    async def _dip_wide_spread(*_args, **_kwargs):
-        return 0.003
+    decision = await strategy.analyze_symbol("ETHUSDT", mode="live")
+    assert decision.action == SignalAction.HOLD
+    assert decision.indicators["pullback_loose_ready"] is True
+    assert decision.indicators["pullback_ready"] is False
+    assert "pullback_not_tight_ema_candidate" in decision.reasons
 
-    monkeypatch.setattr(ProfitStreamStrategy, "_spread_pct", _dip_wide_spread, raising=True)
+
+async def test_profitstream_dip_spread_cap_is_unchanged(monkeypatch):
+    strategy = ProfitStreamStrategy()
+    eth = _frame(close=90, rsi=25, bb_lower=95, bb_mid=105, ema20=100, ema50=95, ema200=90)
+    _pullback_setup_env(monkeypatch, strategy, eth, 0.003)
+
     dip_blocked = await strategy.analyze_symbol("ETHUSDT", mode="live")
-
     assert dip_blocked.action == SignalAction.HOLD
     assert "spread_wide:0.3000%>0.2500%" in dip_blocked.reasons
 

@@ -290,3 +290,48 @@ def test_mfe_mae_pct_none_when_never_tracked():
     mfe, mae = risk.mfe_mae_pct("NEWCOINUSDT", Decimal("100"))
     assert mfe is None
     assert mae is None
+
+
+def test_dynamic_stop_never_tighter_than_fixed_stop(monkeypatch):
+    """A quiet coin (ATR% 0.5% -> raw 1%) must not get a sub-4% stop even if the
+    ATR floor is mis-set below the fixed stop."""
+    from decimal import Decimal
+
+    class _S:
+        stop_loss_pct = 0.04
+        atr_stop_enabled = True
+        atr_stop_multiple = 2.0
+        atr_stop_min_pct = 0.02
+        atr_stop_max_pct = 0.08
+
+    monkeypatch.setattr(risk, "get_settings", lambda: _S())
+    assert risk.dynamic_stop_pct(0.005) == Decimal("0.04")
+    assert risk.dynamic_stop_pct(0.05) == Decimal("0.08")  # ceiling still applies
+    assert risk.dynamic_stop_pct(None) == Decimal("0.04")
+
+
+def test_entry_cap_cannot_exceed_max_open_positions(monkeypatch):
+    from decimal import Decimal
+
+    from app.trading import risk_manager as rm
+
+    class _S:
+        aggressive_max_open_positions = 12
+        rollback_max_open_positions = 12
+        max_open_positions = 5
+        aggressive_position_pct = 0.06
+        rollback_position_pct = 0.03
+        max_long_exposure_pct = 0.99
+        risk_per_trade_pct = 0.01
+        stop_loss_pct = 0.04
+        kelly_fraction_cap = 1.0
+        loss_streak_pause_count = 3
+        loss_streak_pause_minutes = 60
+
+    monkeypatch.setattr(rm, "get_settings", lambda: _S())
+    monkeypatch.setattr(rm.storage, "closed_trades", lambda limit=100: [])
+    d = rm.RiskManager().evaluate_entry(
+        mode="live", total_equity_usdt=Decimal("1000"), open_positions=5,
+        long_exposure_pct=0.1, entry_price=Decimal("10"), aggressive_mode=True,
+    )
+    assert d.allow is False and d.reason == "max_open_positions=5"

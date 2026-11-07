@@ -133,3 +133,33 @@ def test_live_mode_does_not_change_regime_or_loss_controls(monkeypatch):
     assert s.market_regime_gate_enabled is False
     assert s.drawdown_circuit_breaker_pct == 0.15
     assert s.daily_loss_limit_enabled is True
+
+
+def test_win_rate_locked_defaults_pass_without_guardrail_warnings(caplog):
+    import logging
+
+    with caplog.at_level(logging.CRITICAL, logger="app.config"):
+        s = Settings(_env_file=None)
+    assert "WIN-RATE GUARDRAIL OVERRIDDEN" not in caplog.text
+    assert (s.universe_size, s.final_pairlist_size) == (75, 50)
+    assert (s.max_open_positions, s.aggressive_max_open_positions, s.rollback_max_open_positions) == (12, 12, 12)
+    assert s.stop_loss_pct >= 0.04 and s.atr_stop_min_pct >= 0.04
+    assert s.mean_reversion_exit_enabled is False
+    assert s.profitstream_score_threshold == 80
+    assert s.trend_filter_enabled and not s.trend_gate_bypass_enabled
+    assert not s.profitstream_trend_soft_penalty
+    assert s.btc_alignment_hard_gate and s.pullback_require_candidate_confirmation
+
+
+def test_widening_a_win_rate_guardrail_is_logged_loudly(caplog):
+    import logging
+
+    with caplog.at_level(logging.CRITICAL, logger="app.config"):
+        Settings(
+            _env_file=None, universe_size=200, final_pairlist_size=100,
+            aggressive_max_open_positions=50, stop_loss_pct=0.015,
+            mean_reversion_exit_enabled=True,
+        )
+    for name in ("universe_size", "final_pairlist_size", "aggressive_max_open_positions",
+                 "stop_loss_pct", "mean_reversion_exit_enabled"):
+        assert f"WIN-RATE GUARDRAIL OVERRIDDEN: {name}=" in caplog.text

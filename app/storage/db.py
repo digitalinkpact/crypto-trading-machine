@@ -212,6 +212,42 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Book-keeping closes (phantom/stale rows closed at the entry price) are not
+# trades: they must not count as wins or losses in any win-rate measure.
+_BOOKKEEPING_EXIT_SQL = "(COALESCE(exit_reason, '') = 'reconcile_stale' OR COALESCE(exit_reason, '') LIKE '%\\_stale\\_dust' ESCAPE '\\')"
+
+
+def _is_bookkeeping_exit(reason: Optional[str]) -> bool:
+    r = str(reason or "")
+    return r == "reconcile_stale" or r.endswith("_stale_dust")
+
+
+def _record_position_outcome(
+    c: Any, *, symbol: str, mode: str, entry_ts: str, agents: list, now: str,
+) -> None:
+    """Credit agent_stats ONCE per fully-closed position, on its summed net pnl.
+
+    Counting every partial TP1/TP2/trailing leg as its own win (while a loser
+    is a single row) inflated agent win rates, which feed adaptive weights.
+    """
+    row = c.execute(
+        "SELECT COALESCE(SUM(pnl), 0) AS pnl FROM closed_trades "
+        "WHERE symbol=? AND mode=? AND entry_ts=? AND NOT " + _BOOKKEEPING_EXIT_SQL,
+        (symbol, mode, entry_ts),
+    ).fetchone()
+    pnl = float(row["pnl"]) if row else 0.0
+    won = pnl > 0
+    for agent in agents:
+        c.execute(
+            "INSERT INTO agent_stats(agent,wins,losses,total_pnl,last_updated) "
+            "VALUES(?,?,?,?,?) "
+            "ON CONFLICT(agent) DO UPDATE SET "
+            "wins=wins+excluded.wins, losses=losses+excluded.losses, "
+            "total_pnl=total_pnl+excluded.total_pnl, last_updated=excluded.last_updated",
+            (agent, 1 if won else 0, 0 if won else 1, pnl, now),
+        )
+
+
 def _holding_hours(entry_ts: str, exit_ts: str) -> Optional[float]:
     try:
         start = datetime.fromisoformat(str(entry_ts))
@@ -614,14 +650,26 @@ class Storage:
             gross_pnl = (exit_p - entry) * qty
             entry_fee = row["entry_fee_usdt"] if "entry_fee_usdt" in row.keys() else None
             if actual_fee_usdt is not None:
-                fee_amount = float(actual_fee_usdt)
-                fee_source = "actual"
+                # `actual_fee_usdt` is the EXIT fill's commission; the buy-side
+                # fee must still be charged (recorded if known, else modeled) or
+                # PnL is overstated by a full leg of fees.
+                entry_fee_cost = (
+                    float(entry_fee) if entry_fee is not None
+                    else entry * qty * taker_fee
+                )
+                fee_amount = float(actual_fee_usdt) + entry_fee_cost
+                fee_source = "actual" if entry_fee is not None else "mixed"
             elif entry_fee is not None:
                 fee_amount = float(entry_fee) + (exit_p * qty * taker_fee)
                 fee_source = "mixed"
             else:
                 fee_amount = (entry * qty * taker_fee) + (exit_p * qty * taker_fee)
                 fee_source = "modeled"
+            if _is_bookkeeping_exit(exit_reason):
+                # Closed at entry to clear a phantom row: no trade happened, so
+                # no fee either — otherwise it books a fake loss.
+                fee_amount = 0.0
+                fee_source = "none"
             pnl = gross_pnl - fee_amount
             entry_notional = entry * qty
             pnl_pct = ((pnl / entry_notional) * 100) if entry_notional else 0.0
@@ -647,15 +695,10 @@ class Storage:
                  entry_confidence, entry_strategy, entry_btc_regime,
                  gross_pnl, fee_amount, fee_source, pnl, pnl_pct),
             )
-            won = pnl > 0
-            for agent in agents_list:
-                c.execute(
-                    "INSERT INTO agent_stats(agent,wins,losses,total_pnl,last_updated) "
-                    "VALUES(?,?,?,?,?) "
-                    "ON CONFLICT(agent) DO UPDATE SET "
-                    "wins=wins+excluded.wins, losses=losses+excluded.losses, "
-                    "total_pnl=total_pnl+excluded.total_pnl, last_updated=excluded.last_updated",
-                    (agent, 1 if won else 0, 0 if won else 1, pnl, now),
+            if not _is_bookkeeping_exit(reason):
+                _record_position_outcome(
+                    c, symbol=symbol, mode=mode, entry_ts=entry_ts,
+                    agents=agents_list, now=now,
                 )
         return {
             "symbol": symbol, "qty": qty, "entry_price": entry,
@@ -708,14 +751,27 @@ class Storage:
                     if actual_exit_fee_usdt is not None
                     else exit_p * reduce_qty * taker_fee
                 )
+                entry_fee_known = entry_fee is not None
+                if not entry_fee_known:
+                    # Buy-side commission is usually paid in the base coin, so
+                    # it is recorded as unknown. Dropping it (the old behaviour)
+                    # overstated PnL and could flip a ~breakeven trade to a win;
+                    # charge the modeled entry fee instead.
+                    allocated_entry_fee = entry * reduce_qty * taker_fee
                 fee_amount = allocated_entry_fee + exit_fee
-                fee_source = "actual" if actual_exit_fee_usdt is not None else "mixed"
+                fee_source = (
+                    "actual" if (entry_fee_known and actual_exit_fee_usdt is not None)
+                    else "mixed"
+                )
             elif actual_fee_usdt is not None:
                 fee_amount = float(actual_fee_usdt)
                 fee_source = "actual"
             else:
                 fee_amount = (entry * reduce_qty * taker_fee) + (exit_p * reduce_qty * taker_fee)
                 fee_source = "modeled"
+            if _is_bookkeeping_exit(exit_reason):
+                fee_amount = 0.0
+                fee_source = "none"
             pnl = gross_pnl - fee_amount
             entry_notional = entry * reduce_qty
             pnl_pct = ((pnl / entry_notional) * 100) if entry_notional else 0.0
@@ -734,7 +790,12 @@ class Storage:
             else:
                 c.execute(
                     "UPDATE positions SET qty=?, entry_fee_usdt=? WHERE symbol=? AND mode=?",
-                    (remaining, max(0.0, float(entry_fee or 0) - allocated_entry_fee), symbol, mode),
+                    (
+                        remaining,
+                        (max(0.0, float(entry_fee) - allocated_entry_fee)
+                         if entry_fee is not None else None),
+                        symbol, mode,
+                    ),
                 )
             c.execute(
                 "INSERT INTO closed_trades(mode,symbol,qty,entry_price,exit_price,pnl,"
@@ -747,15 +808,10 @@ class Storage:
                  entry_confidence, entry_strategy, entry_btc_regime,
                  gross_pnl, fee_amount, fee_source, pnl, pnl_pct),
             )
-            won = pnl > 0
-            for agent in agents_list:
-                c.execute(
-                    "INSERT INTO agent_stats(agent,wins,losses,total_pnl,last_updated) "
-                    "VALUES(?,?,?,?,?) "
-                    "ON CONFLICT(agent) DO UPDATE SET "
-                    "wins=wins+excluded.wins, losses=losses+excluded.losses, "
-                    "total_pnl=total_pnl+excluded.total_pnl, last_updated=excluded.last_updated",
-                    (agent, 1 if won else 0, 0 if won else 1, pnl, now),
+            if remaining <= 1e-12 and not _is_bookkeeping_exit(reason):
+                _record_position_outcome(
+                    c, symbol=symbol, mode=mode, entry_ts=entry_ts,
+                    agents=agents_list, now=now,
                 )
         return {
             "symbol": symbol,
@@ -842,16 +898,26 @@ class Storage:
         Ordered most-recent-first by the last leg's id. Used for win-rate
         decisions so partial winners aren't counted multiple times.
         """
+        # Two things must never reach a win-rate numerator/denominator:
+        #  * book-keeping closes (phantom rows closed at entry), and
+        #  * positions that are still OPEN after a TP1/TP2 partial — their banked
+        #    leg is positive on its own, so counting it early reads as a win
+        #    before the remainder has had a chance to stop out.
         sql = (
-            "SELECT symbol, entry_ts, SUM(pnl) AS pnl, "
-            "SUM(COALESCE(pnl_pct, 0)) AS pnl_pct, MAX(exit_ts) AS exit_ts, "
-            "MAX(id) AS last_id, COUNT(*) AS rows FROM closed_trades "
+            "SELECT ct.symbol AS symbol, ct.entry_ts AS entry_ts, SUM(ct.pnl) AS pnl, "
+            "SUM(COALESCE(ct.pnl_pct, 0)) AS pnl_pct, MAX(ct.exit_ts) AS exit_ts, "
+            "MAX(ct.id) AS last_id, COUNT(*) AS rows, ct.mode AS mode "
+            "FROM closed_trades ct "
+            "WHERE NOT (COALESCE(ct.exit_reason, '') = 'reconcile_stale' "
+            "OR COALESCE(ct.exit_reason, '') LIKE '%\\_stale\\_dust' ESCAPE '\\') "
+            "AND NOT EXISTS (SELECT 1 FROM positions p WHERE p.symbol = ct.symbol "
+            "AND p.mode = ct.mode AND p.entry_ts = ct.entry_ts) "
         )
         params: list = []
         if mode is not None:
-            sql += "WHERE mode=? "
+            sql += "AND ct.mode=? "
             params.append(mode)
-        sql += "GROUP BY symbol, entry_ts ORDER BY last_id DESC LIMIT ?"
+        sql += "GROUP BY ct.symbol, ct.mode, ct.entry_ts ORDER BY last_id DESC LIMIT ?"
         params.append(limit)
         with self._lock, self._conn() as c:
             rows = c.execute(sql, tuple(params)).fetchall()

@@ -82,3 +82,32 @@ def test_performance_snapshot_win_rate_is_position_level(monkeypatch):
     assert snapshot["trade_count"] == 2       # 2 positions, not 4 rows
     assert snapshot["win_rate"] == 0.5        # 1 winning position / 2 positions
     assert snapshot["closed_row_count"] == 4  # transparency: underlying rows
+
+
+def test_performance_snapshot_excludes_bookkeeping_and_open_partials(monkeypatch):
+    rows = [
+        # Closed winner (single leg).
+        {"mode": "paper", "pnl": 5.0, "pnl_pct": 5.0, "symbol": "BTCUSDT",
+         "entry_ts": "2026-08-01T00:00:00+00:00", "exit_ts": "2026-08-01T05:00:00+00:00", "agents": "[]"},
+        # Closed loser.
+        {"mode": "paper", "pnl": -4.0, "pnl_pct": -4.0, "symbol": "ETHUSDT",
+         "entry_ts": "2026-08-02T00:00:00+00:00", "exit_ts": "2026-08-02T03:00:00+00:00", "agents": "[]"},
+        # Phantom row closed at entry — not a trade.
+        {"mode": "paper", "pnl": -0.01, "pnl_pct": 0.0, "symbol": "SOLUSDT", "exit_reason": "reconcile_stale",
+         "entry_ts": "2026-08-03T00:00:00+00:00", "exit_ts": "2026-08-03T03:00:00+00:00", "agents": "[]"},
+        # TP1 leg of a position that is STILL OPEN — not closed yet.
+        {"mode": "paper", "pnl": 8.0, "pnl_pct": 8.0, "symbol": "ADAUSDT", "exit_reason": "take_profit_1",
+         "entry_ts": "2026-08-04T00:00:00+00:00", "exit_ts": "2026-08-04T03:00:00+00:00", "agents": "[]"},
+    ]
+    monkeypatch.setattr("app.trading.performance_analytics.storage.closed_trades", lambda limit=5000: rows)
+    monkeypatch.setattr(
+        "app.trading.performance_analytics.storage.all_positions",
+        lambda: [{"mode": "paper", "symbol": "ADAUSDT", "entry_ts": "2026-08-04T00:00:00+00:00"}],
+    )
+    monkeypatch.setattr("app.trading.performance_analytics.storage.equity_curve", lambda limit=3000: [])
+    monkeypatch.setattr("app.trading.performance_analytics.storage.recent_tick_audit", lambda limit=5000: [])
+    monkeypatch.setattr("app.trading.performance_analytics.storage.kv_set", lambda key, value: None)
+
+    snapshot = build_performance_snapshot(mode="paper", lookback_days=3650)
+    assert snapshot["trade_count"] == 2
+    assert snapshot["win_rate"] == 0.5

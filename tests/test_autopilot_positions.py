@@ -419,6 +419,7 @@ def test_trend_gate_bypass_requires_both_confidence_and_ml(monkeypatch):
     ap = Autopilot()
 
     class _S:
+        trend_gate_bypass_enabled = True
         trend_gate_bypass_confidence = 0.85
         trend_gate_bypass_ml_proba = 0.55
 
@@ -428,6 +429,17 @@ def test_trend_gate_bypass_requires_both_confidence_and_ml(monkeypatch):
     assert ap._trend_gate_bypass_allowed(0.84, 0.60, True) is False
     assert ap._trend_gate_bypass_allowed(0.90, 0.54, True) is False
     assert ap._trend_gate_bypass_allowed(0.90, None, True) is False
+
+
+def test_trend_gate_bypass_is_off_by_default(monkeypatch):
+    ap = Autopilot()
+
+    class _S:
+        trend_gate_bypass_confidence = 0.85
+        trend_gate_bypass_ml_proba = 0.55
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    assert ap._trend_gate_bypass_allowed(1.0, 0.99, True) is False
 
 
 def test_aggressive_mode_rolls_back_below_min_win_rate(monkeypatch):
@@ -950,7 +962,7 @@ async def test_execute_buy_pyramids_when_position_exists_and_confidence_is_high(
     monkeypatch.setattr(autopilot_module.filters, "is_listed", lambda _s: True, raising=True)
     monkeypatch.setattr(autopilot_module, "liquidity_gate", _ok)
     monkeypatch.setattr(Autopilot, "_market_gate", lambda *_a, **_k: asyncio.sleep(0, result=(True, "ok")), raising=True)
-    monkeypatch.setattr(Autopilot, "_trend_gate", lambda *_a, **_k: asyncio.sleep(0, result=(False, "downtrend")), raising=True)
+    monkeypatch.setattr(Autopilot, "_trend_gate", lambda *_a, **_k: asyncio.sleep(0, result=(True, "ok")), raising=True)
     monkeypatch.setattr(Autopilot, "_funding_gate", lambda *_a, **_k: asyncio.sleep(0, result=(True, "ok")), raising=True)
     monkeypatch.setattr(Autopilot, "_onchain_gate", lambda *_a, **_k: asyncio.sleep(0, result=(True, "ok")), raising=True)
     monkeypatch.setattr(Autopilot, "_buy_order_plan", _buy_plan, raising=True)
@@ -971,7 +983,29 @@ async def test_execute_buy_pyramids_when_position_exists_and_confidence_is_high(
     assert kv_state["pyramid_adds:live:BTCUSDT"] == 2
 
 
-def test_profitstream_trend_adjustment_is_soft_and_legacy_stays_blocked():
+def test_profitstream_trend_veto_is_hard_by_default(monkeypatch):
+    """Below the 200-EMA is never bought: the old -10 soft penalty was never
+    re-checked against the score threshold and let falling knives through."""
+    ap = Autopilot()
+
+    class _ProfitStreamSignal:
+        agent = "profitstream_strategy"
+        contributing_agents = ("profitstream_strategy",)
+        quality_score = 100
+
+    class _S:
+        profitstream_trend_soft_penalty = False
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    allowed, why, adjusted = ap._profitstream_trend_adjustment(
+        _ProfitStreamSignal(), False, "downtrend"
+    )
+    assert allowed is False
+    assert why == "downtrend"
+    assert adjusted is None
+
+
+def test_profitstream_trend_soft_penalty_only_when_explicitly_enabled(monkeypatch):
     ap = Autopilot()
 
     class _ProfitStreamSignal:
@@ -979,6 +1013,10 @@ def test_profitstream_trend_adjustment_is_soft_and_legacy_stays_blocked():
         contributing_agents = ("profitstream_strategy",)
         quality_score = 90
 
+    class _S:
+        profitstream_trend_soft_penalty = True
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
     allowed, why, adjusted = ap._profitstream_trend_adjustment(
         _ProfitStreamSignal(), False, "downtrend"
     )
@@ -1432,3 +1470,84 @@ async def test_correlation_basket_gate_symbol_not_in_group_allows(monkeypatch):
     assert ok is True
     assert why == "not_in_correlated_group"
 
+
+
+async def _run_ob_retry(monkeypatch, *, market=(True, "ok"), regime=2, breaker=False,
+                        halt=None, trend=(True, "ok"), blocked=(), quality=100):
+    """Drive _retry_orderbook_recheck with all collaborators stubbed; returns
+    the list of BUYs it actually placed."""
+    ap = Autopilot()
+    ap.state.mode = "live"
+    ap.state.running = True
+    placed: list[str] = []
+
+    class _S:
+        orderbook_retry_delay_seconds = 0
+        orderbook_retry_enabled = False
+        orderbook_retry_attempts = 1
+        blocked_symbols = blocked
+        buy_cooldown_minutes = 20
+        profitstream_score_threshold = 80
+        market_regime_sideways_score_bonus = 15
+
+    async def _snapshot(*, mode):
+        return {"usdt_cash": Decimal("100"), "total_usdt": Decimal("1000"),
+                "all_balances": {"USDT": Decimal("100")}}
+
+    async def _place_buy(_self, symbol, _sig, _notional):
+        placed.append(symbol)
+        return True
+
+    async def _market_gate(_self):
+        _self._last_regime_score = regime
+        return market
+
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
+    monkeypatch.setattr(autopilot_module, "portfolio_snapshot", _snapshot)
+    monkeypatch.setattr(autopilot_module.storage, "all_positions", lambda: [])
+    monkeypatch.setattr(Autopilot, "_count_non_dust_positions", lambda *_a, **_k: asyncio.sleep(0, result=(0, set())), raising=True)
+    monkeypatch.setattr(Autopilot, "_entry_block_reason", lambda _self: halt, raising=True)
+    monkeypatch.setattr(Autopilot, "_check_circuit_breaker", lambda *_a, **_k: asyncio.sleep(0, result=breaker), raising=True)
+    monkeypatch.setattr(Autopilot, "_market_gate", _market_gate, raising=True)
+    monkeypatch.setattr(Autopilot, "_trend_gate", lambda *_a, **_k: asyncio.sleep(0, result=trend), raising=True)
+    monkeypatch.setattr(Autopilot, "_price", lambda *_a, **_k: asyncio.sleep(0, result=Decimal("10")), raising=True)
+    monkeypatch.setattr(Autopilot, "_place_buy", _place_buy, raising=True)
+    monkeypatch.setattr(Autopilot, "_save", lambda *_a, **_k: None, raising=True)
+    monkeypatch.setattr(autopilot_module, "liquidity_gate", lambda *_a, **_k: asyncio.sleep(0, result=(True, "ok")))
+    monkeypatch.setattr(
+        autopilot_module.RiskManager, "evaluate_entry",
+        lambda *_a, **_k: __import__("types").SimpleNamespace(allow=True, reason="ok", notional_usdt=Decimal("50")),
+        raising=True,
+    )
+
+    class _Sig:
+        action = autopilot_module.SignalAction.BUY
+        quality_score = 0
+
+    _Sig.quality_score = quality
+    await ap._retry_orderbook_recheck(
+        symbol="ABCUSDT", sig=_Sig(), per_trade_usdt=Decimal("50"), attempt=1,
+        aggressive_mode=True, spread_cap=Decimal("0.0025"),
+    )
+    return placed
+
+
+async def test_orderbook_retry_places_buy_when_every_gate_still_passes(monkeypatch):
+    assert await _run_ob_retry(monkeypatch) == ["ABCUSDT"]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"market": (False, "BTC bear")},
+        {"breaker": True},
+        {"halt": "emergency_halt"},
+        {"trend": (False, "downtrend")},
+        {"blocked": ("ABCUSDT",)},
+        {"regime": 0, "quality": 90},  # sideways regime needs 95
+    ],
+)
+async def test_orderbook_retry_cannot_bypass_entry_gates(monkeypatch, kwargs):
+    """The retry fires minutes after the signal; it used to re-check only the
+    order book and risk caps, skipping the breaker, halts, regime and trend."""
+    assert await _run_ob_retry(monkeypatch, **kwargs) == []

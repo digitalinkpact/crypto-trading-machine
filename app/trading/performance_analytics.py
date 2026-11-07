@@ -88,9 +88,24 @@ def build_performance_snapshot(*, mode: str, lookback_days: int = 180) -> dict:
     # so a winner scaled out across TP1/TP2/trailing legs counts once, not
     # several times (see Settings.win_rate_position_level).
     if getattr(get_settings(), "win_rate_position_level", True):
+        # Same rules as Storage.closed_positions: book-keeping closes aren't
+        # trades, and a position still open after a TP1/TP2 partial isn't a
+        # closed position yet (its banked leg alone would read as a win).
+        try:
+            open_keys = {
+                (str(p.get("symbol") or ""), str(p.get("entry_ts") or ""))
+                for p in storage.all_positions() if p.get("mode") == mode
+            }
+        except Exception:  # noqa: BLE001
+            open_keys = set()
         _grouped: dict[tuple[str, str], float] = defaultdict(float)
         for r in closed:
+            reason = str(r.get("exit_reason") or "")
+            if reason == "reconcile_stale" or reason.endswith("_stale_dust"):
+                continue
             key = (str(r.get("symbol") or ""), str(r.get("entry_ts") or ""))
+            if key in open_keys:
+                continue
             _grouped[key] += _to_float(r.get("pnl", 0.0))
         pnls = list(_grouped.values())
     else:

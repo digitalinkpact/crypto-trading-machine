@@ -177,8 +177,10 @@ def dynamic_stop_pct(atr_pct: Optional[float]) -> Decimal:
     if not getattr(s, "atr_stop_enabled", False) or not atr_pct or atr_pct <= 0:
         return fixed
     raw = Decimal(str(getattr(s, "atr_stop_multiple", 2.0))) * Decimal(str(atr_pct))
-    lo = Decimal(str(getattr(s, "atr_stop_min_pct", 0.02)))
-    hi = Decimal(str(getattr(s, "atr_stop_max_pct", 0.08)))
+    # Never tighter than the fixed stop: the 2026-09-16 sweep showed sub-4%
+    # stops sit inside daily noise and shake out winners (win rate 58% vs 69%).
+    lo = max(Decimal(str(getattr(s, "atr_stop_min_pct", 0.02))), fixed)
+    hi = max(Decimal(str(getattr(s, "atr_stop_max_pct", 0.08))), lo)
     return max(lo, min(hi, raw))
 
 

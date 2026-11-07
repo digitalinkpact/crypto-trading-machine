@@ -140,10 +140,42 @@ def _pct(count: int, total: int) -> float:
     return (count / total * 100.0) if total else 0.0
 
 
+def _collapse_to_positions(rows: list[dict]) -> list[dict]:
+    """Group closed_trades leg rows into positions (symbol, mode, entry_ts).
+
+    Mirrors Storage.closed_positions: pnl is the fee-adjusted sum of all legs,
+    book-keeping closes are dropped, and positions still open after a partial
+    TP1/TP2 are excluded — so `won` is a position-level outcome, not a leg.
+    """
+    open_keys = {
+        (p["symbol"], p["mode"], p["entry_ts"]) for p in storage.all_positions()
+    }
+    grouped: dict[tuple, list[dict]] = {}
+    for row in rows:
+        reason = str(row.get("exit_reason") or "")
+        if reason == "reconcile_stale" or reason.endswith("_stale_dust"):
+            continue
+        key = (row.get("symbol"), row.get("mode"), row.get("entry_ts"))
+        if key in open_keys:
+            continue
+        grouped.setdefault(key, []).append(row)
+    out: list[dict] = []
+    for legs in grouped.values():
+        legs = sorted(legs, key=lambda r: r.get("id") or 0)
+        notional = sum(float(r.get("entry_price") or 0) * float(r.get("qty") or 0) for r in legs)
+        pnl = sum(float(r.get("pnl") or 0) for r in legs)
+        merged = dict(legs[-1])
+        merged["entry_ts"] = legs[0].get("entry_ts")
+        merged["pnl"] = pnl
+        merged["pnl_pct"] = (pnl / notional * 100.0) if notional else 0.0
+        out.append(merged)
+    return out
+
+
 def build_trade_contexts() -> list[TradeContext]:
     settings = get_settings()
     cache_dir = settings.data_cache_dir
-    closed = storage.closed_trades(limit=5000)
+    closed = _collapse_to_positions(storage.closed_trades(limit=5000))
     btc_1d = _load_frame(cache_dir, "BTCUSDT", "1d")
     frame_cache: dict[tuple[str, str], pd.DataFrame | None] = {("BTCUSDT", "1d"): btc_1d}
     contexts: list[TradeContext] = []

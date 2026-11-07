@@ -1942,6 +1942,8 @@ class Autopilot:
         aggressive_mode: bool,
     ) -> bool:
         s = get_settings()
+        if not getattr(s, "trend_gate_bypass_enabled", False):
+            return False
         if not aggressive_mode or ml_proba is None:
             return False
         return (
@@ -1957,6 +1959,11 @@ class Autopilot:
     ) -> tuple[bool, str, Optional[int]]:
         if trend_ok:
             return True, trend_why, None
+        if not getattr(get_settings(), "profitstream_trend_soft_penalty", False):
+            # Hard veto: a close below the 200-EMA is never bought (falling-knife
+            # guard). The legacy -10 soft penalty was never re-checked against
+            # the score threshold, so it let those entries through.
+            return False, trend_why, None
         agents = set(getattr(sig, "contributing_agents", ()) or ())
         if getattr(sig, "agent", "") != "profitstream_strategy" and "profitstream_strategy" not in agents:
             return False, trend_why, None
@@ -2000,6 +2007,35 @@ class Autopilot:
                 balances=balances,
             )
             if symbol in held_symbols:
+                return
+
+            # The retry fires minutes after the original signal cleared its
+            # gates; re-validate the ones that can change in that time (or that
+            # protect the account) so a stale signal can't bypass them.
+            halt = self._entry_block_reason()
+            if halt:
+                log.info("[OB_RETRY] %s attempt=%d skipped: entry halted (%s)", symbol, attempt, halt)
+                return
+            if symbol.upper() in {b.upper() for b in (getattr(s, "blocked_symbols", ()) or ())}:
+                return
+            if self._on_cooldown(symbol, datetime.now(timezone.utc), timedelta(minutes=s.buy_cooldown_minutes)):
+                return
+            if (await self._check_circuit_breaker()):
+                log.info("[OB_RETRY] %s attempt=%d skipped: drawdown breaker", symbol, attempt)
+                return
+            market_ok, market_why = await self._market_gate()
+            if not market_ok:
+                log.info("[OB_RETRY] %s attempt=%d skipped: %s", symbol, attempt, market_why)
+                return
+            if self._last_regime_score == 0:
+                required = int(getattr(s, "profitstream_score_threshold", 80)) + int(
+                    getattr(s, "market_regime_sideways_score_bonus", 15)
+                )
+                if int(getattr(sig, "quality_score", 0) or 0) < required:
+                    return
+            trend_ok, trend_why = await self._trend_gate(symbol)
+            if not trend_ok:
+                log.info("[OB_RETRY] %s attempt=%d skipped: %s", symbol, attempt, trend_why)
                 return
 
             usdt_free = Decimal(str(snap["usdt_cash"]))

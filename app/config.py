@@ -254,6 +254,46 @@ class Settings(BaseSettings):
     live_buys_enabled: bool = False
 
     @model_validator(mode="after")
+    def _log_win_rate_guardrail_overrides(self) -> "Settings":
+        """Loudly log any override of the evidence-locked entry-quality caps.
+
+        2026-09-29: widening the universe past top-75/top-50 and positions past
+        12 dropped live win rate ~95% -> ~69%. These can still be changed via
+        .env (reversible), but never silently — each deviation is a CRITICAL
+        log line naming the setting, its value and the evidence-locked value.
+        """
+        import logging
+
+        log = logging.getLogger("app.config")
+        guardrails = (
+            ("universe_size", self.universe_size, "<=", 75),
+            ("final_pairlist_size", self.final_pairlist_size, "<=", 50),
+            ("max_open_positions", self.max_open_positions, "<=", 12),
+            ("aggressive_max_open_positions", self.aggressive_max_open_positions, "<=", 12),
+            ("rollback_max_open_positions", self.rollback_max_open_positions, "<=", 12),
+            ("stop_loss_pct", self.stop_loss_pct, ">=", 0.04),
+            ("atr_stop_min_pct", self.atr_stop_min_pct, ">=", 0.04),
+            ("profitstream_score_threshold", self.profitstream_score_threshold, ">=", 80),
+            ("mean_reversion_exit_enabled", self.mean_reversion_exit_enabled, "==", False),
+            ("trend_filter_enabled", self.trend_filter_enabled, "==", True),
+            ("trend_gate_bypass_enabled", self.trend_gate_bypass_enabled, "==", False),
+            ("profitstream_trend_soft_penalty", self.profitstream_trend_soft_penalty, "==", False),
+        )
+        for name, value, op, locked in guardrails:
+            ok = (
+                value <= locked if op == "<="
+                else value >= locked if op == ">="
+                else value == locked
+            )
+            if not ok:
+                log.critical(
+                    "WIN-RATE GUARDRAIL OVERRIDDEN: %s=%r (evidence-locked: %s %r). "
+                    "See the 2026-09-29 win-rate regression notes in app/config.py.",
+                    name, value, op, locked,
+                )
+        return self
+
+    @model_validator(mode="after")
     def _apply_live_mode_override(self) -> "Settings":
         """If LIVE_MODE=true in .env, force real execution — and NOTHING else.
 
@@ -350,9 +390,11 @@ class Settings(BaseSettings):
     # Falls back to stop_loss_pct when disabled or ATR is unavailable.
     atr_stop_enabled: bool = True
     atr_stop_multiple: float = Field(2.0, ge=0.5, le=6.0)        # stop distance = N x daily ATR%
-    # min floor 0.02->0.03 (2026-09-16 R:R sweep): keep the tightest ATR stops
-    # out of the shake-out zone the fixed-stop finding above identified.
-    atr_stop_min_pct: float = Field(0.03, ge=0.005, le=0.20)     # never tighter than 3%
+    # min floor 0.02->0.03 (2026-09-16 R:R sweep) -> 0.04 (win-rate forensics):
+    # the fixed-stop sweep above showed a ~4% stop is the shake-out boundary, so
+    # the ATR stop must never be tighter than it (risk.dynamic_stop_pct also
+    # floors at stop_loss_pct, so a quiet coin can't get a sub-4% stop).
+    atr_stop_min_pct: float = Field(0.04, ge=0.005, le=0.20)     # never tighter than 4%
     atr_stop_max_pct: float = Field(0.08, ge=0.01, le=0.50)      # never wider than 8%
     take_profit_pct: float = Field(0.05, ge=0.005, le=0.50)      # 5% take-profit (unused by the
     # live TP1/TP2 ladder below; kept only as a display value + the
@@ -508,6 +550,23 @@ class Settings(BaseSettings):
     # feeds the stop-loss gate. Backtest-validated: cuts losses ~3x and max
     # drawdown ~half versus no filter (see scripts/param_sweep diagnosis).
     trend_filter_enabled: bool = True
+    # The 200-EMA veto above is a HARD gate for ProfitStream entries too. It was
+    # silently downgraded to a -10 score penalty (fa6b5d0) that was never
+    # re-checked against the score threshold, and the high-confidence bypass
+    # below waved through every score-100 dip — so oversold-bounce entries below
+    # the 200-EMA (falling knives) executed. Set PROFITSTREAM_TREND_SOFT_PENALTY=true
+    # / TREND_GATE_BYPASS_ENABLED=true only to reproduce the old behaviour.
+    profitstream_trend_soft_penalty: bool = False
+    trend_gate_bypass_enabled: bool = False
+    # A trend pullback must ALSO satisfy the tight `pullback_to_ema` candidate
+    # (<=2% from EMA20, RSI 45-55, EMA20>EMA50, MACD hist turning up). The live
+    # `_pullback_setup` alone accepts any close above EMA20/50 within 7% and
+    # RSI 35-70 — i.e. almost every coin in an uptrend, every day — which is
+    # trend-chasing, not a pullback.
+    pullback_require_candidate_confirmation: bool = True
+    # BTC not aligned (no golden cross AND regime score < 1) hard-blocks the
+    # entry instead of only costing 10 score points.
+    btc_alignment_hard_gate: bool = True
 
     # Market-regime kill-switch — block ALL new longs when the broad market
     # (BTC) is in a confirmed downtrend (50-EMA below 200-EMA, a "death cross").

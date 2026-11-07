@@ -85,13 +85,18 @@ class ProfitStreamStrategy:
         btc_regime = compute_btc_regime_score(btc_1d)
         daily_quote = self._latest_quote_volume(df_1d)
         extended, extension_pct = self._dip_too_extended(df_1d)
-        # Candidate entry types under evaluation (2026-08-21 walk-forward) are
-        # logged for forensic comparison. These scored candidates remain
-        # observability-only; the live pullback path uses `_pullback_setup`.
+        scored_candidates = self._score_entry_candidates(df_1d)
         candidates = {
             name: {"ready": c.ready, "score": c.score, **c.detail}
-            for name, c in self._score_entry_candidates(df_1d).items()
+            for name, c in scored_candidates.items()
         }
+        # The loose `_pullback_setup` (any close above EMA20/50 within 7%) is the
+        # lowest-quality BUY path. Unless disabled, it must also be a genuine
+        # pullback per the tight `pullback_to_ema` candidate; missing indicator
+        # data fails closed (candidate not ready).
+        pullback_loose_ready = pullback_ready
+        if pullback_ready and s.pullback_require_candidate_confirmation:
+            pullback_ready = scored_candidates["pullback_to_ema"].ready
 
         indicators.update(
             {
@@ -99,6 +104,7 @@ class ProfitStreamStrategy:
                 "pullback_rsi_1d": pullback_rsi,
                 "pullback_ema20_dist_pct": pullback_dist_pct,
                 "pullback_ready": pullback_ready,
+                "pullback_loose_ready": pullback_loose_ready,
                 "exit_rsi_1d": exit_rsi,
                 "close_1d": float(df_1d.iloc[-1]["close"]),
                 "bb_lower_1d": float(df_1d.iloc[-1]["bb_lower"]),
@@ -222,8 +228,14 @@ class ProfitStreamStrategy:
 
         spread_pct = await self._spread_pct(symbol)
         indicators["spread_pct"] = spread_pct
-        max_spread_pct = 0.01 if pullback_ready and not dip_ready else 0.0025
-        if spread_pct is not None and spread_pct > max_spread_pct:
+        # One spread cap for every entry type (the pullback path used to get a
+        # 4x looser 1% cap — the lowest-quality setup got the widest book), and
+        # an unverifiable spread blocks the entry instead of passing it.
+        max_spread_pct = float(s.max_spread_pct)
+        if spread_pct is None:
+            filt_ok = False
+            reasons.append("spread_unknown")
+        elif spread_pct > max_spread_pct:
             filt_ok = False
             reasons.append(f"spread_wide:{spread_pct:.4%}>{max_spread_pct:.4%}")
 
@@ -237,9 +249,12 @@ class ProfitStreamStrategy:
         indicators["btc_aligned"] = btc_aligned
         btc_score_penalty = 0
         if not btc_aligned:
-            # Soft penalty only — do not hard-reject entries.
             btc_score_penalty = 10
-            reasons.append("btc_trend_not_aligned_soft")
+            if s.btc_alignment_hard_gate:
+                filt_ok = False
+                reasons.append("btc_trend_not_aligned")
+            else:
+                reasons.append("btc_trend_not_aligned_soft")
 
         score = 0
         score += 70 if dip_ready else 0
@@ -257,7 +272,9 @@ class ProfitStreamStrategy:
             if float(df_1d.iloc[-1]["close"]) > float(df_1d.iloc[-1]["bb_lower"]) * bb_mult:
                 reasons.append("close_above_lower_band")
 
-        if not pullback_ready:
+        if pullback_loose_ready and not pullback_ready:
+            reasons.append("pullback_not_tight_ema_candidate")
+        if not pullback_loose_ready:
             out = df_1d.dropna()
             if not out.empty:
                 last = out.iloc[-1]
@@ -404,7 +421,9 @@ class ProfitStreamStrategy:
         return float(last["close"]) < float(last["ema_20"])
 
     def _score_entry_candidates(self, df: pd.DataFrame) -> dict[str, EntryCandidate]:
-        """Score 4 candidate entry types for observability (NOT for gating).
+        """Score 4 candidate entry types. Only `pullback_to_ema.ready` gates a
+        live entry (as confirmation of the loose pullback setup, see
+        `pullback_require_candidate_confirmation`); the rest are observability.
 
         2026-08-21 walk-forward (scripts/walkforward.py --market-filter, 25
         symbols, 1d, 3 folds): only `oversold_bounce` was ROBUST + (mean

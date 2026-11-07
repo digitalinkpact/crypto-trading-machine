@@ -1,5 +1,9 @@
 """Daily forensic report: which conditions are actually making/losing money.
 
+Win rate here is POSITION-level and fee-adjusted (legs grouped by symbol+entry_ts,
+book-keeping closes and still-open partials excluded) — the same definition the
+bot's rollback guard uses.
+
 Breaks down realized trade performance by BTC regime (recomputed via the
 scored -2..+2 regime, not just a binary flag), symbol, exit reason, and hour
 of day, then calls out the top 3 profitable and bottom 3 losing conditions —
@@ -70,6 +74,68 @@ async def _btc_regime_by_day() -> dict:
     return out
 
 
+def _is_bookkeeping(reason: Optional[str]) -> bool:
+    r = str(reason or "")
+    return r == "reconcile_stale" or r.endswith("_stale_dust")
+
+
+def _to_positions(rows: list[dict], open_keys: set[tuple[str, str, str]]) -> list[dict]:
+    """Collapse closed_trades leg rows into POSITIONS (symbol, mode, entry_ts).
+
+    A position's pnl is the sum of its legs' fee-adjusted pnl, it wins iff that
+    sum > 0, and it is labelled with the reason of its LAST leg. Book-keeping
+    closes and positions still open after a partial (TP1/TP2) are excluded —
+    the same rules as Storage.closed_positions, which the live rollback guard
+    uses, so this report and the bot measure win rate identically.
+    """
+    grouped: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+    for r in rows:
+        if _is_bookkeeping(r.get("exit_reason")):
+            continue
+        key = (r["symbol"], r.get("mode") or "", r.get("entry_ts") or "")
+        if key in open_keys:
+            continue
+        grouped[key].append(r)
+    out: list[dict] = []
+    for (symbol, _mode, entry_ts), legs in grouped.items():
+        legs.sort(key=lambda r: r.get("id") or 0)
+        last = legs[-1]
+        notional = sum((r.get("entry_price") or 0.0) * (r.get("qty") or 0.0) for r in legs)
+        pnl = sum(r.get("pnl") or 0.0 for r in legs)
+        gross = sum(
+            r["gross_pnl"] if r.get("gross_pnl") is not None else (r.get("pnl") or 0.0)
+            for r in legs
+        )
+        out.append({
+            "symbol": symbol,
+            "entry_ts": entry_ts,
+            "pnl": pnl,
+            "gross_pnl": gross,
+            "pnl_pct": (pnl / notional * 100.0) if notional else 0.0,
+            "exit_reason": last.get("exit_reason"),
+            "legs": len(legs),
+            "entry_strategy": legs[0].get("entry_strategy"),
+            "entry_confidence": legs[0].get("entry_confidence"),
+            "entry_btc_regime": legs[0].get("entry_btc_regime"),
+            "mfe_pct": last.get("mfe_pct"),
+            "mae_pct": last.get("mae_pct"),
+        })
+    return out
+
+
+def _score_label(conf: Optional[float]) -> str:
+    if conf is None:
+        return "unknown"
+    score = round(float(conf) * 100)
+    if score >= 100:
+        return "100"
+    if score >= 90:
+        return "90-99"
+    if score >= 80:
+        return "80-89"
+    return "<80"
+
+
 def _bucket_stats(rows: list[dict]) -> dict:
     if not rows:
         return {"n": 0, "win_rate": 0.0, "total_pnl": 0.0, "avg_pct": 0.0}
@@ -109,17 +175,36 @@ def main() -> None:
         ).fetchall()
     ]
     trades = [t for t in trades if (_parse_ts(t.get("entry_ts")) or cutoff) >= cutoff]
+    leg_rows = [t for t in trades if not _is_bookkeeping(t.get("exit_reason"))]
+    open_keys = {
+        (r["symbol"], r["mode"], r["entry_ts"])
+        for r in c.execute("SELECT symbol, mode, entry_ts FROM positions").fetchall()
+    }
+    positions = _to_positions(trades, open_keys)
 
-    _hdr(f"Daily forensic report — mode={args.mode} window={args.days}d trades={len(trades)}")
-    if not trades:
-        print("(no closed trades in this window)")
+    _hdr(
+        f"Daily forensic report — mode={args.mode} window={args.days}d "
+        f"positions={len(positions)} leg_rows={len(leg_rows)}"
+    )
+    if not positions:
+        print("(no closed positions in this window)")
         return
 
-    overall = _bucket_stats(trades)
+    # HEADLINE = position-level, fee-adjusted (the bot's own definition).
+    overall = _bucket_stats(positions)
+    row_overall = _bucket_stats(leg_rows)
+    fee_flipped = sum(1 for p in positions if p["gross_pnl"] > 0 >= p["pnl"])
     print(
-        f"win_rate={overall['win_rate']:.1f}% avg_pct={overall['avg_pct']:.2f}% "
-        f"total_pnl={overall['total_pnl']:.4f}"
+        f"POSITION win_rate={overall['win_rate']:.1f}% avg_pct={overall['avg_pct']:.2f}% "
+        f"total_pnl={overall['total_pnl']:.4f}  (fee-adjusted; fee-flipped winners: {fee_flipped})"
     )
+    print(
+        f"leg-row  win_rate={row_overall['win_rate']:.1f}% over {row_overall['n']} rows "
+        f"(inflated by partial TP legs; do NOT compare to the 94% target)"
+    )
+    paper_note = "paper fills have no slippage/spread: compare live-to-live only" if args.mode == "paper" else ""
+    if paper_note:
+        print(f"note: {paper_note}")
 
     regime_by_day = asyncio.run(_btc_regime_by_day())
 
@@ -128,7 +213,13 @@ def main() -> None:
     by_exit_reason: dict[str, list[dict]] = defaultdict(list)
     by_hour: dict[str, list[dict]] = defaultdict(list)
 
-    for t in trades:
+    by_strategy: dict[str, list[dict]] = defaultdict(list)
+    by_score: dict[str, list[dict]] = defaultdict(list)
+    by_entry_regime: dict[str, list[dict]] = defaultdict(list)
+    for t in positions:
+        by_strategy[t.get("entry_strategy") or "unknown"].append(t)
+        by_score[_score_label(t.get("entry_confidence"))].append(t)
+        by_entry_regime[str(t.get("entry_btc_regime") if t.get("entry_btc_regime") is not None else "unknown")].append(t)
         entry_ts = _parse_ts(t.get("entry_ts"))
         if entry_ts is not None:
             day = entry_ts.date()
@@ -143,6 +234,9 @@ def main() -> None:
     _print_table("By symbol", by_symbol)
     _print_table("By exit reason", by_exit_reason)
     _print_table("By hour of day (UTC)", by_hour)
+    _print_table("By entry strategy (dip vs pullback)", by_strategy)
+    _print_table("By entry score bucket (entry_confidence x100)", by_score)
+    _print_table("By BTC regime score recorded at entry", by_entry_regime)
 
     # Top/bottom conditions across ALL dimensions combined (min 2 trades so a
     # single lucky/unlucky trade can't dominate the ranking).
@@ -150,6 +244,7 @@ def main() -> None:
     for prefix, buckets in (
         ("regime", by_regime), ("symbol", by_symbol),
         ("exit", by_exit_reason), ("hour", by_hour),
+        ("strategy", by_strategy), ("score", by_score),
     ):
         for label, rows in buckets.items():
             if len(rows) >= 2:

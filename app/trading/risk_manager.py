@@ -41,6 +41,9 @@ class RiskManager:
             getattr(s, "aggressive_max_open_positions", 10)
             if aggressive_mode else getattr(s, "rollback_max_open_positions", getattr(s, "max_open_positions", 3))
         )
+        # `max_open_positions` is a hard ceiling on whichever mode-specific cap
+        # binds, so no single knob can silently widen the 12-position cap.
+        max_open_positions = min(max_open_positions, int(getattr(s, "max_open_positions", max_open_positions)))
         position_pct = (
             getattr(s, "aggressive_position_pct", 0.06)
             if aggressive_mode else getattr(s, "rollback_position_pct", getattr(s, "max_position_pct", 0.03))

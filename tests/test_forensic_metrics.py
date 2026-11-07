@@ -132,9 +132,24 @@ def test_close_position_uses_actual_fee_when_provided(tmp_path):
     closed = s.close_position(
         symbol="ETHUSDT", mode="live", exit_price=105.0, actual_fee_usdt=0.03,
     )
+    # Exit fee is the real commission; the unknown buy-side fee is modeled
+    # (100 * 1 * 0.0002 taker) instead of silently dropped.
+    assert closed["fee_source"] == "mixed"
+    assert closed["fee_amount"] == pytest.approx(0.03 + 0.02)
+    assert closed["pnl"] == pytest.approx(5.0 - 0.05)
+
+
+def test_close_position_actual_fee_with_known_entry_fee_is_fully_actual(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(
+        symbol="ETHUSDT", mode="live", qty=1.0, entry_price=100.0, agents=[],
+        entry_fee_usdt=0.02,
+    )
+    closed = s.close_position(
+        symbol="ETHUSDT", mode="live", exit_price=105.0, actual_fee_usdt=0.03,
+    )
     assert closed["fee_source"] == "actual"
-    assert closed["fee_amount"] == 0.03
-    assert closed["pnl"] == 5.0 - 0.03
+    assert closed["fee_amount"] == pytest.approx(0.05)
 
 
 def test_reduce_position_uses_actual_fee_when_provided(tmp_path):
@@ -179,3 +194,70 @@ def test_open_position_accumulates_entry_fee_across_pyramid_adds(tmp_path):
     )
     pos = s.get_position("ETHUSDT")
     assert pos["entry_fee_usdt"] == pytest.approx(0.042)
+
+
+# ── win-rate / fee integrity (2026-11 forensic restoration) ────────────────
+
+
+def test_reduce_position_charges_modeled_entry_fee_when_entry_fee_unknown(tmp_path):
+    """Live BUY commission is usually paid in the base coin, so entry_fee_usdt is
+    None. The exit-only fee used to be booked alone, overstating PnL."""
+    s = _fresh_storage(tmp_path)
+    s.open_position(symbol="ETHUSDT", mode="live", qty=1.0, entry_price=100.0, agents=[])
+    r = s.reduce_position(
+        symbol="ETHUSDT", mode="live", qty=1.0, exit_price=100.03,
+        actual_exit_fee_usdt=0.02,
+    )
+    assert r["fee_source"] == "mixed"
+    assert r["fee_amount"] == pytest.approx(0.02 + 0.02)  # exit actual + modeled entry
+    assert r["pnl"] < 0  # a +0.03% gross "win" is a fee-adjusted loss
+
+
+def test_partial_reduce_keeps_unknown_entry_fee_unknown(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(symbol="ETHUSDT", mode="live", qty=2.0, entry_price=100.0, agents=[])
+    s.reduce_position(symbol="ETHUSDT", mode="live", qty=1.0, exit_price=108.0,
+                      actual_exit_fee_usdt=0.02)
+    assert s.get_position("ETHUSDT")["entry_fee_usdt"] is None
+
+
+def test_bookkeeping_closes_carry_no_fee_and_no_win_rate_weight(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(symbol="AAAUSDT", mode="live", qty=1.0, entry_price=50.0, agents=["a"])
+    closed = s.close_position(
+        symbol="AAAUSDT", mode="live", exit_price=50.0, exit_reason="stop_loss_stale_dust",
+    )
+    assert closed["fee_amount"] == 0.0 and closed["pnl"] == 0.0
+    s.open_position(symbol="BBBUSDT", mode="live", qty=1.0, entry_price=50.0, agents=["a"])
+    s.close_position(symbol="BBBUSDT", mode="live", exit_price=50.0, exit_reason="reconcile_stale")
+
+    assert s.closed_positions(limit=10, mode="live") == []
+    assert s.agent_stats() == []  # phantom rows never credit/debit an agent
+
+
+def test_closed_positions_excludes_still_open_partials(tmp_path):
+    """A TP1 leg is positive on its own; the position is not closed (and not a
+    win) until the remainder exits."""
+    s = _fresh_storage(tmp_path)
+    s.open_position(symbol="ETHUSDT", mode="live", qty=2.0, entry_price=100.0, agents=[])
+    s.reduce_position(symbol="ETHUSDT", mode="live", qty=1.0, exit_price=108.0,
+                      exit_reason="take_profit_1", actual_exit_fee_usdt=0.02)
+    assert s.closed_positions(limit=10, mode="live") == []
+
+    s.reduce_position(symbol="ETHUSDT", mode="live", qty=1.0, exit_price=90.0,
+                      exit_reason="stop_loss", actual_exit_fee_usdt=0.02)
+    positions = s.closed_positions(limit=10, mode="live")
+    assert len(positions) == 1
+    assert positions[0]["rows"] == 2
+    assert positions[0]["pnl"] < 0  # +8 leg then -10 leg: a LOSING position
+
+
+def test_agent_stats_credit_one_outcome_per_position_not_per_leg(tmp_path):
+    s = _fresh_storage(tmp_path)
+    s.open_position(symbol="ETHUSDT", mode="live", qty=3.0, entry_price=100.0, agents=["x"])
+    for qty, px, reason in ((1.0, 108.0, "take_profit_1"), (1.0, 115.0, "take_profit_2"),
+                            (1.0, 112.0, "trailing_stop")):
+        s.reduce_position(symbol="ETHUSDT", mode="live", qty=qty, exit_price=px,
+                          exit_reason=reason, actual_exit_fee_usdt=0.02)
+    stats = {r["agent"]: r for r in s.agent_stats()}
+    assert stats["x"]["wins"] == 1 and stats["x"]["losses"] == 0
