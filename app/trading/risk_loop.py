@@ -38,6 +38,7 @@ from app.logging_setup import get_logger
 from app.storage import storage
 from app.exchange.telemetry import exchange_telemetry
 from app.trading.autopilot import autopilot
+from app.trading.execution_context import current_execution
 
 log = get_logger(__name__)
 
@@ -51,19 +52,40 @@ _stop_event: "asyncio.Event | None" = None
 
 async def _run_once() -> None:
     started = time.perf_counter()
-    ttl = max(10.0, float(get_settings().risk_manager_loop_seconds) * 3)
-    if not storage.try_acquire_lock(_LOCK_NAME, ttl_seconds=ttl, owner=_OWNER):
-        # Another risk-loop instance (in-process or standalone) already ran
-        # this cycle — expected transiently during a restart/redeploy when
-        # both deployments briefly overlap.
-        return
+    acquired = False
+    token = None
+    owner = f"{_OWNER}-{uuid.uuid4().hex[:8]}"
     try:
-        await autopilot._run_risk_gates()
-        storage.kv_set(_HEARTBEAT_KEY, time.time())
+        timeout = int(getattr(get_settings(), "risk_manager_loop_timeout_seconds", 120))
+        acquired = storage.try_acquire_lock(_LOCK_NAME, ttl_seconds=timeout + 30, owner=owner)
+        if not acquired:
+            return
+        execution = {"tick_id": None, "errors": [], "orders": []}
+        token = current_execution.set(execution)
+        storage.kv_set("risk_loop_last_attempt", time.time())
+        outcome = await asyncio.wait_for(autopilot._run_risk_gates(), timeout=timeout)
+        if not isinstance(outcome, dict):
+            outcome = {"success": False, "errors": [{"stage": "risk_iteration", "type": "MissingOutcome"}]}
+        outcome["errors"] = outcome.get("errors", []) + execution["errors"]
+        outcome["orders"] = execution["orders"]
+        outcome["success"] = bool(outcome.get("success")) and not outcome["errors"]
+        storage.kv_set("risk_loop_status", outcome)
+        if isinstance(outcome, dict) and outcome.get("success"):
+            storage.kv_set(_HEARTBEAT_KEY, time.time())
     except Exception as exc:  # noqa: BLE001
         log.exception("independent risk loop iteration failed: %s", exc)
+        try:
+            storage.kv_set("risk_loop_status", {"success": False, "errors": [{"stage": "risk_iteration", "type": type(exc).__name__}]})
+        except Exception:
+            log.exception("risk-loop error persistence failed")
     finally:
-        storage.release_lock(_LOCK_NAME, owner=_OWNER)
+        if token is not None:
+            current_execution.reset(token)
+        if acquired:
+            try:
+                storage.release_lock(_LOCK_NAME, owner=owner)
+            except Exception:
+                log.exception("risk-loop lock release failed")
         exchange_telemetry.record_stage("risk_loop", time.perf_counter() - started)
 
 
@@ -113,6 +135,10 @@ async def stop() -> None:
             await asyncio.wait_for(_task, timeout=10)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             _task.cancel()
+            try:
+                await _task
+            except asyncio.CancelledError:
+                pass
         _task = None
 
 

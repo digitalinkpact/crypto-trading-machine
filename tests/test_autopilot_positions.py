@@ -253,6 +253,7 @@ async def test_run_risk_gates_executes_stop_loss_even_when_entry_gates_blocked(m
     monkeypatch.setattr(autopilot_module.filters, "meets_min", lambda symbol, qty, price: True, raising=True)
     monkeypatch.setattr(autopilot_module.storage, "record_tick_audit", lambda **_k: None, raising=True)
     monkeypatch.setattr(Autopilot, "_submit", _fake_submit, raising=True)
+    monkeypatch.setattr(Autopilot, "_atr_pct", lambda *_args: asyncio.sleep(0, result=None))
 
     # Confirm the (blocked) entry-protection state really is active — this
     # test would be meaningless if it weren't.
@@ -767,6 +768,7 @@ async def test_execute_sell_clamps_to_free_and_tracked_balance(monkeypatch):
         raising=True,
     )
     monkeypatch.setattr(Autopilot, "_place_sell", _fake_place_sell, raising=True)
+    monkeypatch.setattr(Autopilot, "_price", lambda *_args: asyncio.sleep(0, result=Decimal("100")))
     monkeypatch.setattr(autopilot_module.filters, "is_listed", lambda _s: True, raising=True)
     monkeypatch.setattr(Autopilot, "_record_signal_event", lambda *_a, **_k: __import__("asyncio").sleep(0), raising=True)
     monkeypatch.setattr(Autopilot, "_persist_skip_stats", lambda *_a, **_k: None, raising=True)
@@ -965,6 +967,7 @@ async def test_execute_buy_pyramids_when_position_exists_and_confidence_is_high(
     monkeypatch.setattr(Autopilot, "_onchain_gate", lambda *_a, **_k: asyncio.sleep(0, result=(True, "ok")), raising=True)
     monkeypatch.setattr(Autopilot, "_buy_order_plan", _buy_plan, raising=True)
     monkeypatch.setattr(Autopilot, "_place_buy", _place_buy, raising=True)
+    monkeypatch.setattr(Autopilot, "_atr_pct", lambda *_args: asyncio.sleep(0, result=None))
     monkeypatch.setattr(autopilot_module.RiskManager, "evaluate_entry", lambda *_a, **_k: __import__("types").SimpleNamespace(allow=True, reason="ok", notional_usdt=Decimal("50")), raising=True)
 
     class _Sig:
@@ -1476,6 +1479,13 @@ async def _run_ob_retry(monkeypatch, *, market=(True, "ok"), regime=2, breaker=F
         placed.append(symbol)
         return True
 
+    async def _tick(_self, **kwargs):
+        assert kwargs["source"] == "orderbook_retry"
+        placed.append("ABCUSDT")
+        return {"status": "EXECUTED"}
+
+    monkeypatch.setattr(Autopilot, "tick", _tick)
+
     async def _market_gate(_self):
         _self._last_regime_score = regime
         return market
@@ -1558,6 +1568,13 @@ async def _run_ob_retry(monkeypatch, *, market=(True, "ok"), regime=2, breaker=F
     async def _place_buy(_self, symbol, _sig, _notional):
         placed.append(symbol)
         return True
+
+    async def _tick(_self, **kwargs):
+        assert kwargs["source"] == "orderbook_retry"
+        placed.append("ABCUSDT")
+        return {"status": "EXECUTED"}
+
+    monkeypatch.setattr(Autopilot, "tick", _tick)
 
     async def _market_gate(_self):
         _self._last_regime_score = regime

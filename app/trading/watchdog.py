@@ -96,9 +96,12 @@ def set_scheduler_ref(scheduler) -> None:
 def get_scheduler_status() -> dict:
     """Read-only scheduler status for startup_report() etc. — kept here since
     watchdog.py owns the scheduler reference."""
+    jobs = _SCHEDULER_REF.get_jobs() if _SCHEDULER_REF is not None else []
+    next_run = next((getattr(job, "next_run_time", None) for job in jobs if job.id == "autopilot"), None)
     return {
         "running": bool(_SCHEDULER_REF.running) if _SCHEDULER_REF is not None else False,
         "jobs": [j.id for j in _SCHEDULER_REF.get_jobs()] if _SCHEDULER_REF is not None else [],
+        "next_tick_at": next_run.isoformat() if next_run is not None else None,
     }
 
 
@@ -357,7 +360,8 @@ async def _health_loop() -> None:
                 )
                 status["actions"].append("restarted_scheduler" + ("_verified" if recovered else "_unverified"))
 
-            last_tick = autopilot.state.last_tick_at
+            last_success = storage.kv_get("autopilot_last_success")
+            last_tick = datetime.fromisoformat(last_success) if last_success else None
             if autopilot.state.running and last_tick is not None:
                 age = (datetime.now(timezone.utc) - last_tick).total_seconds()
                 stale_after = int(s.health_tick_stale_seconds)
@@ -372,7 +376,8 @@ async def _health_loop() -> None:
                     engage_tick_protection("trade_loop_stale", detail=detail)
                     status["actions"].append("tick_protection_engaged")
                     try:
-                        await autopilot._run_risk_gates()
+                        from app.trading import risk_loop
+                        await risk_loop._run_once()
                         status["actions"].append("ran_emergency_risk_gates")
                     except Exception as e:  # noqa: BLE001
                         log.exception("health check: emergency risk-gate run failed: %s", e)

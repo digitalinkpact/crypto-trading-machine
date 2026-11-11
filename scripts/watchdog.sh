@@ -86,7 +86,11 @@ try:
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     row = conn.execute("SELECT value FROM kv WHERE key='autopilot_state'").fetchone()
     if row:
-        print(json.loads(row[0]).get("last_tick_at") or "")
+        state = json.loads(row[0])
+        if state.get("running"):
+            success = conn.execute("SELECT value FROM kv WHERE key='autopilot_last_success'").fetchone()
+            startup = conn.execute("SELECT value FROM kv WHERE key='process_started_at'").fetchone()
+            print(json.loads(success[0]) if success else json.loads(startup[0]) if startup else state.get("last_tick_at") or "")
 except Exception as e:
     import logging
     logger = logging.getLogger(__name__)

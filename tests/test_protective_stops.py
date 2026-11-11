@@ -238,7 +238,7 @@ def _wire_risk_gates(monkeypatch, fake, *, position, exits, order_status="FILLED
     monkeypatch.setattr(Autopilot, "_protective_stop_manager",
                         lambda self: ProtectiveStopManager(fake, settings=_S()), raising=True)
     monkeypatch.setattr(ap_mod.storage, "all_positions", lambda: [position])
-    monkeypatch.setattr(ap_mod.storage, "get_position", lambda s: position)
+    monkeypatch.setattr(ap_mod.storage, "get_position", lambda s, mode=None: position)
 
     async def _snap(*, mode):
         return {"free_balances": {base: fake.free(base)},
@@ -562,7 +562,7 @@ async def test_record_exit_never_closes_position_at_zero_price(monkeypatch):
     ap = Autopilot()
     ap.state.mode = "live"
     closes: list = []
-    monkeypatch.setattr(ap_mod.storage, "get_position", lambda _s: {"entry_price": 1.0})
+    monkeypatch.setattr(ap_mod.storage, "get_position", lambda _s, mode=None: {"entry_price": 1.0})
     monkeypatch.setattr(ap_mod.risk, "mfe_mae_pct", lambda _s, _e: (None, None))
     for fn in ("clear_hwm", "clear_tp1", "clear_tp2"):
         monkeypatch.setattr(ap_mod.risk, fn, lambda *_a, **_k: None)
@@ -580,7 +580,7 @@ async def test_record_exit_closes_at_real_price_with_actual_fee(monkeypatch):
     ap = Autopilot()
     ap.state.mode = "live"
     closes: list = []
-    monkeypatch.setattr(ap_mod.storage, "get_position", lambda _s: {"entry_price": 1.0})
+    monkeypatch.setattr(ap_mod.storage, "get_position", lambda _s, mode=None: {"entry_price": 1.0})
     monkeypatch.setattr(ap_mod.risk, "mfe_mae_pct", lambda _s, _e: (None, None))
     for fn in ("clear_hwm", "clear_tp1", "clear_tp2"):
         monkeypatch.setattr(ap_mod.risk, fn, lambda *_a, **_k: None)
@@ -652,7 +652,7 @@ async def test_record_exit_never_closes_position_at_zero_price(monkeypatch):
     ap = Autopilot()
     ap.state.mode = "live"
     closes: list = []
-    monkeypatch.setattr(ap_mod.storage, "get_position", lambda _s: {"entry_price": 1.0})
+    monkeypatch.setattr(ap_mod.storage, "get_position", lambda _s, mode=None: {"entry_price": 1.0})
     monkeypatch.setattr(ap_mod.risk, "mfe_mae_pct", lambda _s, _e: (None, None))
     for fn in ("clear_hwm", "clear_tp1", "clear_tp2"):
         monkeypatch.setattr(ap_mod.risk, fn, lambda *_a, **_k: None)
@@ -670,7 +670,7 @@ async def test_record_exit_closes_at_real_price_with_actual_fee(monkeypatch):
     ap = Autopilot()
     ap.state.mode = "live"
     closes: list = []
-    monkeypatch.setattr(ap_mod.storage, "get_position", lambda _s: {"entry_price": 1.0})
+    monkeypatch.setattr(ap_mod.storage, "get_position", lambda _s, mode=None: {"entry_price": 1.0})
     monkeypatch.setattr(ap_mod.risk, "mfe_mae_pct", lambda _s, _e: (None, None))
     for fn in ("clear_hwm", "clear_tp1", "clear_tp2"):
         monkeypatch.setattr(ap_mod.risk, fn, lambda *_a, **_k: None)

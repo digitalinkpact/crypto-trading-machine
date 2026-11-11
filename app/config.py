@@ -19,6 +19,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ENV_PATH = Path(os.environ.get("APP_ENV_FILE", _REPO_ROOT / ".env")).expanduser()
 
 
+class TradingMode(str, Enum):
+    LIVE = "live"
+    SIMULATION = "simulation"
+
+
 class Timeframe(str, Enum):
     """The 4 canonical timeframes the system trades on."""
 
@@ -209,6 +214,7 @@ class Settings(BaseSettings):
     risk_loop_in_process_enabled: bool = True
     # Independent risk loop cadence (stop-loss/take-profit/trailing checks).
     risk_manager_loop_seconds: int = Field(15, ge=5, le=300)
+    risk_manager_loop_timeout_seconds: int = Field(120, ge=15, le=300)
     # Maximum wall time for one strategy tick; timed-out ticks are cancelled
     # and treated as unhealthy so watchdog can block new entries and recover.
     autopilot_tick_timeout_seconds: int = Field(50, ge=5, le=600)
@@ -254,6 +260,7 @@ class Settings(BaseSettings):
     live_mode: bool = False  # SAFE DEFAULT: off
     dry_run: bool = True     # SAFE DEFAULT: on
     paper_trading: bool = True  # SAFE DEFAULT: on
+    trading_mode: TradingMode | None = None
     # Global production kill switch for NEW live entries. This stays false
     # unless an operator explicitly enables it after a documented safety
     # review. It never prevents protective SELLs.
@@ -297,23 +304,30 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _apply_live_mode_override(self) -> "Settings":
-        """If LIVE_MODE=true in .env, force real execution — and NOTHING else.
-
-        LIVE_MODE must only decide *whether orders reach the exchange*, never
-        *how much risk is allowed*. An earlier version of this override also
-        widened max_open_positions/max_long_exposure_pct and force-disabled
-        ml_gate_enabled whenever live mode was on — i.e. flipping one flag to
-        "use real money" silently also removed several unrelated risk caps at
-        the same time. That is exactly the failure mode this project's own
-        audit checklist warns against: enabling live trading must never
-        implicitly weaken position limits, exposure caps, or quality gates.
-        Every risk parameter is controlled independently via its own setting
-        (.env), regardless of live_mode.
-        """
-        if self.live_mode:
-            self.paper_trading = False
-            self.dry_run = False
+        """Resolve one mode, reject conflicts, and leave all risk policy unchanged."""
+        provided = self.model_fields_set
+        if self.trading_mode is None:
+            if self.live_mode:
+                if any(name in provided and getattr(self, name) for name in ("paper_trading", "dry_run")):
+                    raise ValueError("Conflicting legacy modes: LIVE_MODE cannot override simulation flags")
+                self.trading_mode = TradingMode.LIVE
+            elif not self.paper_trading and self.dry_run:
+                raise ValueError("Legacy dry-run with live balances requires explicit mode migration")
+            else:
+                self.trading_mode = TradingMode.SIMULATION if self.paper_trading else TradingMode.LIVE
+        else:
+            live = self.trading_mode == TradingMode.LIVE
+            expected = {"live_mode": live, "paper_trading": not live, "dry_run": not live}
+            if any(name in provided and getattr(self, name) != value for name, value in expected.items()):
+                raise ValueError("TRADING_MODE conflicts with legacy execution flags")
+        self.live_mode = self.trading_mode == TradingMode.LIVE
+        self.paper_trading = not self.live_mode
+        self.dry_run = not self.live_mode
         return self
+
+    @property
+    def ledger_mode(self) -> str:
+        return "live" if self.trading_mode == TradingMode.LIVE else "paper"
 
     # Risk caps — fraction-of-equity, single source of truth for sizing/exposure.
     max_position_pct: float = Field(0.05, ge=0.005, le=1.0)      # per-position sizing cap

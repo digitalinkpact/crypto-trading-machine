@@ -17,6 +17,7 @@ from app.storage import storage
 from app.exchange.telemetry import exchange_telemetry
 from app.ta import add_indicators
 from app.trading.strategy import ProfitStreamStrategy
+from app.trading.execution_context import current_execution, record_error
 
 from .base import AgentContext
 from .breakout import BreakoutAgent
@@ -69,6 +70,7 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
     llm_sem = asyncio.Semaphore(_LLM_CONCURRENCY)
     settings = get_settings()
     mode = "paper" if settings.paper_trading else "live"
+    scan_key = "profitstream_llm_scan" if use_llm else "profitstream_scan"
 
 
     # --- ML model gating for LLM signals ---
@@ -129,6 +131,8 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
                 return None
 
     symbols = await get_symbols()
+    if not symbols:
+        raise ValueError("No eligible market universe available")
 
     if settings.profitstream_enabled:
         strategy_started = time.perf_counter()
@@ -146,7 +150,8 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
             btc_1d = await strategy._candles("BTCUSDT", "1d", DAILY_FETCH_BARS)
         except Exception as exc:  # noqa: BLE001
             log.warning("ProfitStream BTC context unavailable; skipping strategy pass: %s", exc)
-            storage.kv_set("profitstream_scan", {
+            record_error("btc_daily_context", exc)
+            storage.kv_set(scan_key, {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "timeframe": Timeframe.D1.value,
                 "symbols": len(symbols),
@@ -160,6 +165,12 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
             return {}
         for symbol in symbols:
             decision = await strategy.analyze_symbol(symbol, mode=mode, btc_1d=btc_1d)
+            if any(reason.startswith("data_unavailable:") for reason in decision.reasons):
+                record_error(f"market_data:{symbol}", ValueError("daily data unavailable"))
+            execution = current_execution.get()
+            if execution is not None:
+                execution["pairs_evaluated"] += 1
+                execution["decisions"][decision.action.value] += 1
             runner_pass = (
                 decision.action.value == "SELL"
                 or (
@@ -230,7 +241,7 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
             and breadth_usable >= getattr(settings, "breadth_min_symbols", 15)
             and breadth_fraction >= getattr(settings, "breadth_min_fraction", 0.5)
         )
-        storage.kv_set("profitstream_scan", {
+        storage.kv_set(scan_key, {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "timeframe": Timeframe.D1.value,
             "symbols": len(symbols),

@@ -34,19 +34,19 @@ log = get_logger(__name__)
 
 
 def _hwm_key(symbol: str) -> str:
-    return f"hwm:{symbol}"
+    return f"hwm:{getattr(get_settings(), 'ledger_mode', 'paper')}:{symbol}"
 
 
 def _lwm_key(symbol: str) -> str:
-    return f"lwm:{symbol}"
+    return f"lwm:{getattr(get_settings(), 'ledger_mode', 'paper')}:{symbol}"
 
 
 def _tp1_key(symbol: str) -> str:
-    return f"tp1:{symbol}"
+    return f"tp1:{getattr(get_settings(), 'ledger_mode', 'paper')}:{symbol}"
 
 
 def _tp2_key(symbol: str) -> str:
-    return f"tp2:{symbol}"
+    return f"tp2:{getattr(get_settings(), 'ledger_mode', 'paper')}:{symbol}"
 
 
 def update_hwm(symbol: str, price: Decimal) -> Decimal:

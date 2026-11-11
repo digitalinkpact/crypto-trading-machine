@@ -9,8 +9,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
+import uuid
 
 from app.config import get_settings
+from pydantic import SecretStr
 from app.exchange import BinanceUSClient, Order, OrderSide, OrderStatus, OrderType
 from app.logging_setup import get_logger
 from app.trading import risk
@@ -25,13 +27,27 @@ PAPER_FEE_RATE = Decimal(str(get_settings().binance_taker_fee))
 DEFAULT_PAPER_USDT = Decimal("25000")
 
 
+class SimulationMarketData:
+    """Credential-free market reads; no order-placement capability."""
+
+    def __init__(self) -> None:
+        settings = get_settings().model_copy(update={
+            "binance_api_key": SecretStr(""), "binance_api_secret": SecretStr(""),
+            "live_buys_enabled": False, "paper_trading": True, "dry_run": True,
+        })
+        self._client = BinanceUSClient(settings)
+
+    async def ticker_price(self, symbol: str) -> Decimal:
+        return await self._client.ticker_price(symbol)
+
+
 class PaperExchange:
     """Drop-in for `BinanceUSClient.place_order` in paper mode."""
 
     def __init__(self, live_client: Optional[BinanceUSClient] = None) -> None:
         # Used purely for read-only price/exchange_info calls. Public endpoints,
         # no API key required.
-        self._live = live_client or BinanceUSClient()
+        self._live = live_client or SimulationMarketData()
 
     # ── balances / portfolio ────────────────────────────────────────
     def ensure_seeded(self, amount: Decimal = DEFAULT_PAPER_USDT) -> None:
@@ -88,7 +104,32 @@ class PaperExchange:
         entry_btc_regime: Optional[int] = None,
     ) -> Order:
         """Simulate a market order using the current live ticker price."""
+        if not get_settings().paper_trading:
+            raise RuntimeError("Simulation execution is unavailable in live mode")
         price = await self._live.ticker_price(symbol)
+        if quantity <= 0 or price <= 0:
+            raise ValueError("Simulation price and quantity must be positive")
+        with storage.transaction():
+            return self._record_fill(
+                symbol, side, quantity, price, agents,
+                client_order_id or f"paper-{uuid.uuid4().hex[:24]}",
+                entry_confidence, entry_strategy, entry_btc_regime,
+            )
+
+    def _record_fill(
+        self, symbol, side, quantity, price, agents, client_order_id,
+        entry_confidence, entry_strategy, entry_btc_regime,
+    ) -> Order:
+        existing = storage.order_by_client_id("paper", client_order_id)
+        if existing:
+            if existing["symbol"] != symbol or existing["side"] != side.value or Decimal(str(existing["qty"])) != quantity:
+                raise ValueError("Simulation client order ID was reused for a different order")
+            return Order(
+                symbol=symbol, side=side, type=OrderType.MARKET, quantity=quantity,
+                price=Decimal(str(existing["price"])), client_order_id=client_order_id,
+                status=OrderStatus.FILLED, filled_quantity=quantity,
+                avg_fill_price=Decimal(str(existing["price"])), raw={"mode": "paper", "replayed": True},
+            )
         notional = quantity * price
         fee_rate = Decimal(str(get_settings().binance_taker_fee))
         fee = notional * fee_rate

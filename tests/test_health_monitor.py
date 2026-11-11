@@ -1,14 +1,65 @@
+from __future__ import annotations
+
+
+async def test_risk_failure_does_not_refresh_success_heartbeat(monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock
+    from app.storage.db import Storage
+    from app.trading import risk_loop
+
+    store = Storage(tmp_path / "risk.db")
+    store.kv_set("risk_loop_last_run", 123)
+    monkeypatch.setattr(risk_loop, "storage", store)
+    monkeypatch.setattr(risk_loop.autopilot, "_run_risk_gates", AsyncMock(return_value={"success": False, "errors": ["balances"]}))
+    await risk_loop._run_once()
+    assert store.kv_get("risk_loop_last_run") == 123
+    assert store.kv_get("risk_loop_last_attempt") > 123
+    assert store.kv_get("risk_loop_status")["success"] is False
+
+
+async def test_risk_lock_failure_does_not_kill_future_iterations(monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock, Mock
+    from app.storage.db import Storage
+    from app.trading import risk_loop
+
+    store = Storage(tmp_path / "risk.db")
+    acquire = store.try_acquire_lock
+    monkeypatch.setattr(risk_loop, "storage", store)
+    monkeypatch.setattr(store, "try_acquire_lock", Mock(side_effect=RuntimeError("database busy")))
+    await risk_loop._run_once()
+    assert store.kv_get("risk_loop_last_run") is None
+    monkeypatch.setattr(store, "try_acquire_lock", acquire)
+    monkeypatch.setattr(risk_loop.autopilot, "_run_risk_gates", AsyncMock(return_value={"success": True, "errors": []}))
+    await risk_loop._run_once()
+    assert store.kv_get("risk_loop_last_run") is not None
+
 """Tests for the individual health *checks* in app/trading/health.py —
 duplicate/failed-order/duplicate-position detection, plus the generic
 retry/recovery primitives. The watchdog loop and emergency-halt escalation
 ladder that consume these checks live in app/trading/watchdog.py and are
 tested separately in tests/test_watchdog.py.
 """
-from __future__ import annotations
 
 from types import SimpleNamespace
 
 import app.trading.health as health
+
+
+async def test_risk_accounting_error_prevents_success_heartbeat(monkeypatch, tmp_path):
+    from app.storage.db import Storage
+    from app.trading import risk_loop
+    from app.trading.execution_context import record_error
+
+    store = Storage(tmp_path / "risk.db")
+    monkeypatch.setattr(risk_loop, "storage", store)
+
+    async def evaluate():
+        record_error("fill_accounting", RuntimeError("write failed"))
+        return {"success": True, "errors": []}
+
+    monkeypatch.setattr(risk_loop.autopilot, "_run_risk_gates", evaluate)
+    await risk_loop._run_once()
+    assert store.kv_get("risk_loop_last_run") is None
+    assert store.kv_get("risk_loop_status")["success"] is False
 
 
 def test_check_duplicate_orders_detects_same_symbol_side_within_window(monkeypatch):

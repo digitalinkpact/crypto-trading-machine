@@ -9,12 +9,20 @@ and an inconclusive lookup must halt new entries rather than guess.
 from __future__ import annotations
 
 from decimal import Decimal
+import pytest
 
 import app.trading.autopilot as autopilot_module
 import app.trading.watchdog as watchdog_module
 from app.exchange import Order, OrderSide, OrderStatus, OrderType
 from app.exchange.client import BinanceUSClient
 from app.trading.autopilot import Autopilot
+from app.config import Settings
+
+
+@pytest.fixture(autouse=True)
+def configured_live_executor(monkeypatch):
+    settings = Settings(_env_file=None, trading_mode="live")
+    monkeypatch.setattr(autopilot_module, "get_settings", lambda: settings)
 
 
 class _FakeClient:
@@ -295,3 +303,47 @@ async def test_submit_skips_when_same_symbol_side_is_locked(monkeypatch):
     )
     order = await ap._submit("BTCUSDT", OrderSide.SELL, Decimal("1"), ["test"])
     assert order is None
+
+
+async def test_cancelled_submission_retains_unknown_intent(monkeypatch):
+    import asyncio
+    import pytest
+    from unittest.mock import AsyncMock
+
+    autopilot = Autopilot()
+    autopilot.state.mode = "live"
+    started = asyncio.Event()
+    waiting = asyncio.Event()
+
+    class Client:
+        def generate_client_order_id(self):
+            return "cancelled-order"
+
+        async def place_order(self, **kwargs):
+            started.set()
+            await waiting.wait()
+
+    monkeypatch.setattr(autopilot_module, "BinanceUSClient", Client)
+    monkeypatch.setattr(autopilot, "_final_live_buy_safety_check", AsyncMock(return_value=(True, "ok", {})))
+    monkeypatch.setattr(watchdog_module, "trigger_emergency_halt", lambda *args, **kwargs: None)
+    task = asyncio.create_task(autopilot._submit("BTCUSDT", OrderSide.BUY, Decimal("1"), []))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    intents = autopilot_module.storage.pending_order_intents("live")
+    assert len(intents) == 1 and intents[0]["status"] == "UNKNOWN"
+    assert intents[0]["client_order_id"] == "cancelled-order"
+    assert await autopilot._submit("BTCUSDT", OrderSide.BUY, Decimal("1"), []) is None
+
+
+async def test_direct_submission_rejects_mode_mismatch(monkeypatch):
+    from unittest.mock import Mock
+
+    autopilot = Autopilot()
+    autopilot.state.mode = "paper"
+    client = Mock()
+    monkeypatch.setattr(autopilot_module, "BinanceUSClient", client)
+    assert await autopilot._submit("BTCUSDT", OrderSide.BUY, Decimal("1"), []) is None
+    client.assert_not_called()
+    assert "mode mismatch" in autopilot.state.last_error

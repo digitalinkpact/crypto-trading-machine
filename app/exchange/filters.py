@@ -100,6 +100,8 @@ class SymbolFilters:
         if not self._loaded:
             return False
         info = self._info.get(symbol) or {}
+        if not info or qty <= 0 or price <= 0:
+            return False
         min_qty: Optional[Decimal] = info.get("min_qty")
         min_notional: Optional[Decimal] = info.get("min_notional")
         if min_qty and qty < min_qty:
@@ -126,7 +128,7 @@ class SymbolFilters:
             "min_notional": min_notional,
             "qty_ok": qty_ok,
             "notional_ok": notional_ok,
-            "meets_min": qty_ok and notional_ok,
+            "meets_min": self.meets_min(symbol, qty, price),
         }
 
 

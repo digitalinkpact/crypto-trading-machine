@@ -3,11 +3,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from html import escape
+import logging
+from decimal import Decimal
 
-from fastapi import APIRouter, Form, HTTPException, Response
+from fastapi import APIRouter, Form, Header, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.config import SYMBOLS, TIMEFRAMES, get_settings
+from app.auth.service import current_user
 from app.credentials import (
     credentials_present,
     save_binance_credentials,
@@ -22,6 +25,7 @@ from app.exchange.telemetry import exchange_telemetry
 from app.trading.win_rate import win_rate_summary_from_storage
 
 router = APIRouter()
+_APP_STARTED_AT = datetime.now(timezone.utc)
 
 
 _CSS = """
@@ -76,6 +80,15 @@ th { color: #8a93b2; font-weight: 600; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .win { color: #5be29a; }
 .loss { color: #ff7a8a; }
+header, nav { flex-wrap: wrap; gap: 0.75rem; }
+.row { gap: 1rem; flex-wrap: wrap; }
+.row b { min-width: 0; overflow-wrap: anywhere; }
+pre { max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+    main { padding: 1rem; }
+    .card { padding: 1rem; overflow-x: auto; }
+    header { padding: 1rem; }
+}
 """
 
 
@@ -103,6 +116,7 @@ def _layout(title: str, body: str, active: str = "home") -> str:
         nav.append(f"<a class='{cls}' href='{href}'>{label}</a>")
     return (
         "<!doctype html><html><head><meta charset='utf-8'/>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'/>"
         f"<title>{title}</title><style>{_CSS}</style></head><body>"
         "<header><h1>AI Crypto Trading Machine</h1><nav>"
         + " &nbsp;&middot;&nbsp; ".join(nav)
@@ -113,8 +127,106 @@ def _layout(title: str, body: str, active: str = "home") -> str:
 def _mode_pill() -> str:
     s = get_settings()
     if s.paper_trading:
-        return "<span class='pill paper'>PAPER</span>"
+        return "<span class='pill paper'>SIMULATION</span>"
     return "<span class='pill real'>LIVE &mdash; REAL MONEY</span>"
+
+
+def _execution_overview(snapshot: dict | None) -> dict:
+    from app.trading.watchdog import get_scheduler_status
+
+    mode = get_settings().ledger_mode
+    runs = storage.recent_tick_runs(1, mode=mode)
+    latest = runs[0] if runs else None
+    positions = [position for position in storage.all_positions() if position["mode"] == mode]
+    prices = {holding["asset"]: Decimal(str(holding["price_usdt"])) for holding in (snapshot or {}).get("holdings", [])}
+    unrealized = Decimal("0")
+    for position in positions:
+        price = prices.get(position["symbol"].removesuffix("USDT"))
+        if price is None:
+            unrealized = None
+            break
+        unrealized += Decimal(str(position["qty"])) * (price - Decimal(str(position["entry_price"])))
+    return {
+        "trading_mode": get_settings().trading_mode.value,
+        "ledger_mode": mode,
+        "mode_consistent": autopilot.state.mode == mode,
+        "latest_tick": latest,
+        "scheduler": get_scheduler_status(),
+        "last_successful_tick_at": storage.kv_get("autopilot_last_success"),
+        "last_technical_error": storage.kv_get("autopilot_last_technical_error"),
+        "risk_evaluation": storage.kv_get("risk_loop_status"),
+        "app_started_at": _APP_STARTED_AT.isoformat(),
+        "open_positions": len(positions),
+        "orders": storage.order_summary(mode),
+        "available_usdt": str(snapshot["usdt_cash"]) if snapshot is not None else None,
+        "realized_pnl_usdt": storage.total_realized_pnl(mode=mode),
+        "unrealized_pnl_usdt": str(unrealized) if unrealized is not None else None,
+    }
+
+
+def _render_execution_panel(overview: dict) -> str:
+    latest = overview["latest_tick"] or {}
+    decisions = latest.get("decisions", {})
+    values = {
+        "Mode": overview["trading_mode"].upper(),
+        "Mode agreement": "OK" if overview["mode_consistent"] else "ERROR",
+        "Tick ID": latest.get("tick_id"),
+        "Last tick result": latest.get("status"),
+        "Tick started": latest.get("started_at"),
+        "Tick completed": latest.get("completed_at"),
+        "Tick duration (seconds)": latest.get("duration_seconds"),
+        "Next scheduled tick": overview["scheduler"].get("next_tick_at"),
+        "Last successful tick": overview["last_successful_tick_at"],
+        "Last technical error": overview["last_technical_error"],
+        "Pairs scanned": latest.get("pairs_evaluated"),
+        "BUY decisions": decisions.get("BUY"),
+        "SELL decisions": decisions.get("SELL"),
+        "HOLD decisions": decisions.get("HOLD"),
+        "Risk rejections": latest.get("risk_rejections"),
+        "Orders submitted (tick)": latest.get("orders_submitted"),
+        "Orders filled (tick)": latest.get("orders_filled"),
+        "Execution errors": latest.get("errors"),
+        "Open positions": overview["open_positions"],
+        "Pending or unresolved orders": overview["orders"]["pending"],
+        "Recorded filled orders": overview["orders"]["filled"],
+        "Historical orders with unknown status": overview["orders"]["legacy_unknown"],
+        "Available USDT": overview["available_usdt"],
+        "Realized P&L (USDT)": overview["realized_pnl_usdt"],
+        "Unrealized P&L before exit fees (USDT)": overview["unrealized_pnl_usdt"],
+        "Risk evaluation": overview["risk_evaluation"],
+        "App started": overview["app_started_at"],
+    }
+    rows = "".join(
+        f"<div class='row'><span>{escape(label)}</span><b>{escape(str(value) if value is not None else 'Unavailable')}</b></div>"
+        for label, value in values.items()
+    )
+    return f"<section class='card'><h2>Execution status</h2>{rows}</section>"
+
+
+_MANUAL_TICK_SCRIPT = """
+<script>
+document.getElementById('run-one-tick').addEventListener('click', async event => {
+  const button = event.currentTarget;
+  const output = document.getElementById('manual-tick-result');
+  const confirmation = button.dataset.confirmation;
+  if (confirmation === 'RUN_ONE_LIVE_TICK' &&
+      window.prompt('Type RUN_ONE_LIVE_TICK to confirm real-money execution') !== confirmation) return;
+  button.disabled = true;
+  output.textContent = 'RUNNING';
+  try {
+    const response = await fetch('/autopilot/tick', {
+      method: 'POST', credentials: 'same-origin',
+      headers: {'Accept': 'application/json', 'X-Tick-Confirmation': confirmation}
+    });
+    if (response.status === 401) throw new Error('Authentication required');
+    const result = await response.json();
+    output.textContent = JSON.stringify(result, null, 2);
+  } catch (error) {
+    output.textContent = 'Result unknown: ' + error.message + '. Inspect persisted ticks and orders before retrying.';
+  } finally { button.disabled = false; }
+});
+</script>
+"""
 
 
 def _render_tick_diagnostics() -> tuple[str, str]:
@@ -227,13 +339,13 @@ async def dashboard() -> str:
     creds = credentials_present()
     st = autopilot.state
     pill_class = "live" if st.running else "off"
-    pill_text = "RUNNING" if st.running else "STOPPED"
+    health_state = storage.kv_get("health_status") or {}
+    pill_text = "ERROR" if st.running and health_state.get("overall_healthy") is False else "RUNNING" if st.running else "STOPPED"
     diag_banner, diag_card = _render_tick_diagnostics()
 
     if is_paper:
         creds_banner = (
-            "<div class='banner ok'>PAPER mode &mdash; trading with simulated $10,000. "
-            "All trades, P&amp;L, and per-agent learning are saved and will carry over to LIVE.</div>"
+            "<div class='banner ok'>SIMULATION &mdash; isolated ledger; no real orders.</div>"
         )
     elif not creds:
         creds_banner = (
@@ -248,6 +360,7 @@ async def dashboard() -> str:
         )
 
     balance_card = ""
+    snap = None
     low_cash_banner = ""
     try:
         snap = await portfolio_snapshot()
@@ -302,7 +415,7 @@ async def dashboard() -> str:
             f"<div class='muted'>Could not fetch balance: {exc}</div></div>"
         )
 
-    stats = storage.agent_stats()
+    stats = storage.agent_stats(mode=s.ledger_mode)
     if stats:
         rows = "".join(
             f"<tr><td>{a['agent']}</td>"
@@ -315,7 +428,6 @@ async def dashboard() -> str:
         agent_card = f"""
 <div class='card'>
   <h2>Agent learning</h2>
-  <div class='muted'>Per-agent stats accumulate across PAPER and LIVE so the live system inherits everything.</div>
   <table style='margin-top:0.75rem;'>
     <thead><tr><th>Agent</th><th class='num'>Positions</th><th class='num'>Win rate (per position)</th><th class='num'>Total P&amp;L</th></tr></thead>
     <tbody>{rows}</tbody>
@@ -325,12 +437,11 @@ async def dashboard() -> str:
     else:
         agent_card = (
             "<div class='card'><h2>Agent learning</h2>"
-            "<div class='muted'>No closed trades yet. Run autopilot in Paper mode "
-            "to start building a track record.</div></div>"
+            "<div class='muted'>No closed positions in this mode.</div></div>"
         )
 
     # ── Risk events card ─────────────────────────────────────────────
-    risk_events = storage.recent_risk_events(limit=10)
+    risk_events = storage.recent_risk_events(limit=10, mode=s.ledger_mode)
     if risk_events:
         rows = "".join(
             f"<tr><td>{e['exit_ts'][:16].replace('T',' ')}</td>"
@@ -358,7 +469,7 @@ async def dashboard() -> str:
         )
 
     # ── Equity curve card (last 30 snapshots, ascii sparkline) ───────
-    curve = storage.equity_curve(limit=30)
+    curve = storage.equity_curve(limit=30, mode=s.ledger_mode)
     if len(curve) >= 2:
         values = [c["total_usdt"] for c in curve]
         lo, hi = min(values), max(values)
@@ -402,6 +513,13 @@ async def dashboard() -> str:
     can_start = (creds or is_paper) and not st.running
     start_disabled = "" if can_start else "disabled"
     stop_disabled = "" if st.running else "disabled"
+    overview = _execution_overview(snap)
+    execution_panel = _render_execution_panel(overview)
+    confirmation = "RUN_ONE_PAPER_TICK" if is_paper else "RUN_ONE_LIVE_TICK"
+    recent_audit = storage.recent_trade_audit(limit=1, mode=s.ledger_mode)
+    recent_orders = storage.recent_orders(limit=1, mode=s.ledger_mode)
+    latest_audit = recent_audit[0] if recent_audit else {}
+    latest_order = recent_orders[0] if recent_orders else {}
 
     body = f"""
 {creds_banner}
@@ -409,12 +527,12 @@ async def dashboard() -> str:
 {low_cash_banner}
 <div class='card'>
   <h2>Autopilot <span class='pill {pill_class}'>{pill_text}</span> {_mode_pill()}</h2>
-  <div class='muted'>Trading runs automatically every 15 minutes once started.
-    Stop will market-sell every coin back to USDT.</div>
   <div class='row'><span>Started</span><b>{started}</b></div>
   <div class='row'><span>Last tick</span><b>{last_tick}</b></div>
   <div class='row'><span>Trades executed (this run)</span><b>{st.trades_executed}</b></div>
   {last_err}
+    <button id='run-one-tick' class='btn btn-mode' data-confirmation='{confirmation}' {stop_disabled}>&#8635; RUN ONE TICK</button>
+    <pre id='manual-tick-result' role='status' aria-live='polite'></pre>
   <form method='post' action='/autopilot/start'>
     <button class='btn btn-start' {start_disabled}>&#9654;  Start auto-trading</button>
   </form>
@@ -423,21 +541,21 @@ async def dashboard() -> str:
     <button class='btn btn-stop' {stop_disabled}>&#9632;  Stop &amp; liquidate everything</button>
   </form>
 </div>
+{execution_panel}
 {balance_card}
 {diag_card}
 {equity_card}
 {agent_card}
 {risk_card}
 <div class='card'>
-    <h2>LIVE trading monitor</h2>
-    <div class='row'><span>Last signal</span><b>{escape(str((storage.recent_trade_audit(limit=1)[0]['signal'] if storage.recent_trade_audit(limit=1) else '—')))}</b></div>
-    <div class='row'><span>Last order</span><b>{escape(str((storage.recent_orders(limit=1)[0]['side'] + ' ' + storage.recent_orders(limit=1)[0]['symbol'] if storage.recent_orders(limit=1) else '—')))}</b></div>
-    <div class='row'><span>Last Binance response</span><b>{escape(str((storage.recent_trade_audit(limit=1)[0]['binance_response'] if storage.recent_trade_audit(limit=1) else '—')))}</b></div>
-    <div class='row'><span>Last exception</span><b>{escape(str((storage.recent_trade_audit(limit=1)[0]['exception'] if storage.recent_trade_audit(limit=1) and storage.recent_trade_audit(limit=1)[0]['exception'] else st.last_error or '—')))}</b></div>
+    <h2>Trading monitor {_mode_pill()}</h2>
+    <div class='row'><span>Last signal</span><b>{escape(str(latest_audit.get('signal') or 'Unavailable'))}</b></div>
+    <div class='row'><span>Last order</span><b>{escape(str(latest_order.get('side', '') + ' ' + latest_order.get('symbol', '')).strip() or 'Unavailable')}</b></div>
+    <div class='row'><span>Last exchange response</span><b>{escape(str(latest_audit.get('binance_response') or 'Unavailable'))}</b></div>
+    <div class='row'><span>Last exception</span><b>{escape(str(latest_audit.get('exception') or st.last_error or 'Unavailable'))}</b></div>
     <div class='row'><span>Open positions</span><b>{len([p for p in storage.all_positions() if p['mode'] == st.mode])}</b></div>
-    <div class='row'><span>Account balances</span><b>{escape(str(len((await portfolio_snapshot(mode=st.mode)).get('all_balances', {}))))} assets</b></div>
-    <div class='row'><span>Bot uptime</span><b>{escape(str((datetime.now(timezone.utc) - st.started_at) if st.started_at else '—'))}</b></div>
-    <div class='row'><span>Scheduler uptime</span><b>{escape(str((storage.kv_get('health_status') or {}).get('timestamp') or '—'))}</b></div>
+    <div class='row'><span>Account assets</span><b>{len(snap.get('all_balances', {})) if snap is not None else 'Unavailable'}</b></div>
+    <div class='row'><span>App uptime</span><b>{escape(str(datetime.now(timezone.utc) - _APP_STARTED_AT))}</b></div>
 </div>
 <div class='card'>
   <h2>Universe</h2>
@@ -445,7 +563,7 @@ async def dashboard() -> str:
     ({", ".join(t.value for t in TIMEFRAMES)})</div>
 </div>
 """
-    return _layout("Dashboard", body, active="home")
+    return _layout("Dashboard", body + _MANUAL_TICK_SCRIPT, active="home")
 
 
 @router.get("/trades", response_class=HTMLResponse, include_in_schema=False)
@@ -559,22 +677,8 @@ async def settings_page(saved: int = 0, mode_saved: int = 0, risk_saved: int = 0
 {saved_banner}
 <div class='card'>
   <h2>Trading mode {_mode_pill()}</h2>
-  <div class='muted'>PAPER simulates trades against live Binance.US prices &mdash;
-    no real money. Every trade is saved so the LIVE system inherits the
-    learning when you switch.</div>
-  <form method='post' action='/settings/mode'>
-    <label style='display:flex;align-items:center;gap:0.5rem;margin-top:1rem;'>
-      <input type='radio' name='mode' value='paper' {paper_checked} />
-      <span><b>Paper</b> &mdash; safe simulation (recommended)</span>
-    </label>
-    <label style='display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;'>
-      <input type='radio' name='mode' value='live' {live_checked} />
-      <span><b>Live</b> &mdash; real Binance.US orders, real money</span>
-    </label>
-    <button class='btn btn-mode' style='margin-top:1rem;'
-      onclick="return confirm('Change trading mode? Stop autopilot first if it is running.');"
-    >Save mode</button>
-  </form>
+    <div class='row'><span>Execution</span><b>{escape(s.trading_mode.value.upper())}</b></div>
+    <div class='row'><span>Mode changes</span><b>Offline migration required</b></div>
 </div>
 {risk_form}
 <div class='card'>
@@ -609,16 +713,10 @@ async def save_credentials(
 
 @router.post("/settings/mode", include_in_schema=False)
 async def save_mode(mode: str = Form(...)):
-    if mode not in ("paper", "live"):
-        raise HTTPException(status_code=400, detail="mode must be 'paper' or 'live'")
-    if autopilot.state.running and mode != autopilot.state.mode:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop autopilot before changing trading mode",
-        )
-    save_trading_mode(paper=(mode == "paper"))
-    autopilot.state.mode = mode
-    return RedirectResponse(url="/settings?mode_saved=1", status_code=303)
+    raise HTTPException(
+        status_code=409,
+        detail="Mode changes require an offline, reviewed TRADING_MODE migration and restart; live configuration was not changed",
+    )
 
 
 @router.post("/settings/risk", include_in_schema=False)
@@ -655,6 +753,33 @@ async def autopilot_start():
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return RedirectResponse(url="/", status_code=303)
+
+
+@router.post("/autopilot/tick")
+async def autopilot_tick(
+    request: Request,
+    confirmation: str = Header(default="", alias="X-Tick-Confirmation"),
+) -> dict:
+    user = current_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="session authentication required")
+    origin = request.headers.get("origin")
+    if origin and origin.rstrip("/") != str(request.base_url).rstrip("/"):
+        raise HTTPException(status_code=403, detail="same-origin request required")
+    settings = get_settings()
+    live = autopilot.state.mode != "paper" or not settings.paper_trading or settings.live_mode
+    expected = "RUN_ONE_LIVE_TICK" if live else "RUN_ONE_PAPER_TICK"
+    if confirmation != expected:
+        raise HTTPException(status_code=400, detail=f"X-Tick-Confirmation must be {expected}")
+    try:
+        return await autopilot.tick(source="manual", requested_by=user.get("id"))
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Manual autopilot tick failed")
+        raise HTTPException(status_code=500, detail={
+            "status": "FAILED",
+            "reasons": ["tick_failed; inspect service logs before retrying"],
+            "orders_submitted": None,
+        }) from exc
 
 
 @router.post("/autopilot/stop", include_in_schema=False)
@@ -724,7 +849,12 @@ async def health(response: Response) -> dict:
 async def autopilot_status() -> dict:
     s = autopilot.state
     entry_status = storage.kv_get("entry_status") or {}
+    try:
+        snapshot = await portfolio_snapshot(mode=get_settings().ledger_mode)
+    except Exception:
+        snapshot = None
     return {
+        **_execution_overview(snapshot),
         "running": s.running,
         "mode": s.mode,
         "credentials_set": credentials_present(),
@@ -752,7 +882,7 @@ async def config_summary() -> dict:
         "live_mode": s.live_mode,
         "dry_run": s.dry_run,
         "paper_trading": s.paper_trading,
-        "mode": "paper" if s.paper_trading else "live",
+        "mode": s.trading_mode.value,
         "symbols": list(SYMBOLS),
         "timeframes": [tf.value for tf in TIMEFRAMES],
         "risk": {

@@ -54,9 +54,9 @@ def save_binance_credentials(api_key: str, api_secret: str) -> None:
 def save_trading_mode(paper: bool) -> None:
     """Flip between PAPER and LIVE. PAPER also sets dry_run=true (defense in depth)."""
     if paper:
-        _write_env({"LIVE_MODE": "false", "PAPER_TRADING": "true", "DRY_RUN": "true"})
+        _write_env({"TRADING_MODE": "simulation", "LIVE_MODE": "false", "PAPER_TRADING": "true", "DRY_RUN": "true"})
     else:
-        _write_env({"LIVE_MODE": "true", "PAPER_TRADING": "false", "DRY_RUN": "false"})
+        _write_env({"TRADING_MODE": "live", "LIVE_MODE": "true", "PAPER_TRADING": "false", "DRY_RUN": "false"})
 
 
 def save_trade_fees(maker: float, taker: float) -> None:

@@ -62,6 +62,68 @@ def test_tick_lock_expires(tmp_path):
     assert s.try_acquire_lock("autopilot_tick", ttl_seconds=300, owner="proc-b") is True
 
 
+def test_order_lock_rejects_same_owner_reentry(tmp_path):
+    store = _fresh_storage(tmp_path)
+    assert store.try_acquire_lock("order:paper:BTCUSDT:SELL", 300, "same-owner")
+    assert not store.try_acquire_lock("order:paper:BTCUSDT:SELL", 300, "same-owner")
+
+
+def test_restart_marks_dead_tick_failed_and_preserves_live_owner(tmp_path):
+    import os
+
+    store = _fresh_storage(tmp_path)
+    for tick_id, pid in (("dead", 999999999), ("alive", os.getpid())):
+        store.record_tick_run({"tick_id": tick_id, "pid": pid, "source": "scheduled", "mode": "paper",
+                               "started_at": "2026-11-11T00:00:00+00:00", "status": "RUNNING"})
+    store.recover_interrupted_ticks()
+    statuses = {row["tick_id"]: row["status"] for row in store.recent_tick_runs()}
+    assert statuses == {"dead": "FAILED", "alive": "RUNNING"}
+
+
+def test_repeated_fill_is_recorded_once(tmp_path):
+    store = _fresh_storage(tmp_path)
+    payload = dict(symbol="BTCUSDT", side="BUY", qty=1, position_qty=1, price=100,
+                   client_order_id="same-id", agents=[])
+    assert store.record_live_fill(**payload)
+    assert not store.record_live_fill(**payload)
+    assert store.get_position("BTCUSDT", mode="live")["qty"] == 1
+    assert len(store.recent_orders()) == 1
+
+
+def test_legacy_risk_migration_preserves_existing_keys(tmp_path):
+    store = _fresh_storage(tmp_path)
+    store.open_position(symbol="BTCUSDT", mode="live", qty=1, entry_price=100, agents=[])
+    store.kv_set("hwm:BTCUSDT", "120")
+    store.migrate_risk_state("live")
+    assert store.kv_get("hwm:live:BTCUSDT") == "120"
+    assert store.kv_get("hwm:BTCUSDT") == "120"
+
+
+def test_failed_close_rolls_back_position_and_trade(tmp_path):
+    import sqlite3
+
+    store = _fresh_storage(tmp_path)
+    store.open_position(symbol="BTCUSDT", mode="paper", qty=1, entry_price=100, agents=[])
+    with store._conn() as connection:
+        connection.execute("CREATE TRIGGER reject_close BEFORE INSERT ON closed_trades BEGIN SELECT RAISE(ABORT, 'write failed'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="write failed"):
+        store.close_position(symbol="BTCUSDT", mode="paper", exit_price=110)
+    assert store.get_position("BTCUSDT")["qty"] == 1
+    assert store.closed_trades() == []
+
+
+def test_transaction_rolls_back_multiple_storage_methods(tmp_path):
+    store = _fresh_storage(tmp_path)
+    store.paper_reset(100)
+    with pytest.raises(RuntimeError):
+        with store.transaction():
+            store.paper_balance_debit("USDT", 20)
+            store.open_position(symbol="BTCUSDT", mode="paper", qty=1, entry_price=20, agents=[])
+            raise RuntimeError("write failed")
+    assert store.paper_balance_get("USDT") == 100
+    assert store.all_positions() == []
+
+
 def test_tick_lock_releases_when_owner_process_is_dead(tmp_path):
     s = _fresh_storage(tmp_path)
     assert s.try_acquire_lock("autopilot_tick", ttl_seconds=300, owner="999999999-dead") is True

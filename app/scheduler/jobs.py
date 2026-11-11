@@ -40,12 +40,7 @@ async def refresh_market_data() -> None:
 
 async def autopilot_tick() -> None:
     """Run agents and execute signals only when the user has hit Start."""
-    timeout_s = max(5, int(get_settings().autopilot_tick_timeout_seconds))
-    try:
-        await asyncio.wait_for(autopilot.tick(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        autopilot.state.last_error = f"autopilot tick timed out after {timeout_s}s"
-        log.critical("autopilot tick timed out after %ss", timeout_s)
+    await autopilot.tick(source="scheduled")
 
 
 async def equity_snapshot() -> None:
@@ -146,13 +141,7 @@ async def performance_analytics_pass() -> None:
 
 
 def build_scheduler() -> AsyncIOScheduler:
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(refresh_market_data, CronTrigger(minute="*/15"), id="market_data")
-    scheduler.add_job(autopilot_tick, CronTrigger(minute="2,17,32,47"), id="autopilot")
-    scheduler.add_job(llm_signal_pass, CronTrigger(minute="7"), id="llm_pass")
-    scheduler.add_job(ml_learning_pass, CronTrigger(minute="12", hour="*/6"), id="ml_learning")
-    scheduler.add_job(equity_snapshot, CronTrigger(minute="55"), id="equity_curve")
-    scheduler.add_job(reconcile_portfolio, CronTrigger(minute="*/5"), id="portfolio_reconcile")
-    scheduler.add_job(performance_analytics_pass, CronTrigger(minute="20", hour="*/1"), id="performance_analytics")
-    return scheduler
+    from app.scheduler.scheduler import build_scheduler as canonical_builder
+
+    return canonical_builder()
 

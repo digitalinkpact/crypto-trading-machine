@@ -79,7 +79,7 @@ def test_execution_defaults_are_more_permissive():
 
 
 def test_live_mode_forces_live_flags():
-    s = Settings(_env_file=None, live_mode=True, paper_trading=True, dry_run=True)
+    s = Settings(_env_file=None, live_mode=True)
     assert s.live_mode is True
     assert s.paper_trading is False
     assert s.dry_run is False
@@ -87,12 +87,32 @@ def test_live_mode_forces_live_flags():
 
 def test_live_mode_from_env_forces_live(monkeypatch):
     monkeypatch.setenv("LIVE_MODE", "true")
-    monkeypatch.setenv("PAPER_TRADING", "true")
-    monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.setenv("PAPER_TRADING", "false")
+    monkeypatch.setenv("DRY_RUN", "false")
     s = Settings(_env_file=None)
     assert s.live_mode is True
     assert s.paper_trading is False
     assert s.dry_run is False
+
+
+def test_conflicting_modes_fail_closed():
+    import pytest
+
+    with pytest.raises(ValueError, match="Conflicting legacy"):
+        Settings(_env_file=None, live_mode=True, paper_trading=True, dry_run=True)
+    with pytest.raises(ValueError, match="conflicts"):
+        Settings(_env_file=None, trading_mode="simulation", live_mode=True)
+    with pytest.raises(ValueError, match="migration"):
+        Settings(_env_file=None, live_mode=False, paper_trading=False, dry_run=True)
+
+
+def test_authoritative_mode_derives_compatibility_flags():
+    for mode, live in (("live", True), ("simulation", False)):
+        settings = Settings(_env_file=None, trading_mode=mode)
+        assert settings.live_mode is live
+        assert settings.paper_trading is not live
+        assert settings.dry_run is not live
+        assert settings.ledger_mode == ("live" if live else "paper")
 
 
 def test_live_mode_does_not_disable_ml_gate(monkeypatch):

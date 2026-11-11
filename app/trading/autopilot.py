@@ -14,6 +14,7 @@ Each tick:
 from __future__ import annotations
 
 import asyncio
+from contextvars import Context
 import hashlib
 import json
 import os
@@ -296,7 +297,7 @@ class Autopilot:
         # to 15 min for the next cron slot before any trade can fire.
         try:
             self._initial_tick_task = asyncio.create_task(
-                self.tick(), name="autopilot-initial-tick"
+                self.tick(source="initial"), name="autopilot-initial-tick"
             )
             self._initial_tick_task.add_done_callback(self._log_initial_tick_result)
             log.info("autopilot first tick scheduled immediately after Start")
@@ -334,22 +335,107 @@ class Autopilot:
         return self.state
 
     # ── scheduled tick ─────────────────────────────────────────────────
-    async def tick(self) -> None:
+    async def tick(self, *, source: str = "scheduled", requested_by: int | None = None) -> dict:
+        from app.trading.execution_context import current_execution, record_error
+
+        settings = get_settings()
+        started = time.perf_counter()
+        result = {
+            "tick_id": uuid.uuid4().hex,
+            "source": source,
+            "requested_by": requested_by,
+            "mode": self.state.mode,
+            "revision": _active_revision(),
+            "pid": os.getpid(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+            "status": "RUNNING",
+            "pairs_evaluated": 0,
+            "decisions": {"BUY": 0, "SELL": 0, "HOLD": 0},
+            "risk_rejections": {},
+            "orders": [],
+            "orders_submitted": 0,
+            "orders_filled": 0,
+            "errors": [],
+            "reasons": [],
+        }
+        try:
+            storage.record_tick_run(result)
+        except Exception as exc:
+            log.exception("tick admission persistence failed")
+            return {**result, "status": "FAILED", "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "errors": [{"stage": "tick_admission", "type": type(exc).__name__}], "reasons": ["database_unavailable"]}
+        token = current_execution.set(result)
+        try:
+            if hasattr(settings, "ledger_mode") and settings.ledger_mode != self.state.mode:
+                result.update(status="BLOCKED", reasons=["mode_mismatch; offline migration required"])
+            else:
+                timeout = max(5, int(getattr(settings, "autopilot_tick_timeout_seconds", 50)))
+                outcome = await asyncio.wait_for(self._tick_once(), timeout=timeout)
+                result["reasons"] = outcome.get("reasons", [])
+                result["execution"] = outcome.get("execution", {})
+                result["risk_rejections"] = {
+                    reason: count for reason, count in result["execution"].get("by_reason", {}).items()
+                    if not reason.startswith("executed_") and reason not in {"no_signals", "action_hold"}
+                }
+                result["status"] = {
+                    "skipped": "SKIPPED", "blocked": "BLOCKED", "failed": "FAILED",
+                }.get(outcome.get("status"), "EXECUTED")
+                if outcome.get("status") == "failed" and not result["errors"] and any(
+                    reason in result["reasons"] for reason in ("drawdown_circuit_breaker", "emergency_halt")
+                ):
+                    result["status"] = "BLOCKED"
+        except asyncio.TimeoutError as exc:
+            record_error("tick_timeout", exc)
+            result.update(status="FAILED", reasons=["tick_timeout"])
+            self.state.last_error = "autopilot tick timed out; inspect order intents before retrying"
+        except asyncio.CancelledError as exc:
+            record_error("tick_cancelled", exc)
+            result.update(status="FAILED", reasons=["tick_cancelled"])
+            raise
+        except Exception as exc:
+            record_error("tick", exc)
+            result.update(status="FAILED", reasons=["technical_error; inspect service logs"])
+            log.exception("tick failed")
+        finally:
+            result["completed_at"] = datetime.now(timezone.utc).isoformat()
+            result["duration_seconds"] = round(time.perf_counter() - started, 6)
+            result["orders_submitted"] = sum(bool(order.get("submitted")) for order in result["orders"])
+            result["orders_filled"] = sum(bool(order.get("filled")) for order in result["orders"])
+            if result["errors"]:
+                result["status"] = "FAILED"
+            try:
+                storage.record_tick_run(result)
+                if result["status"] == "EXECUTED":
+                    storage.kv_set("autopilot_last_success", result["completed_at"])
+                if result["errors"]:
+                    storage.kv_set("autopilot_last_technical_error", {"at": result["completed_at"], "errors": result["errors"]})
+                self._save()
+            except Exception as exc:
+                result["status"] = "FAILED"
+                result["errors"].append({"stage": "tick_completion", "type": type(exc).__name__})
+                log.exception("tick completion persistence failed")
+            current_execution.reset(token)
+        return result
+
+    async def _tick_once(self) -> dict:
         """Called by the scheduler. No-op when stopped."""
         tick_started = time.perf_counter()
         if not self.state.running:
-            return
+            return {"status": "skipped", "reasons": ["autopilot_stopped"], "orders_submitted": 0}
         if self._lock.locked():
             log.info("autopilot tick skipped — previous tick still running")
-            return
+            return {"status": "skipped", "reasons": ["tick_in_progress"], "orders_submitted": 0}
         # Cross-process guard: if another app instance (e.g. a stray dev server
         # sharing this DB) is mid-tick, skip. This prevents the duplicate-order
         # / negative-balance corruption that an in-process lock alone can't stop.
         # TTL is a crash safety net; we release explicitly in `finally`.
-        if not storage.try_acquire_lock("autopilot_tick", ttl_seconds=300.0, owner=self._owner):
+        lease = max(300, int(getattr(get_settings(), "autopilot_tick_timeout_seconds", 50)) + 30)
+        if not storage.try_acquire_lock("autopilot_tick", ttl_seconds=lease, owner=self._owner):
             log.info("autopilot tick skipped — another process holds the tick lock")
-            return
+            return {"status": "skipped", "reasons": ["tick_locked_by_another_process"], "orders_submitted": 0}
         async with self._lock:
+            self._tick_debug = {}
             self.state.last_error = ""
             self.state.last_tick_at = datetime.now(timezone.utc)
             try:
@@ -372,6 +458,8 @@ class Autopilot:
                     log.warning("filter load failed at tick start: %s", exc)
                 if not filters.loaded:
                     reason = "Binance.US LOT_SIZE/MIN_NOTIONAL filters unavailable"
+                    from app.trading.execution_context import record_error
+                    record_error("exchange_filters", RuntimeError(reason))
                     self._set_entry_safety_halt(_FILTERS_HALT_KEY, reason)
                     log.critical("%s; new BUY entries blocked", reason)
                 else:
@@ -395,12 +483,14 @@ class Autopilot:
 
                 # 2. Agent signals → execute (skip BUYs if breaker tripped).
                 try:
-                    signals = await run_all_agents(use_llm=get_settings().llm_in_trading_loop)
+                    signals = await run_all_agents(use_llm=False)
                 except Exception as exc:  # noqa: BLE001
                     self.state.last_error = f"agent run failed: {exc}"
+                    from app.trading.execution_context import record_error
+                    record_error("agents", exc)
                     log.exception("autopilot agent run failed")
                     self._save()
-                    return
+                    return {"status": "failed", "reasons": ["agent_run_failed"], "orders_submitted": 0}
                 try:
                     await self._execute(signals, allow_buys=not breaker_tripped)
                 finally:
@@ -433,15 +523,33 @@ class Autopilot:
                         })
                     except Exception as exc:  # noqa: BLE001
                         log.debug("entry_status persist failed: %s", exc)
+                submitted = sum(
+                    bool(entry.get("submitted"))
+                    for entry in self._tick_debug.get("per_symbol", {}).values()
+                ) + self._tick_debug.get("by_reason", {}).get("executed_sell", 0)
+                outcome_reasons = reasons + list(self._tick_debug.get("by_reason", {}))
+                if self.state.last_error:
+                    outcome_reasons.append("tick_error; inspect service logs")
+                return {
+                    "status": (
+                        "executed" if submitted else
+                        "blocked" if signals else "executed"
+                    ),
+                    "orders_submitted": submitted,
+                    "reasons": outcome_reasons,
+                    "execution": self._tick_debug,
+                    "last_tick_at": self.state.last_tick_at.isoformat(),
+                }
             finally:
                 exchange_telemetry.record_stage("tick", time.perf_counter() - tick_started)
                 storage.release_lock("autopilot_tick", owner=self._owner)
 
     # ── risk gates ─────────────────────────────────────────────────────
-    async def _run_risk_gates(self) -> None:
+    async def _run_risk_gates(self) -> dict:
+        failures = []
         positions = [p for p in storage.all_positions() if p["mode"] == self.state.mode]
         if not positions:
-            return
+            return {"success": True, "positions_evaluated": 0, "errors": []}
         # Actual free balances — risk exits must sell what the exchange really
         # holds, not the recorded position qty. A market BUY pays its fee out of
         # the received base asset (book 45 XLM, free 44.991), so selling the
@@ -475,7 +583,7 @@ class Autopilot:
                 )
             except Exception as halt_exc:  # noqa: BLE001
                 log.error("failed to engage halt after balance verification failure: %s", halt_exc)
-            return
+            return {"success": False, "positions_evaluated": 0, "errors": [{"stage": "balances", "type": type(exc).__name__}]}
         prices: dict[str, Decimal] = {}
         atr_by_symbol: dict[str, float] = {}
         for pos in positions:
@@ -483,6 +591,7 @@ class Autopilot:
                 prices[pos["symbol"]] = await self._price(pos["symbol"])
             except Exception as exc:  # noqa: BLE001
                 log.warning("price fetch failed for %s: %s", pos["symbol"], exc)
+                failures.append({"stage": "price", "symbol": pos["symbol"], "type": type(exc).__name__})
             # Best-effort ATR% drives the ATR-scaled hard stop; a None here just
             # falls back to the fixed stop_loss_pct inside evaluate_exits.
             atr = await self._atr_pct(pos["symbol"])
@@ -555,12 +664,12 @@ class Autopilot:
                             # corrupts realized PnL, win-rate and agent stats.
                             # Close at the entry price so realized PnL is ~0
                             # (bookkeeping cleanup, not a real trade).
-                            stale_pos = storage.get_position(ex.symbol)
+                            stale_pos = storage.get_position(ex.symbol, mode=self.state.mode)
                             book_exit_price = Decimal(
                                 str((stale_pos or {}).get("entry_price") or price)
                             )
                             storage.close_position(
-                                symbol=ex.symbol, exit_price=book_exit_price,
+                                symbol=ex.symbol, mode=self.state.mode, exit_price=book_exit_price,
                                 exit_reason=f"{ex.reason}_stale_dust",
                             )
                             risk.clear_hwm(ex.symbol)
@@ -618,6 +727,7 @@ class Autopilot:
                         risk.clear_tp1(ex.symbol)
                         risk.clear_tp2(ex.symbol)
                 else:
+                    failures.append({"stage": "risk_exit", "symbol": ex.symbol, "type": "UnfilledOrder"})
                     log.error(
                         "RISK EXIT %s did NOT fill (status=%s) — position remains "
                         "open, will retry next tick", ex.symbol,
@@ -625,6 +735,7 @@ class Autopilot:
                     )
             except Exception as exc:  # noqa: BLE001
                 log.exception("risk-exit failed for %s: %s", ex.symbol, exc)
+                failures.append({"stage": "risk_exit", "symbol": ex.symbol, "type": type(exc).__name__})
 
         # Ensure every allowlisted live position carries its exchange-native
         # backstop and ratchet it up. No-op unless the canary flag covers a
@@ -633,6 +744,8 @@ class Autopilot:
             await self.reconcile_protective_stops()
         except Exception as exc:  # noqa: BLE001
             log.exception("protective-stop reconcile failed: %s", exc)
+            failures.append({"stage": "protective_stops", "type": type(exc).__name__})
+        return {"success": not failures, "positions_evaluated": len(prices), "errors": failures}
 
     async def _check_circuit_breaker(self) -> bool:
         drawdown_halt = storage.kv_get(_DRAWDOWN_HALT_KEY) or {}
@@ -647,6 +760,8 @@ class Autopilot:
             snap = await portfolio_snapshot(mode=self.state.mode)
         except Exception as exc:  # noqa: BLE001
             self.state.last_error = f"breaker portfolio fetch failed: {exc}; new BUYs halted"
+            from app.trading.execution_context import record_error
+            record_error("circuit_breaker", exc)
             log.critical(self.state.last_error)
             return True
         tripped, dd = risk.is_circuit_breaker_tripped(
@@ -1077,6 +1192,8 @@ class Autopilot:
             snap = await portfolio_snapshot(mode=self.state.mode)
         except Exception as exc:  # noqa: BLE001
             self.state.last_error = f"portfolio fetch failed: {exc}"
+            from app.trading.execution_context import record_error
+            record_error("portfolio", exc)
             log.exception("autopilot portfolio fetch failed")
             return
 
@@ -1266,7 +1383,6 @@ class Autopilot:
                         if tracked_qty > 0 and sell_qty > 0:
                             placed = await self._place_sell(symbol, sig, sell_qty)
                             if placed:
-                                skip_counter["executed_sell"] += 1
                                 risk.clear_hwm(symbol)
                                 risk.clear_tp1(symbol)
                                 risk.clear_tp2(symbol)
@@ -1639,7 +1755,7 @@ class Autopilot:
                                         attempt=1,
                                         aggressive_mode=aggressive_mode,
                                         spread_cap=spread_cap,
-                                    )
+                                    ), context=Context(),
                                 )
                                 retry_scheduled = True
                         detail = ob_why if not retry_scheduled else f"{ob_why}; retry_scheduled=60s x{int(getattr(s, 'orderbook_retry_attempts', 3))}"
@@ -1661,7 +1777,6 @@ class Autopilot:
                         self._clear_pyramid_adds_count(symbol)
                     else:
                         self._set_pyramid_adds_count(symbol, pyramid_adds + 1)
-                    skip_counter["executed_buy"] += 1
                     _finish(
                         symbol,
                         ("executed_pyramid_buy" if is_pyramid else "executed_buy"),
@@ -1701,6 +1816,8 @@ class Autopilot:
                         )
             except Exception as exc:  # noqa: BLE001
                 self.state.last_error = f"{symbol}: {exc}"
+                from app.trading.execution_context import record_error
+                record_error("signal_execution", exc)
                 log.warning("execute failed %s: %s", symbol, exc)
                 _bump("exception", symbol, str(exc))
         self._persist_skip_stats(skip_counter, tick_debug, total=len(signals))
@@ -2107,18 +2224,12 @@ class Autopilot:
                             attempt=attempt + 1,
                             aggressive_mode=aggressive_mode,
                             spread_cap=spread_cap,
-                        )
+                        ), context=Context(),
                     )
                     self._orderbook_retry_tasks[task_key] = next_task
                 return
 
-            placed = await self._place_buy(symbol, sig, retry_notional)
-            if placed:
-                self.state.cooldowns[symbol] = datetime.now(timezone.utc).isoformat()
-                self._save()
-                log.info("[OB_RETRY] %s attempt=%d executed after recheck", symbol, attempt)
-            else:
-                log.info("[OB_RETRY] %s attempt=%d failed at submit stage", symbol, attempt)
+            await self.tick(source="orderbook_retry")
         except Exception as exc:  # noqa: BLE001
             log.warning("[OB_RETRY] %s attempt=%d failed: %s", symbol, attempt, exc)
         finally:
@@ -2181,14 +2292,15 @@ class Autopilot:
         total: int,
     ) -> None:
         """Persist per-tick reason breakdown so /diagnose and operators can see why."""
+        self._tick_debug = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "total_signals": total,
+            "by_reason": dict(counter),
+            "per_symbol": tick_debug,
+        }
         try:
             storage.kv_set(_SKIP_STATS_KEY, dict(counter))
-            storage.kv_set(_LAST_TICK_DEBUG_KEY, {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "total_signals": total,
-                "by_reason": dict(counter),
-                "per_symbol": tick_debug,
-            })
+            storage.kv_set(_LAST_TICK_DEBUG_KEY, self._tick_debug)
         except Exception as exc:  # noqa: BLE001
             log.debug("skip-stats persist failed: %s", exc)
         if counter:
@@ -2654,7 +2766,7 @@ class Autopilot:
                     symbol, fill_price,
                 )
                 return
-            pos = storage.get_position(symbol)
+            pos = storage.get_position(symbol, mode=self.state.mode)
             entry_price = Decimal(str((pos or {}).get("entry_price") or 0))
             mfe_pct, mae_pct = risk.mfe_mae_pct(symbol, entry_price)
             fee = fill.get("fee")
@@ -2674,7 +2786,7 @@ class Autopilot:
         """After a TP1/TP2 partial, re-place the stop for the REMAINING qty."""
         if not self._stop_allowed(symbol):
             return
-        pos = storage.get_position(symbol)
+        pos = storage.get_position(symbol, mode=self.state.mode)
         if not pos or Decimal(str(pos.get("qty") or 0)) <= 0:
             return
         software_stop = await self._effective_software_stop_price(
@@ -2766,11 +2878,30 @@ class Autopilot:
         entry_strategy: Optional[str] = None,
         entry_btc_regime: Optional[int] = None,
     ) -> Optional[Order]:
+        settings = get_settings()
+        if hasattr(settings, "ledger_mode") and settings.ledger_mode != self.state.mode:
+            self.state.last_error = "mode mismatch; order submission rejected"
+            return None
         order_lock = f"order:{self.state.mode}:{symbol}:{side.value}"
-        if not storage.try_acquire_lock(order_lock, ttl_seconds=300.0, owner=self._owner):
+        owner = f"{self._owner}-{uuid.uuid4().hex[:8]}"
+        if not storage.try_acquire_lock(order_lock, ttl_seconds=300.0, owner=owner):
             log.warning("order skipped: another submission is active for %s %s", symbol, side.value)
             return None
         try:
+            unresolved = [intent for intent in storage.pending_order_intents(self.state.mode)
+                          if intent["symbol"] == symbol and intent["side"] == side.value]
+            if unresolved:
+                self.state.last_error = "unresolved order intent; verify exchange before retrying"
+                return None
+            if side is OrderSide.SELL:
+                position = storage.get_position(symbol, mode=self.state.mode)
+                if position is None:
+                    log.warning("SELL skipped: tracked position no longer exists for %s", symbol)
+                    return None
+                if not any(agent.startswith("risk:") for agent in agents):
+                    qty = min(qty, Decimal(str(position["qty"])))
+                if qty <= 0:
+                    return None
             return await self._submit_locked(
                 symbol, side, qty, agents,
                 entry_confidence=entry_confidence,
@@ -2778,7 +2909,7 @@ class Autopilot:
                 entry_btc_regime=entry_btc_regime,
             )
         finally:
-            storage.release_lock(order_lock, owner=self._owner)
+            storage.release_lock(order_lock, owner=owner)
 
     async def _submit_locked(
         self,
@@ -2791,12 +2922,24 @@ class Autopilot:
         entry_strategy: Optional[str] = None,
         entry_btc_regime: Optional[int] = None,
     ) -> Optional[Order]:
+        from app.trading.execution_context import current_execution, record_error
+
+        execution = current_execution.get()
         if self.state.mode == "paper":
             order = await paper_exchange.place_order(
                 symbol=symbol, side=side, quantity=qty, agents=agents,
                 entry_confidence=entry_confidence, entry_strategy=entry_strategy,
                 entry_btc_regime=entry_btc_regime,
             )
+            if execution is not None:
+                execution["orders"].append({
+                    "symbol": symbol, "side": side.value,
+                    "client_order_id": order.client_order_id,
+                    "status": order.status.value, "submitted": True,
+                    "filled": self._order_filled(order),
+                    "filled_quantity": str(order.filled_quantity),
+                    "average_price": str(order.avg_fill_price),
+                })
         else:
             if side is OrderSide.BUY:
                 allowed, reason, detail = await self._final_live_buy_safety_check(
@@ -2816,6 +2959,12 @@ class Autopilot:
                     return None
             client = BinanceUSClient()
             coid = client.generate_client_order_id()
+            intent = {"client_order_id": coid, "tick_id": (execution or {}).get("tick_id"),
+                      "mode": self.state.mode, "symbol": symbol, "side": side.value, "qty": str(qty)}
+            storage.record_order_intent(intent)
+            response = {**intent, "status": "SUBMITTING", "submitted": True, "filled": False}
+            if execution is not None:
+                execution["orders"].append(response)
             try:
                 order = await client.place_order(
                     symbol=symbol,
@@ -2824,6 +2973,13 @@ class Autopilot:
                     quantity=qty,
                     client_order_id=coid,
                 )
+            except asyncio.CancelledError:
+                response["status"] = "UNKNOWN"
+                storage.update_order_intent(coid, "UNKNOWN", response)
+                storage.kv_set("order_outcome_unknown", intent)
+                from app.trading import watchdog
+                watchdog.trigger_emergency_halt("order submission cancelled; verify client order ID", level="order_outcome_unknown")
+                raise
             except Exception as exc:  # noqa: BLE001
                 order = await self._resolve_order_after_exception(
                     symbol=symbol,
@@ -2833,7 +2989,15 @@ class Autopilot:
                     exc=exc,
                 )
                 if order is None:
+                    response["status"] = "UNKNOWN" if "UNKNOWN" in self.state.last_error else "REJECTED"
+                    storage.update_order_intent(coid, response["status"], response)
+                    record_error("exchange_submission", exc)
                     return None
+            response.update(status=order.status.value, filled=self._order_filled(order),
+                            filled_quantity=str(order.filled_quantity), average_price=str(order.avg_fill_price),
+                            exchange_order_id=order.exchange_order_id)
+            if order.status in (OrderStatus.DRY_RUN, OrderStatus.REJECTED):
+                response["submitted"] = False
             # Only mirror a live order into our book if the exchange actually
             # filled it. Recording the *requested* qty on a partial fill (or a
             # config-drift DRY_RUN) would leave a phantom/oversized position the
@@ -2852,6 +3016,7 @@ class Autopilot:
                 self.state.last_error = (
                     f"{symbol} {side.value} not filled (status={order.status})"
                 )
+                storage.update_order_intent(coid, order.status.value, response)
                 return order
             if filled < qty:
                 log.warning(
@@ -2876,60 +3041,26 @@ class Autopilot:
                     if order.commission is not None and order.commission_asset == "USDT"
                     else 0
                 )
-                storage.record_order(
-                    mode="live", symbol=symbol, side=side.value,
-                    qty=filled, price=price, fee=order_fee_usdt,
-                    client_order_id=order.client_order_id, agents=agents,
+                pos = next((position for position in storage.all_positions()
+                            if position["symbol"] == symbol and position["mode"] == "live"), None)
+                mfe_pct, mae_pct = risk.mfe_mae_pct(symbol, Decimal(str((pos or {}).get("entry_price") or 0)))
+                commission = float(order.commission) if order.commission is not None and order.commission_asset == "USDT" else None
+                storage.record_live_fill(
+                    symbol=symbol, side=side.value, qty=filled, position_qty=position_qty,
+                    price=price, fee=order_fee_usdt, client_order_id=order.client_order_id,
+                    agents=agents, entry_confidence=entry_confidence, entry_strategy=entry_strategy,
+                    entry_btc_regime=entry_btc_regime, entry_fee_usdt=commission,
+                    exit_fee_usdt=commission, mfe_pct=mfe_pct, mae_pct=mae_pct,
+                    status=order.status.value, response=response,
                 )
                 if side is OrderSide.BUY:
-                    entry_fee_usdt = (
-                        float(order.commission)
-                        if order.commission is not None and order.commission_asset == "USDT"
-                        else None
-                    )
-                    storage.open_position(
-                        symbol=symbol, mode="live", qty=position_qty,
-                        entry_price=price, agents=agents,
-                        entry_confidence=entry_confidence, entry_strategy=entry_strategy,
-                        entry_btc_regime=entry_btc_regime, entry_fee_usdt=entry_fee_usdt,
-                    )
-                    # Exchange-native catastrophe backstop (OFF by default; the
-                    # software risk loop stays primary). No-op when disabled.
-                    pos_row = storage.get_position(symbol)
+                    pos_row = storage.get_position(symbol, mode=self.state.mode)
                     await self._place_protective_stop(
                         symbol, position_qty, Decimal(str(price)),
                         str((pos_row or {}).get("entry_ts") or ""),
                     )
-                else:
-                    pos = next(
-                        (p for p in storage.all_positions() if p["symbol"] == symbol and p["mode"] == "live"),
-                        None,
-                    )
-                    mfe_pct, mae_pct = risk.mfe_mae_pct(
-                        symbol, Decimal(str((pos or {}).get("entry_price") or 0))
-                    )
-                    # Exchange fill reconciliation: use the REAL commission
-                    # Binance charged (from the order's fills[]) instead of a
-                    # modeled estimate — but only when BOTH the original
-                    # entry's and this exit's commission are known and were
-                    # paid in the quote asset (USDT). A commission paid in
-                    # another asset (e.g. BNB fee discount) isn't directly a
-                    # USDT cost without a conversion we don't have here, and
-                    # mixing one real leg with one modeled leg would blur
-                    # `fee_source` — storage.reduce_position falls back to a
-                    # fully modeled estimate for the whole trade rather than
-                    # fabricate a partial number.
-                    actual_exit_fee_usdt = None
-                    entry_fee = (pos or {}).get("entry_fee_usdt")
-                    if order.commission is not None and order.commission_asset == "USDT":
-                        actual_exit_fee_usdt = float(order.commission)
-                    storage.reduce_position(
-                        symbol=symbol, mode="live", qty=filled, exit_price=price,
-                        exit_reason=risk.infer_exit_reason(agents),
-                        mfe_pct=mfe_pct, mae_pct=mae_pct,
-                        actual_exit_fee_usdt=actual_exit_fee_usdt,
-                    )
             except Exception as exc:  # noqa: BLE001
+                record_error("fill_accounting", exc)
                 log.critical(
                     "LIVE order filled but local persistence failed for %s %s coid=%s: %s; "
                     "blocking new entries until reconciliation",
@@ -2998,6 +3129,23 @@ class Autopilot:
             detail["order_notional"] = str(qty * price)
             if usdt_free < qty * price:
                 return False, "insufficient_usdt", detail
+            open_positions = [position for position in storage.all_positions() if position["mode"] == "live"]
+            balances = snapshot.get("free_balances") or snapshot.get("all_balances") or {}
+            open_count, held = await self._count_non_dust_positions(open_positions=open_positions, balances=balances)
+            equity = Decimal(str(snapshot["total_usdt"]))
+            aggressive, _reason = self._aggressive_mode_active()
+            current = next((position for position in open_positions if position["symbol"] == symbol), None)
+            decision = RiskManager().evaluate_entry(
+                mode="live", total_equity_usdt=equity, open_positions=open_count,
+                long_exposure_pct=float((equity-usdt_free)/equity) if equity > 0 else 0,
+                entry_price=price, aggressive_mode=aggressive,
+                is_pyramid=symbol in held,
+                current_position_notional=Decimal(str((current or {}).get("qty", 0))) * price,
+            )
+            if not decision.allow:
+                return False, decision.reason, detail
+            if qty * price > decision.notional_usdt:
+                return False, "order_exceeds_risk_budget", detail
             return True, "ok", detail
         except Exception as exc:  # noqa: BLE001
             detail["exception"] = str(exc)

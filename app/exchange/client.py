@@ -15,7 +15,7 @@ from typing import Any, Optional
 import pandas as pd
 from binance.spot import Spot  # type: ignore[import-untyped]
 
-from app.config import Settings, Timeframe, get_settings
+from app.config import Settings, Timeframe, TradingMode, get_settings
 from app.logging_setup import get_logger
 
 from .models import Order, OrderSide, OrderStatus, OrderType
@@ -115,11 +115,17 @@ class BinanceUSClient:
             api_key=self._settings.binance_api_key.get_secret_value() or None,
             api_secret=self._settings.binance_api_secret.get_secret_value() or None,
             base_url=self._settings.binance_base_url,
+            timeout=10,
         )
 
     def generate_client_order_id(self, prefix: str = "ctm") -> str:
         """Create a Binance-safe client order id used for idempotency."""
         return _new_client_order_id(prefix)
+
+    @property
+    def _simulation(self) -> bool:
+        return (self._settings.trading_mode != TradingMode.LIVE
+                or self._settings.dry_run or self._settings.paper_trading)
 
     async def _api_call(self, operation: str, func, *args, **kwargs):
         started = asyncio.get_running_loop().time()
@@ -288,7 +294,7 @@ class BinanceUSClient:
             submitted_at=datetime.now(timezone.utc),
         )
 
-        if self._settings.dry_run or self._settings.paper_trading:
+        if self._simulation:
             log.warning(
                 "[DRY-RUN] %s %s %s qty=%s price=%s coid=%s",
                 symbol, side.value, type.value, quantity, price, coid,
@@ -334,7 +340,7 @@ class BinanceUSClient:
         )
 
     async def cancel_order(self, symbol: str, client_order_id: str) -> dict[str, Any]:
-        if self._settings.dry_run or self._settings.paper_trading:
+        if self._simulation:
             log.warning("[DRY-RUN] cancel coid=%s symbol=%s", client_order_id, symbol)
             return {"status": "DRY_RUN", "origClientOrderId": client_order_id}
         return await self._api_call(
@@ -359,7 +365,7 @@ class BinanceUSClient:
             quantity=quantity, stop_price=stop_price, client_order_id=coid,
             submitted_at=datetime.now(timezone.utc),
         )
-        if self._settings.dry_run or self._settings.paper_trading:
+        if self._simulation:
             log.warning(
                 "[DRY-RUN] STOP_LOSS %s qty=%s stop=%s coid=%s",
                 symbol, quantity, stop_price, coid,
@@ -401,7 +407,7 @@ class BinanceUSClient:
         empty list in paper/dry_run — there is no live account to query — which
         makes the caller fall back to a modeled fee rather than fabricate one.
         """
-        if self._settings.dry_run or self._settings.paper_trading:
+        if self._simulation:
             return []
         raw = await self._api_call(
             "my_trades", self._spot.my_trades, symbol=symbol, orderId=order_id,
@@ -425,7 +431,7 @@ class BinanceUSClient:
                 continue
             symbol = f"{asset}{quote}"
             coid = _new_client_order_id("liq")
-            if self._settings.dry_run:
+            if self._simulation:
                 log.warning(
                     "[DRY-RUN] liquidate %s qty=%s coid=%s",
                     symbol, free, coid,

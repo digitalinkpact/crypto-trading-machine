@@ -7,6 +7,7 @@ import json
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 async def test_daily_buy_flows_through_risk_to_paper_fill_and_linked_audit(monkeypatch, tmp_path):
@@ -130,3 +131,64 @@ async def test_daily_buy_flows_through_risk_to_paper_fill_and_linked_audit(monke
     detail = json.loads(after["filters"])
     assert detail["runner_pass"] and detail["submitted"] and detail["filled"]
     assert detail["client_order_id"].startswith("paper-")
+
+
+@pytest.mark.parametrize("price,reason,remaining", [
+    ("100", "stop_loss", False),
+    ("160", "take_profit_1", True),
+])
+async def test_daily_buy_then_independent_paper_exit(monkeypatch, tmp_path, price, reason, remaining):
+    from unittest.mock import AsyncMock
+    import app.trading.autopilot as module
+    from app.trading.autopilot import Autopilot
+
+    await test_daily_buy_flows_through_risk_to_paper_fill_and_linked_audit(monkeypatch, tmp_path)
+    monkeypatch.setattr(module.paper_exchange._live, "ticker_price", AsyncMock(return_value=Decimal(price)))
+    autopilot = Autopilot()
+    outcome = await autopilot._run_risk_gates()
+    assert outcome["success"]
+    assert module.storage.closed_trades()[0]["exit_reason"] == reason
+    assert bool(module.storage.all_positions()) is remaining
+    orders = module.storage.recent_orders()
+    assert {order["side"] for order in orders} == {"BUY", "SELL"}
+    assert all(order["mode"] == "paper" and order["client_order_id"].startswith("paper-") for order in orders)
+
+
+async def test_paper_fill_rolls_back_all_writes_on_order_failure(monkeypatch, tmp_path):
+    import sqlite3
+    import app.trading.autopilot as module
+    from app.exchange import OrderSide
+
+    await test_daily_buy_flows_through_risk_to_paper_fill_and_linked_audit(monkeypatch, tmp_path)
+    balances = module.storage.paper_balances()
+    positions = module.storage.all_positions()
+    with module.storage._conn() as connection:
+        connection.execute("CREATE TRIGGER reject_order BEFORE INSERT ON orders BEGIN SELECT RAISE(ABORT, 'write failed'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="write failed"):
+        await module.paper_exchange.place_order(symbol="ALT0USDT", side=OrderSide.BUY, quantity=Decimal("1"))
+    assert module.storage.paper_balances() == balances
+    assert module.storage.all_positions() == positions
+
+
+async def test_paper_buy_rejects_insufficient_balance_without_writes(monkeypatch, tmp_path):
+    import app.trading.autopilot as module
+    from app.exchange import OrderSide
+
+    await test_daily_buy_flows_through_risk_to_paper_fill_and_linked_audit(monkeypatch, tmp_path)
+    balances = module.storage.paper_balances()
+    with pytest.raises(RuntimeError, match="insufficient"):
+        await module.paper_exchange.place_order(symbol="ALT0USDT", side=OrderSide.BUY, quantity=Decimal("10000"))
+    assert module.storage.paper_balances() == balances
+
+
+async def test_repeated_simulation_client_id_does_not_double_fill(monkeypatch, tmp_path):
+    import app.trading.autopilot as module
+    from app.exchange import OrderSide
+
+    await test_daily_buy_flows_through_risk_to_paper_fill_and_linked_audit(monkeypatch, tmp_path)
+    arguments = dict(symbol="ALT0USDT", side=OrderSide.BUY, quantity=Decimal("1"), client_order_id="paper-idempotent")
+    await module.paper_exchange.place_order(**arguments)
+    balances = module.storage.paper_balances()
+    await module.paper_exchange.place_order(**arguments)
+    assert module.storage.paper_balances() == balances
+    assert len([order for order in module.storage.recent_orders() if order["client_order_id"] == "paper-idempotent"]) == 1

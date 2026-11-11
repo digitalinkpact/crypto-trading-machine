@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 
@@ -59,6 +60,7 @@ async def _log_price_diagnostic(settings) -> None:
 async def lifespan(app: FastAPI):
     configure_logging()
     settings = get_settings()
+    storage.kv_set("process_started_at", datetime.now(timezone.utc).isoformat())
     # Fail loud if the LLM is wired into the trading loop but disabled (e.g. the
     # configured provider has no API key/token on this host). Without this guard
     # a missing GITHUB_TOKEN/DEEPSEEK_API_KEY silently turns every LLM vote into
@@ -92,7 +94,8 @@ async def lifespan(app: FastAPI):
         log.critical("startup safety verification failed: %s", exc)
     # Seed paper account on first run.
     try:
-        paper_exchange.ensure_seeded()
+        if settings.paper_trading:
+            paper_exchange.ensure_seeded()
     except Exception as exc:  # noqa: BLE001
         log.exception("paper account seed failed: %s", exc)
 

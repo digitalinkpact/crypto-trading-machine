@@ -10,6 +10,7 @@ import os
 import pickle
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -17,12 +18,37 @@ from typing import Any, Iterable, Optional
 
 from app.config import get_settings
 from app.trading.win_rate import is_bookkeeping_exit
+from app.trading.execution_context import current_execution
 from app.logging_setup import get_logger
 
 log = get_logger(__name__)
 
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS tick_runs (
+    tick_id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    mode TEXT NOT NULL,
+    source TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_tick_runs_started ON tick_runs(started_at);
+
+CREATE TABLE IF NOT EXISTS order_intents (
+    client_order_id TEXT PRIMARY KEY,
+    tick_id TEXT,
+    mode TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    qty TEXT NOT NULL,
+    status TEXT NOT NULL,
+    recorded INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    response TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -304,18 +330,47 @@ class Storage:
     """Thread-safe SQLite helper. Synchronous; call from async via to_thread."""
 
     def __init__(self, path: Optional[Path] = None) -> None:
-        self._path = path or (get_settings().data_cache_dir / "trading.db")
+        settings = get_settings()
+        directory = settings.data_cache_dir
+        if settings.paper_trading:
+            directory = directory / "simulation"
+        self._path = path or (directory / "trading.db")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._transaction = threading.local()
         self._wal_initialized = False
         self._init()
 
-    def _conn(self) -> sqlite3.Connection:
+    @contextmanager
+    def _conn(self):
+        shared = getattr(self._transaction, "connection", None)
+        if shared is not None:
+            yield shared
+            return
+        with self._new_connection() as connection:
+            yield connection
+
+    @contextmanager
+    def transaction(self):
+        """Group synchronous storage operations into one atomic transaction."""
+        with self._lock:
+            if getattr(self._transaction, "connection", None) is not None:
+                yield
+                return
+            with self._conn() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._transaction.connection = connection
+                try:
+                    yield
+                finally:
+                    self._transaction.connection = None
+
+    def _new_connection(self) -> sqlite3.Connection:
         c = sqlite3.connect(
             self._path,
-            isolation_level=None,
+            isolation_level="",
             factory=_ClosingConnection,
-        )  # autocommit
+        )
         c.row_factory = sqlite3.Row
         if not self._wal_initialized:
             c.execute("PRAGMA journal_mode=WAL;")
@@ -325,7 +380,10 @@ class Storage:
 
     def _init(self) -> None:
         with self._lock, self._conn() as c:
+            if c.execute("PRAGMA user_version").fetchone()[0] > 1:
+                raise RuntimeError("Database schema is newer than this application; rollback requires review")
             c.executescript(_SCHEMA)
+            c.execute("BEGIN IMMEDIATE")
             # Historical schema keyed positions by symbol only, which let paper
             # and live rows collide and made live sell eligibility depend on
             # whichever mode wrote last. Migrate in place to mode-scoped rows.
@@ -389,6 +447,77 @@ class Storage:
             ):
                 if col not in pos_cols:
                     c.execute(f"ALTER TABLE positions ADD COLUMN {col} {decl}")
+            tick_cols = {row["name"] for row in c.execute("PRAGMA table_info(tick_audit)")}
+            if "tick_id" not in tick_cols:
+                c.execute("ALTER TABLE tick_audit ADD COLUMN tick_id TEXT")
+            order_cols = {row["name"] for row in c.execute("PRAGMA table_info(orders)")}
+            for name, declaration in (("status", "TEXT"), ("filled_qty", "REAL"), ("tick_id", "TEXT")):
+                if name not in order_cols:
+                    c.execute(f"ALTER TABLE orders ADD COLUMN {name} {declaration}")
+            c.execute("PRAGMA user_version=1")
+
+    def record_tick_run(self, result: dict) -> None:
+        with self._lock, self._conn() as connection:
+            connection.execute(
+                "INSERT INTO tick_runs(tick_id,started_at,completed_at,mode,source,status,payload) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(tick_id) DO UPDATE SET "
+                "completed_at=excluded.completed_at,status=excluded.status,payload=excluded.payload",
+                (result["tick_id"], result["started_at"], result.get("completed_at"),
+                 result["mode"], result["source"], result["status"], json.dumps(result, default=str)),
+            )
+
+    def recent_tick_runs(self, limit: int = 20, mode: Optional[str] = None) -> list[dict]:
+        with self._lock, self._conn() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM tick_runs WHERE (? IS NULL OR mode=?) ORDER BY started_at DESC LIMIT ?",
+                (mode, mode, limit),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def recover_interrupted_ticks(self) -> None:
+        with self._lock, self._conn() as connection:
+            rows = connection.execute("SELECT payload FROM tick_runs WHERE status='RUNNING'").fetchall()
+        for row in rows:
+            result = json.loads(row["payload"])
+            if result.get("pid") and _owner_is_alive(str(result["pid"])):
+                continue
+            result.update(status="FAILED", completed_at=_now(), reasons=["process_interrupted"])
+            result.setdefault("errors", []).append({"stage": "restart", "type": "InterruptedRun"})
+            self.record_tick_run(result)
+
+    def migrate_risk_state(self, mode: str) -> None:
+        with self.transaction(), self._conn() as connection:
+            positions = connection.execute("SELECT symbol FROM positions WHERE mode=?", (mode,)).fetchall()
+            for position in positions:
+                for prefix in ("hwm", "lwm", "tp1", "tp2"):
+                    connection.execute(
+                        "INSERT OR IGNORE INTO kv(key,value) SELECT ?,value FROM kv WHERE key=?",
+                        (f"{prefix}:{mode}:{position['symbol']}", f"{prefix}:{position['symbol']}"),
+                    )
+
+    def record_order_intent(self, payload: dict) -> None:
+        with self._lock, self._conn() as connection:
+            connection.execute(
+                "INSERT INTO order_intents(client_order_id,tick_id,mode,symbol,side,qty,status,updated_at,response) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (payload["client_order_id"], payload.get("tick_id"), payload["mode"], payload["symbol"],
+                 payload["side"], str(payload["qty"]), "SUBMITTING", _now(), "{}"),
+            )
+
+    def update_order_intent(self, client_order_id: str, status: str, response: dict, *, recorded: bool = False) -> None:
+        with self._lock, self._conn() as connection:
+            connection.execute(
+                "UPDATE order_intents SET status=?,response=?,recorded=MAX(recorded,?),updated_at=? WHERE client_order_id=?",
+                (status, json.dumps(response, default=str), int(recorded), _now(), client_order_id),
+            )
+
+    def pending_order_intents(self, mode: str) -> list[dict]:
+        with self._lock, self._conn() as connection:
+            rows = connection.execute(
+                "SELECT * FROM order_intents WHERE mode=? AND (status IN ('SUBMITTING','UNKNOWN','NEW','PARTIALLY_FILLED') "
+                "OR (status='FILLED' AND recorded=0))", (mode,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     # ── KV (used for autopilot state) ────────────────────────────────
     def kv_set(self, key: str, value: Any) -> None:
@@ -475,7 +604,7 @@ class Storage:
                         data = json.loads(row["value"])
                         existing_owner = data.get("owner")
                         lease_expires = float(data.get("expires", 0))
-                        if lease_expires > now and existing_owner != owner:
+                        if lease_expires > now:
                             if _owner_is_alive(existing_owner):
                                 c.execute("COMMIT")
                                 return False
@@ -499,6 +628,7 @@ class Storage:
         """Release a lock previously acquired by ``owner`` (no-op otherwise)."""
         key = f"lock:{name}"
         with self._lock, self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
             row = c.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
             if not row:
                 return
@@ -511,6 +641,42 @@ class Storage:
             c.execute("DELETE FROM kv WHERE key=?", (key,))
 
     # ── Orders ───────────────────────────────────────────────────────
+    def order_by_client_id(self, mode: str, client_order_id: str) -> Optional[dict]:
+        with self._lock, self._conn() as connection:
+            row = connection.execute(
+                "SELECT * FROM orders WHERE mode=? AND client_order_id=? ORDER BY id LIMIT 1",
+                (mode, client_order_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def record_live_fill(
+        self, *, symbol, side, qty, position_qty, price, client_order_id, agents,
+        entry_confidence=None, entry_strategy=None, entry_btc_regime=None,
+        entry_fee_usdt=None, exit_fee_usdt=None, fee=0, mfe_pct=None, mae_pct=None,
+        status="FILLED", response=None,
+    ) -> bool:
+        from app.trading.risk import infer_exit_reason
+
+        with self.transaction(), self._conn() as connection:
+            existing = connection.execute(
+                "SELECT id FROM orders WHERE mode='live' AND client_order_id=?", (client_order_id,),
+            ).fetchone()
+            if existing:
+                return False
+            self.record_order(mode="live", symbol=symbol, side=side, qty=qty, price=price,
+                              fee=fee, client_order_id=client_order_id, agents=agents, status=status)
+            if side == "BUY":
+                self.open_position(symbol=symbol, mode="live", qty=position_qty, entry_price=price,
+                                   agents=agents, entry_confidence=entry_confidence,
+                                   entry_strategy=entry_strategy, entry_btc_regime=entry_btc_regime,
+                                   entry_fee_usdt=entry_fee_usdt)
+            else:
+                self.reduce_position(symbol=symbol, mode="live", qty=qty, exit_price=price,
+                                     exit_reason=infer_exit_reason(agents), mfe_pct=mfe_pct,
+                                     mae_pct=mae_pct, actual_exit_fee_usdt=exit_fee_usdt)
+            self.update_order_intent(client_order_id, status, response or {}, recorded=True)
+        return True
+
     def record_order(
         self,
         *,
@@ -522,21 +688,32 @@ class Storage:
         fee: Decimal | float = 0,
         client_order_id: Optional[str] = None,
         agents: Optional[Iterable[str]] = None,
+        status: str = "FILLED",
     ) -> int:
         agents_json = json.dumps(list(agents or []))
         with self._lock, self._conn() as c:
             cur = c.execute(
-                "INSERT INTO orders(ts,mode,symbol,side,qty,price,fee,client_order_id,agents) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO orders(ts,mode,symbol,side,qty,price,fee,client_order_id,agents,status,filled_qty,tick_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (_now(), mode, symbol, side, _f(qty), _f(price), _f(fee),
-                 client_order_id, agents_json),
+                 client_order_id, agents_json, status, _f(qty), (current_execution.get() or {}).get("tick_id")),
             )
             return int(cur.lastrowid or 0)
 
-    def recent_orders(self, limit: int = 100) -> list[dict]:
+    def order_summary(self, mode: str) -> dict:
+        with self._lock, self._conn() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS total, SUM(CASE WHEN filled_qty>0 THEN 1 ELSE 0 END) AS filled, "
+                "SUM(CASE WHEN status IS NULL THEN 1 ELSE 0 END) AS legacy_unknown FROM orders WHERE mode=?",
+                (mode,),
+            ).fetchone()
+        return {"recorded": row["total"], "filled": row["filled"] or 0,
+                "legacy_unknown": row["legacy_unknown"] or 0, "pending": len(self.pending_order_intents(mode))}
+
+    def recent_orders(self, limit: int = 100, mode: Optional[str] = None) -> list[dict]:
         with self._lock, self._conn() as c:
             rows = c.execute(
-                "SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,)
+                "SELECT * FROM orders WHERE (? IS NULL OR mode=?) ORDER BY id DESC LIMIT ?", (mode, mode, limit)
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -581,11 +758,12 @@ class Storage:
                 ),
             )
 
-    def get_position(self, symbol: str) -> Optional[dict]:
+    def get_position(self, symbol: str, mode: Optional[str] = None) -> Optional[dict]:
         with self._lock, self._conn() as c:
             row = c.execute(
-                "SELECT * FROM positions WHERE symbol=? ORDER BY CASE mode WHEN 'live' THEN 0 ELSE 1 END LIMIT 1",
-                (symbol,),
+                "SELECT * FROM positions WHERE symbol=? AND (? IS NULL OR mode=?) "
+                "ORDER BY CASE mode WHEN 'live' THEN 0 ELSE 1 END LIMIT 1",
+                (symbol, mode, mode),
             ).fetchone()
         return dict(row) if row else None
 
@@ -620,7 +798,7 @@ class Storage:
         `app.exchange.client._extract_commission`), is used in place of the
         modeled fee estimate — never fabricated when unavailable.
         """
-        with self._lock, self._conn() as c:
+        with self.transaction(), self._conn() as c:
             if mode is None:
                 row = c.execute(
                     "SELECT * FROM positions WHERE symbol=? "
@@ -719,7 +897,7 @@ class Storage:
         actual_exit_fee_usdt: Optional[float] = None,
     ) -> Optional[dict]:
         """Close part or all of an open position and persist a closed-trade row."""
-        with self._lock, self._conn() as c:
+        with self.transaction(), self._conn() as c:
             row = c.execute(
                 "SELECT * FROM positions WHERE symbol=? AND mode=?",
                 (symbol, mode),
@@ -831,7 +1009,20 @@ class Storage:
         }
 
     # ── Agent stats ──────────────────────────────────────────────────
-    def agent_stats(self) -> list[dict]:
+    def agent_stats(self, mode: Optional[str] = None) -> list[dict]:
+        if mode is not None:
+            with self._lock, self._conn() as connection:
+                rows = connection.execute(
+                    "SELECT agent.value AS agent, SUM(cp.pnl>0) AS wins, SUM(cp.pnl<=0) AS losses, SUM(cp.pnl) AS total_pnl "
+                    "FROM (SELECT ct.symbol,ct.entry_ts,SUM(ct.pnl) AS pnl,MAX(ct.agents) AS agents FROM closed_trades ct "
+                    "WHERE ct.mode=? AND NOT (COALESCE(ct.exit_reason,'')='reconcile_stale' "
+                    "OR COALESCE(ct.exit_reason,'') LIKE '%\\_stale\\_dust' ESCAPE '\\') "
+                    "AND NOT EXISTS (SELECT 1 FROM positions p WHERE p.symbol=ct.symbol AND p.mode=ct.mode AND p.entry_ts=ct.entry_ts) "
+                    "GROUP BY ct.symbol,ct.entry_ts) cp, json_each(cp.agents) agent GROUP BY agent.value ORDER BY total_pnl DESC",
+                    (mode,),
+                ).fetchall()
+            return [{**dict(row), "total_trades": row["wins"] + row["losses"],
+                     "win_rate": row["wins"] / (row["wins"] + row["losses"])} for row in rows]
         with self._lock, self._conn() as c:
             rows = c.execute(
                 "SELECT * FROM agent_stats ORDER BY total_pnl DESC"
@@ -950,25 +1141,12 @@ class Storage:
         amt = _f(amount)
         if amt <= 0:
             return 0.0
-        with self._lock, self._conn() as c:
-            c.execute("BEGIN IMMEDIATE")
-            try:
-                row = c.execute(
-                    "SELECT qty FROM paper_balances WHERE asset=?", (asset,)
-                ).fetchone()
-                have = float(row["qty"]) if row else 0.0
-                debited = have if amt > have else amt
-                if debited > 0:
-                    c.execute(
-                        "UPDATE paper_balances SET qty=qty-? WHERE asset=?",
-                        (debited, asset),
-                    )
-                c.execute("COMMIT")
-            except Exception as e:
-                logger = log
-                logger.exception(f"Trade execution failure: {e}")
-                c.execute("ROLLBACK")
-                raise
+        with self.transaction(), self._conn() as c:
+            row = c.execute("SELECT qty FROM paper_balances WHERE asset=?", (asset,)).fetchone()
+            have = float(row["qty"]) if row else 0.0
+            debited = min(have, amt)
+            if debited > 0:
+                c.execute("UPDATE paper_balances SET qty=qty-? WHERE asset=?", (debited, asset))
         return debited
 
     # ── Trade audit trail ─────────────────────────────────────────────
@@ -1015,11 +1193,11 @@ class Storage:
             )
             return int(cur.lastrowid or 0)
 
-    def recent_trade_audit(self, limit: int = 100) -> list[dict]:
+    def recent_trade_audit(self, limit: int = 100, mode: Optional[str] = None) -> list[dict]:
         with self._lock, self._conn() as c:
             rows = c.execute(
-                "SELECT * FROM trade_audit ORDER BY id DESC LIMIT ?",
-                (limit,),
+                "SELECT * FROM trade_audit WHERE (? IS NULL OR mode=?) ORDER BY id DESC LIMIT ?",
+                (mode, mode, limit),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1039,8 +1217,8 @@ class Storage:
         with self._lock, self._conn() as c:
             cur = c.execute(
                 "INSERT INTO tick_audit("
-                "ts,mode,symbol,timeframe,action,score,executed,reason,indicators,filters"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "ts,mode,symbol,timeframe,action,score,executed,reason,indicators,filters,tick_id"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     _now(),
                     mode,
@@ -1052,6 +1230,7 @@ class Storage:
                     reason,
                     json.dumps(indicators or {}, default=str),
                     json.dumps(filters or {}, default=str),
+                    (current_execution.get() or {}).get("tick_id"),
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -1126,25 +1305,26 @@ class Storage:
                 (_now(), mode, total_usdt, cash_usdt, invested_usdt),
             )
 
-    def equity_curve(self, limit: int = 90) -> list[dict]:
+    def equity_curve(self, limit: int = 90, mode: Optional[str] = None) -> list[dict]:
         """Most recent N equity snapshots (oldest → newest)."""
         with self._lock, self._conn() as c:
             rows = c.execute(
                 "SELECT ts, total_usdt, cash_usdt, invested_usdt, mode "
-                "FROM equity_snapshots ORDER BY id DESC LIMIT ?",
-                (limit,),
+                "FROM equity_snapshots WHERE (? IS NULL OR mode=?) ORDER BY id DESC LIMIT ?",
+                (mode, mode, limit),
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
 
     # ── Risk events (stop-loss / take-profit / trailing / max-hold exits) ───
-    def recent_risk_events(self, limit: int = 25) -> list[dict]:
+    def recent_risk_events(self, limit: int = 25, mode: Optional[str] = None) -> list[dict]:
         """Closed trades where any contributing agent label starts with 'risk:'."""
         with self._lock, self._conn() as c:
             rows = c.execute(
                 "SELECT * FROM closed_trades "
-                "WHERE agents LIKE '%\"risk:%' "
+                "WHERE (? IS NULL OR mode=?) AND (agents LIKE '%\"risk:%' OR exit_reason IN "
+                "('stop_loss','take_profit_1','take_profit_2','trailing_stop','stale_dead_money','max_hold','exchange_stop')) "
                 "ORDER BY id DESC LIMIT ?",
-                (limit,),
+                (mode, mode, limit),
             ).fetchall()
         out: list[dict] = []
         for r in rows:
@@ -1157,7 +1337,7 @@ class Storage:
                 (a.split(":", 1)[1] for a in agents if a.startswith("risk:")),
                 "unknown",
             )
-            d["reason"] = reason
+            d["reason"] = d.get("exit_reason") or reason
             out.append(d)
         return out
 

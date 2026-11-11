@@ -14,6 +14,15 @@ log = get_logger(__name__)
 async def verify_before_trading() -> None:
     """Verify local/exchange state and halt new entries on any discrepancy."""
     mode = "paper" if get_settings().paper_trading else "live"
+    storage.migrate_risk_state(mode)
+    storage.recover_interrupted_ticks()
+    pending = storage.pending_order_intents(mode)
+    if pending:
+        watchdog.trigger_emergency_halt(
+            "startup found pending or unresolved order intents; verify exchange client order IDs",
+            level="order_outcome_unknown",
+        )
+        return
     prior_state = storage.kv_get("autopilot_state") or {}
     if prior_state.get("running") and not prior_state.get("starting_balance_usdt"):
         storage.kv_set(
