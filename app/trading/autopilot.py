@@ -350,6 +350,7 @@ class Autopilot:
             log.info("autopilot tick skipped — another process holds the tick lock")
             return
         async with self._lock:
+            self.state.last_error = ""
             self.state.last_tick_at = datetime.now(timezone.utc)
             try:
                 # -1. Ensure paper mode has seeded balance (cold-start after restart).

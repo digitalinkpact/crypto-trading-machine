@@ -183,6 +183,7 @@ async def test_tick_does_not_run_risk_gates_inline(monkeypatch):
     """Protective exits are owned by the independent risk loop, not tick()."""
     ap = Autopilot()
     ap.state.running = True
+    ap.state.last_error = "stale prior-tick error"
 
     class _S:
         paper_trading = True
@@ -201,12 +202,18 @@ async def test_tick_does_not_run_risk_gates_inline(monkeypatch):
     monkeypatch.setattr(autopilot_module, "get_settings", lambda: _S())
     monkeypatch.setattr(autopilot_module.storage, "try_acquire_lock", lambda *a, **k: True, raising=True)
     monkeypatch.setattr(autopilot_module.storage, "release_lock", lambda *a, **k: None, raising=True)
+    monkeypatch.setattr(autopilot_module.storage, "kv_set", lambda *a, **k: None, raising=True)
     monkeypatch.setattr(autopilot_module.paper_exchange, "ensure_seeded", lambda: None, raising=True)
     monkeypatch.setattr(autopilot_module.filters, "load", lambda: asyncio.sleep(0), raising=True)
     monkeypatch.setattr(Autopilot, "_run_risk_gates", _boom, raising=True)
     monkeypatch.setattr(Autopilot, "_check_circuit_breaker", _fake_breaker, raising=True)
     monkeypatch.setattr(autopilot_module, "run_all_agents", lambda use_llm: asyncio.sleep(0, result={}), raising=True)
     monkeypatch.setattr(Autopilot, "_execute", _fake_execute, raising=True)
+    monkeypatch.setattr(Autopilot, "_save", lambda self: None, raising=True)
+
+    await ap.tick()
+
+    assert ap.state.last_error == ""
 
 
 async def test_run_risk_gates_executes_stop_loss_even_when_entry_gates_blocked(monkeypatch):
