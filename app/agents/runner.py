@@ -222,6 +222,9 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
         market_enabled = getattr(settings, "market_regime_gate_enabled", True)
         breadth_expected = sum(symbol != "BTCUSDT" for symbol in symbols)
         breadth_fraction = breadth_above / breadth_usable if breadth_usable else 0.0
+        qualified_buy_candidates = sum(
+            signal.action.value == "BUY" for signal in raw_signals
+        )
         breadth_allowed = not getattr(settings, "breadth_gate_enabled", False) or (
             breadth_usable == breadth_expected
             and breadth_usable >= getattr(settings, "breadth_min_symbols", 15)
@@ -235,6 +238,7 @@ async def run_all_agents(use_llm: bool = False) -> dict[str, Signal]:
             "reasons": dict(scan_reasons),
             "highest_score": highest_score,
             "score_threshold": score_threshold,
+            "qualified_buy_candidates": qualified_buy_candidates,
             "candle_close_at": btc_1d.attrs.get("candle_close_at"),
             "usable_symbols": usable_symbols,
             "predicate_pass_counts": dict(scan_checks),
