@@ -1201,6 +1201,14 @@ async def test_buy_trace_persists_market_gate_and_sizing(monkeypatch):
         },
         raising=True,
     )
+    monkeypatch.setattr(
+        autopilot_module.RiskManager,
+        "evaluate_entry",
+        lambda *_a, **_k: __import__("types").SimpleNamespace(
+            allow=True, reason="ok", notional_usdt=Decimal("3")
+        ),
+        raising=True,
+    )
 
     class _BuySig:
         action = autopilot_module.SignalAction.BUY
