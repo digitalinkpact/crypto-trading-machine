@@ -3,13 +3,19 @@
 Usage:
     python scripts/test_live_order.py --symbol BTCUSDT --quote-usdt 10
 
-Requires LIVE mode (not paper) and DRY_RUN=false for real execution.
+Requires LIVE mode (not paper), DRY_RUN=false and LIVE_BUYS_ENABLED=true for
+real execution. The SELL only unwinds the quantity this script BOUGHT (net of
+any commission paid in the base asset) — pre-existing holdings are untouched.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from decimal import Decimal
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import get_settings
 from app.exchange import BinanceUSClient, OrderSide, OrderType
@@ -31,6 +37,8 @@ async def main() -> None:
 
     if s.paper_trading or s.dry_run:
         raise RuntimeError("This script requires PAPER_TRADING=false and DRY_RUN=false")
+    if not s.live_buys_enabled:
+        raise RuntimeError("LIVE_BUYS_ENABLED=false — the exchange wrapper will reject the BUY")
 
     client = BinanceUSClient()
 
@@ -64,14 +72,19 @@ async def main() -> None:
     if buy.status.name not in ("FILLED", "PARTIALLY_FILLED"):
         raise RuntimeError(f"BUY failed: {buy.status}")
 
-    post_buy = await client.account()
     base = args.symbol.removesuffix("USDT")
+    bought = buy.filled_quantity
+    if buy.commission is not None and buy.commission_asset == base:
+        bought -= buy.commission
+
+    post_buy = await client.account()
     base_free = next((Decimal(str(b["free"])) for b in post_buy.get("balances", []) if b["asset"] == base), Decimal("0"))
-    print(f"Post-BUY base balance {base}: {base_free}")
-    if base_free <= 0:
+    print(f"Post-BUY {base}: bought(net)={bought} free={base_free}")
+    if base_free <= 0 or bought <= 0:
         raise RuntimeError("Position verification failed: no base balance after BUY")
 
-    sell_qty = filters.round_qty(args.symbol, base_free)
+    # Never sell more than this test bought — protects pre-existing holdings.
+    sell_qty = filters.round_qty(args.symbol, min(bought, base_free))
     if sell_qty <= 0:
         raise RuntimeError("Rounded SELL qty is zero")
     print(f"Placing SELL {args.symbol} qty={sell_qty}")

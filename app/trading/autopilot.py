@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import os
+import subprocess
 import time
 import uuid
 from collections import Counter
@@ -35,7 +36,6 @@ from app.exchange.ws_stream import live_prices
 from app.exchange.telemetry import exchange_telemetry
 from app.logging_setup import get_logger
 from app.regime import online_regime
-from app.revision import get_revision
 from app.signals import SignalAction
 from app.storage import storage
 from app.trading.audit import trade_audit_logger
@@ -169,7 +169,20 @@ def _jsonable(value):
 
 
 def _active_revision() -> str:
-    return get_revision()
+    configured = os.getenv("GIT_REVISION")
+    if configured:
+        return configured
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 class Autopilot:
@@ -750,6 +763,242 @@ class Autopilot:
         log.warning("drawdown recovery recorded; new entries remain subject to all other gates")
 
     # ── execution ──────────────────────────────────────────────────────
+    async def _execute_signal(self, symbol: str, sig, *, allow_buys: bool) -> tuple[bool, str]:
+        """Execute one aggregated signal through Validate -> Risk -> Execute -> Log."""
+        s = get_settings()
+        snap = await portfolio_snapshot(mode=self.state.mode)
+        balance_source = snap.get("free_balances") or snap.get("all_balances") or {}
+        balances: dict[str, Decimal] = {
+            asset: Decimal(str(qty)) for asset, qty in balance_source.items()
+        }
+        usdt_free = Decimal(str(snap["usdt_cash"]))
+        total_eq = Decimal(str(snap["total_usdt"]))
+        open_positions = [
+            p for p in storage.all_positions() if p["mode"] == self.state.mode
+        ]
+        position_exists = any(p["symbol"] == symbol for p in open_positions)
+
+        if sig.action == SignalAction.HOLD:
+            trade_audit_logger.log_event(
+                mode=self.state.mode,
+                symbol=symbol,
+                signal=sig.action.value,
+                confidence=float(sig.confidence),
+                position_exists=position_exists,
+                available_balance=usdt_free,
+                final_outcome="rejected: hold",
+                detail={"reason": "signal_hold"},
+            )
+            return False, "hold"
+
+        if sig.confidence < s.min_signal_confidence:
+            reason = "Confidence below threshold"
+            trade_audit_logger.log_event(
+                mode=self.state.mode,
+                symbol=symbol,
+                signal=sig.action.value,
+                confidence=float(sig.confidence),
+                position_exists=position_exists,
+                available_balance=usdt_free,
+                final_outcome=f"rejected: {reason}",
+                detail={"threshold": s.min_signal_confidence},
+            )
+            return False, reason
+
+        if sig.action == SignalAction.BUY and not allow_buys:
+            reason = "Max exposure exceeded"
+            trade_audit_logger.log_event(
+                mode=self.state.mode,
+                symbol=symbol,
+                signal=sig.action.value,
+                confidence=float(sig.confidence),
+                risk_passed=False,
+                position_exists=position_exists,
+                available_balance=usdt_free,
+                final_outcome=f"rejected: {reason}",
+            )
+            return False, reason
+
+        if sig.action == SignalAction.BUY and position_exists:
+            reason = "Position already exists"
+            trade_audit_logger.log_event(
+                mode=self.state.mode,
+                symbol=symbol,
+                signal=sig.action.value,
+                confidence=float(sig.confidence),
+                risk_passed=True,
+                position_exists=True,
+                available_balance=usdt_free,
+                final_outcome=f"rejected: {reason}",
+            )
+            return False, reason
+
+        if sig.action == SignalAction.SELL:
+            base = symbol.removesuffix("USDT")
+            free = balances.get(base, Decimal("0"))
+            tracked_qty = next(
+                (
+                    Decimal(str(p.get("qty") or 0))
+                    for p in open_positions
+                    if p["symbol"] == symbol and p["mode"] == self.state.mode
+                ),
+                Decimal("0"),
+            )
+            sell_qty = min(tracked_qty, free)
+            if tracked_qty <= 0:
+                reason = "SELL rejected: no tracked position"
+                trade_audit_logger.log_event(
+                    mode=self.state.mode, symbol=symbol, signal=sig.action.value,
+                    confidence=float(sig.confidence), risk_passed=False,
+                    position_exists=False, available_balance=free,
+                    execution_attempted=False, final_outcome=f"rejected: {reason}",
+                )
+                return False, reason
+            if sell_qty <= 0:
+                reason = "SELL rejected: no exchange balance"
+                trade_audit_logger.log_event(
+                    mode=self.state.mode,
+                    symbol=symbol,
+                    signal=sig.action.value,
+                    confidence=float(sig.confidence),
+                    risk_passed=True,
+                    position_exists=True,
+                    available_balance=free,
+                    execution_attempted=False,
+                    final_outcome=f"rejected: {reason}",
+                )
+                return False, reason
+            order = await self._submit(symbol, OrderSide.SELL, sell_qty, list(getattr(sig, "contributing_agents", []) or []))
+            ok = self._order_filled(order)
+            if getattr(sig, "decision_id", None) is not None:
+                storage.update_tick_execution(
+                    sig.decision_id,
+                    outcome="executed" if ok else "rejected: Binance rejected order",
+                    submitted=True,
+                    filled=ok,
+                    client_order_id=getattr(order, "client_order_id", None) if order else None,
+                    risk_passed=True,
+                )
+            trade_audit_logger.log_event(
+                mode=self.state.mode,
+                symbol=symbol,
+                signal=sig.action.value,
+                confidence=float(sig.confidence),
+                risk_passed=True,
+                position_exists=position_exists,
+                available_balance=sell_qty,
+                execution_attempted=True,
+                min_notional_passed=True,
+                binance_response=(getattr(order, "status", "NONE") if order else "NONE"),
+                final_outcome=("executed" if ok else "rejected: Binance rejected order"),
+                detail={"order_id": getattr(order, "exchange_order_id", None) if order else None},
+            )
+            return ok, ("executed" if ok else "Binance rejected order")
+
+        # BUY path
+        entry_block_reason = self._entry_block_reason()
+        if entry_block_reason:
+            trade_audit_logger.log_event(
+                mode=self.state.mode,
+                symbol=symbol,
+                signal=sig.action.value,
+                confidence=float(sig.confidence),
+                risk_passed=False,
+                position_exists=position_exists,
+                available_balance=usdt_free,
+                final_outcome=f"rejected: {entry_block_reason}",
+            )
+            return False, entry_block_reason
+
+        long_exposure_pct = float(
+            (total_eq - usdt_free) / total_eq if total_eq > 0 else Decimal("0")
+        )
+        open_count = len(open_positions)
+        ok_risk, why = risk.can_open_new_position(
+            open_positions=open_count,
+            long_exposure_pct=long_exposure_pct,
+        )
+        if not ok_risk:
+            trade_audit_logger.log_event(
+                mode=self.state.mode,
+                symbol=symbol,
+                signal=sig.action.value,
+                confidence=float(sig.confidence),
+                risk_passed=False,
+                position_exists=position_exists,
+                available_balance=usdt_free,
+                final_outcome="rejected: Max exposure exceeded",
+                detail={"reason": why},
+            )
+            return False, why
+
+        atr_pct = await self._atr_pct(symbol)
+        eff_pct = risk.volatility_scaled_pct(s.max_position_pct, atr_pct)
+        per_trade_usdt = usdt_free * Decimal(str(eff_pct))
+        if per_trade_usdt < 10:
+            trade_audit_logger.log_event(
+                mode=self.state.mode,
+                symbol=symbol,
+                signal=sig.action.value,
+                confidence=float(sig.confidence),
+                risk_passed=True,
+                position_exists=position_exists,
+                available_balance=usdt_free,
+                min_notional_passed=False,
+                final_outcome="rejected: No available funds",
+                detail={"required_min_usdt": 10, "computed_usdt": str(per_trade_usdt)},
+            )
+            return False, "No available funds"
+
+        plan = await self._buy_order_plan(symbol, per_trade_usdt)
+        meets_min = bool(plan["meets_min"])
+        if not meets_min:
+            trade_audit_logger.log_event(
+                mode=self.state.mode,
+                symbol=symbol,
+                signal=sig.action.value,
+                confidence=float(sig.confidence),
+                risk_passed=True,
+                position_exists=position_exists,
+                available_balance=usdt_free,
+                min_notional_passed=False,
+                final_outcome="rejected: Min notional check failed",
+                detail={"plan": _jsonable(plan)},
+            )
+            return False, "Min notional check failed"
+
+        order = await self._submit(
+            symbol,
+            OrderSide.BUY,
+            plan["rounded_qty"],
+            list(getattr(sig, "contributing_agents", []) or []),
+        )
+        ok = self._order_filled(order)
+        if getattr(sig, "decision_id", None) is not None:
+            storage.update_tick_execution(
+                sig.decision_id,
+                outcome="executed" if ok else "rejected: Binance rejected order",
+                submitted=True,
+                filled=ok,
+                client_order_id=getattr(order, "client_order_id", None) if order else None,
+                risk_passed=True,
+            )
+        trade_audit_logger.log_event(
+            mode=self.state.mode,
+            symbol=symbol,
+            signal=sig.action.value,
+            confidence=float(sig.confidence),
+            risk_passed=True,
+            position_exists=position_exists,
+            available_balance=usdt_free,
+            min_notional_passed=True,
+            execution_attempted=True,
+            binance_response=(getattr(order, "status", "NONE") if order else "NONE"),
+            final_outcome=("executed" if ok else "rejected: Binance rejected order"),
+            detail={"plan": _jsonable(plan), "order_id": getattr(order, "exchange_order_id", None) if order else None},
+        )
+        return ok, ("executed" if ok else "Binance rejected order")
+
     async def _execute(self, signals, *, allow_buys: bool = True) -> None:
         skip_counter: Counter[str] = Counter()
         tick_debug: dict[str, dict] = {}
@@ -1250,9 +1499,6 @@ class Autopilot:
                         log.info("skip %s BUY: %s", symbol, market_why)
                         continue
 
-                    # Alt-market breadth — ANDed with the BTC gate. BTC above its
-                    # EMAs while most alts are below theirs is the exact regime
-                    # that broke the pullback entry in Oct-2026.
                     breadth_ok, breadth_why = await self._breadth_gate()
                     _set_filter(symbol, "breadth", breadth_ok, breadth_why, sig)
                     if not breadth_ok:
@@ -1739,9 +1985,6 @@ class Autopilot:
         if trend_ok:
             return True, trend_why, None
         if not getattr(get_settings(), "profitstream_trend_soft_penalty", False):
-            # Hard veto: a close below the 200-EMA is never bought (falling-knife
-            # guard). The legacy -10 soft penalty was never re-checked against
-            # the score threshold, so it let those entries through.
             return False, trend_why, None
         agents = set(getattr(sig, "contributing_agents", ()) or ())
         if getattr(sig, "agent", "") != "profitstream_strategy" and "profitstream_strategy" not in agents:
@@ -1788,9 +2031,6 @@ class Autopilot:
             if symbol in held_symbols:
                 return
 
-            # The retry fires minutes after the original signal cleared its
-            # gates; re-validate the ones that can change in that time (or that
-            # protect the account) so a stale signal can't bypass them.
             halt = self._entry_block_reason()
             if halt:
                 log.info("[OB_RETRY] %s attempt=%d skipped: entry halted (%s)", symbol, attempt, halt)
@@ -1799,7 +2039,7 @@ class Autopilot:
                 return
             if self._on_cooldown(symbol, datetime.now(timezone.utc), timedelta(minutes=s.buy_cooldown_minutes)):
                 return
-            if (await self._check_circuit_breaker()):
+            if await self._check_circuit_breaker():
                 log.info("[OB_RETRY] %s attempt=%d skipped: drawdown breaker", symbol, attempt)
                 return
             market_ok, market_why = await self._market_gate()
@@ -1817,6 +2057,13 @@ class Autopilot:
                 if int(getattr(sig, "quality_score", 0) or 0) < required:
                     return
             trend_ok, trend_why = await self._trend_gate(symbol)
+            trend_ok, trend_why, _adjusted = self._profitstream_trend_adjustment(
+                sig, trend_ok, trend_why
+            )
+            if not trend_ok and self._trend_gate_bypass_allowed(
+                sig.confidence, None, aggressive_mode
+            ):
+                trend_ok = True
             if not trend_ok:
                 log.info("[OB_RETRY] %s attempt=%d skipped: %s", symbol, attempt, trend_why)
                 return
@@ -2118,12 +2365,10 @@ class Autopilot:
             return cache[0], cache[1]
         allowed, reason, score = False, "market_no_data", -1
         try:
-            from app.data import OHLCVRepository
+            from app.data.daily import load_daily_snapshot
             from app.regime.btc_regime import compute_btc_regime_score
-            from app.ta import add_indicators
 
-            df = await OHLCVRepository().get("BTCUSDT", Timeframe.D1, refresh=False)
-            df = add_indicators(df).dropna()
+            df = await load_daily_snapshot("BTCUSDT")
             if not df.empty and {"ema_50", "ema_200"} <= set(df.columns):
                 result = compute_btc_regime_score(df)
                 score = result.score
@@ -2144,62 +2389,54 @@ class Autopilot:
         return allowed, reason
 
     async def _breadth_gate(self) -> tuple[bool, str]:
-        """Alt-market breadth gate: fraction of the cached alt universe closing
-        above EMA{breadth_ema_span} must be >= breadth_min_fraction.
-
-        Mirrors scripts/strategy_lab._breadth_above_ema (the validated backtest
-        implementation). Reads only on-disk OHLCV pickles — no exchange calls.
-        One reading per tick is cached for 5 minutes. FAIL-CLOSED: if breadth
-        cannot be computed from enough symbols, new entries are blocked.
-        """
+        """Block new longs when too few tradable alts are above their EMA."""
         s = get_settings()
         if not getattr(s, "breadth_gate_enabled", False):
             return True, "breadth_gate_disabled"
+        now = asyncio.get_running_loop().time()
         cache = getattr(self, "_breadth_cache", None)
-        now = asyncio.get_event_loop().time()
         if cache is not None and (now - cache[2]) < 300.0:
             return cache[0], cache[1]
+
         allowed, reason = False, "breadth_no_data"
         try:
-            from pathlib import Path
-            from app.data import OHLCVRepository
-            from app.ta import add_indicators
+            from app.data import load_daily_snapshot
+            from app.exchange.symbol_source import get_symbols
 
-            span = int(s.breadth_ema_span)
-            col = f"ema_{span}"
-            cache_dir = Path(s.data_cache_dir)
-            syms = sorted(
-                p.stem.removesuffix("_1d")
-                for p in cache_dir.glob("*_1d.pkl")
-                if not p.stem.startswith("BTCUSDT")
-            )
-            above = total = 0
-            repo = OHLCVRepository()
-            for sym in syms:
-                try:
-                    df = await repo.get(sym, Timeframe.D1, refresh=False)
-                    df = add_indicators(df).dropna()
-                    if df.empty or col not in df.columns:
-                        continue
-                    last = df.iloc[-1]
-                    total += 1
-                    if float(last["close"]) > float(last[col]):
-                        above += 1
-                except Exception:  # noqa: BLE001
-                    continue
-            if total >= int(s.breadth_min_symbols):
-                frac = above / total
-                allowed = frac >= float(s.breadth_min_fraction)
-                reason = (
-                    f"breadth {above}/{total}={frac:.0%} above EMA{span} "
-                    f"({'>=' if allowed else '<'} {s.breadth_min_fraction:.0%})"
-                )
+            symbols = sorted({str(symbol).upper() for symbol in await get_symbols()
+                              if str(symbol).upper().endswith("USDT")
+                              and str(symbol).upper() != "BTCUSDT"})
+            total = len(symbols)
+            minimum = int(s.breadth_min_symbols)
+            if total < minimum:
+                reason = f"breadth_insufficient_symbols:{total}<{minimum}"
             else:
-                reason = f"breadth_insufficient_symbols:{total}<{s.breadth_min_symbols}"
-                log.warning("[BREADTH] %s — blocking new entries (fail-closed)", reason)
+                column = f"ema_{int(s.breadth_ema_span)}"
+                above = observed = 0
+                for symbol in symbols:
+                    try:
+                        frame = await load_daily_snapshot(symbol)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if frame.empty or column not in frame.columns:
+                        continue
+                    observed += 1
+                    if float(frame.iloc[-1]["close"]) > float(frame.iloc[-1][column]):
+                        above += 1
+                if observed != total:
+                    reason = f"breadth_incomplete_coverage:{observed}/{total}"
+                elif observed < minimum:
+                    reason = f"breadth_insufficient_symbols:{observed}<{minimum}"
+                else:
+                    fraction = above / observed
+                    allowed = fraction >= float(s.breadth_min_fraction)
+                    reason = (
+                        f"breadth {above}/{observed}={fraction:.0%} above EMA{int(s.breadth_ema_span)} "
+                        f"({'≥' if allowed else '<'} {float(s.breadth_min_fraction):.0%})"
+                    )
         except Exception as exc:  # noqa: BLE001
-            log.warning("[BREADTH] gate failed (%s) — blocking new entries (fail-closed)", exc)
             reason = f"breadth_unavailable:{exc}"
+
         self._breadth_cache = (allowed, reason, now)
         return allowed, reason
 
@@ -2237,7 +2474,17 @@ class Autopilot:
             entry_strategy=(str(getattr(sig, "entry_strategy", "") or "") or None),
             entry_btc_regime=getattr(sig, "entry_btc_regime", None),
         )
-        return self._order_filled(order)
+        filled = self._order_filled(order)
+        if getattr(sig, "decision_id", None) is not None:
+            storage.update_tick_execution(
+                sig.decision_id,
+                outcome="executed" if filled else "rejected: exchange did not fill BUY",
+                submitted=order is not None,
+                filled=filled,
+                client_order_id=getattr(order, "client_order_id", None) if order else None,
+                risk_passed=True,
+            )
+        return filled
 
     async def _buy_order_plan(self, symbol: str, per_trade_usdt: Decimal) -> dict[str, Decimal | bool | None]:
         price = await self._price(symbol)
@@ -2272,7 +2519,17 @@ class Autopilot:
         if sig_exit_reason:
             agents = [*agents, f"exit:{sig_exit_reason}"]
         order = await self._submit(symbol, OrderSide.SELL, qty, agents)
-        return self._order_filled(order)
+        filled = self._order_filled(order)
+        if getattr(sig, "decision_id", None) is not None:
+            storage.update_tick_execution(
+                sig.decision_id,
+                outcome="executed" if filled else "rejected: exchange did not fill SELL",
+                submitted=order is not None,
+                filled=filled,
+                client_order_id=getattr(order, "client_order_id", None) if order else None,
+                risk_passed=True,
+            )
+        return filled
 
     @staticmethod
     def _order_filled(order: Optional[Order]) -> bool:
@@ -2391,9 +2648,6 @@ class Autopilot:
             except (ArithmeticError, ValueError, TypeError):
                 priced = Decimal("0")
             if priced <= 0:
-                # A 0/None fill price would corrupt realized PnL. detect_fill
-                # should already have returned None here; refuse as a backstop
-                # so close_position is NEVER called with a non-positive price.
                 log.error(
                     "exchange_stop fill for %s had non-positive price %r — NOT recording exit",
                     symbol, fill_price,
@@ -2665,6 +2919,7 @@ class Autopilot:
                     # fully modeled estimate for the whole trade rather than
                     # fabricate a partial number.
                     actual_exit_fee_usdt = None
+                    entry_fee = (pos or {}).get("entry_fee_usdt")
                     if order.commission is not None and order.commission_asset == "USDT":
                         actual_exit_fee_usdt = float(order.commission)
                     storage.reduce_position(

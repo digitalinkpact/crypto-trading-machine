@@ -19,9 +19,9 @@ threshold + `market_regime_sideways_score_bonus` (95) in a sideways BTC regime:
 * The additive score is kept for dips because the richer `oversold_bounce`
   candidate hard-codes RSI<40 and only reaches 80+ at RSI<=13, which would veto
   nearly every dip the walk-forward validated; its detail is logged for
-  forensics only. With the hard gates above, a BUY can only be 90 or 100, so
-  the score is effectively a setup label: the sideways bonus (95) admits dip
-  entries only.
+  forensics only. Dips can reach 100; confirmed pullbacks are capped by their
+  EMA-distance candidate (75..89 for a strictly positive distance). The
+  sideways bonus (95) therefore admits dip entries only.
 """
 from __future__ import annotations
 
@@ -32,14 +32,14 @@ from typing import Any, Optional
 
 import pandas as pd
 
-from app.config import get_settings
+from app.config import DAILY_FETCH_BARS, DAILY_MIN_USABLE_BARS, get_settings
+from app.data import OHLCVRepository, load_daily_snapshot
 from app.exchange import BinanceUSClient
 from app.exchange.orderbook import analyze_order_book
 from app.logging_setup import get_logger
 from app.regime.btc_regime import compute_btc_regime_score
 from app.signals import SignalAction
 from app.storage import storage
-from app.ta import add_indicators
 
 log = get_logger(__name__)
 
@@ -82,14 +82,14 @@ class ProfitStreamStrategy:
         s = get_settings()
 
         try:
-            df_1d = await self._candles(symbol, "1d", 320)
+            df_1d = await self._candles(symbol, "1d", DAILY_FETCH_BARS)
             if btc_1d is None:
-                btc_1d = await self._candles("BTCUSDT", "1d", 320)
+                btc_1d = await self._candles("BTCUSDT", "1d", DAILY_FETCH_BARS)
         except Exception as exc:  # noqa: BLE001
             reasons.append(f"data_unavailable:{exc}")
             return StrategyDecision(symbol, SignalAction.HOLD, 0, reasons, indicators)
 
-        if min(len(df_1d), len(btc_1d)) < 60:
+        if min(len(df_1d), len(btc_1d)) < DAILY_MIN_USABLE_BARS:
             reasons.append("insufficient_history")
             return StrategyDecision(symbol, SignalAction.HOLD, 0, reasons, indicators)
 
@@ -136,6 +136,12 @@ class ProfitStreamStrategy:
                 "btc_regime_label": btc_regime.label,
                 "ema20_extension_pct": extension_pct,
                 "entry_candidates": candidates,
+                "candle_close_at": df_1d.attrs.get("candle_close_at", str(df_1d.index[-1])),
+                "history_bars": df_1d.attrs.get("history_bars"),
+                "above_breadth_ema": (
+                    bool(df_1d.iloc[-1]["close"] > df_1d.iloc[-1][f"ema_{s.breadth_ema_span}"])
+                    if f"ema_{s.breadth_ema_span}" in df_1d.columns else None
+                ),
             }
         )
 
@@ -266,6 +272,37 @@ class ProfitStreamStrategy:
         # sideways regimes, so downside protection is unchanged.
         btc_aligned = btc_risk_on or btc_regime.score >= 1
         indicators["btc_aligned"] = btc_aligned
+        indicators["btc_market_allowed"] = btc_regime.score >= 0
+        indicators["btc_strong_bull"] = btc_regime.score >= 2
+        last = df_1d.iloc[-1]
+        low5 = float(df_1d["low"].tail(5).min())
+        bounce_floor = low5 * (1 + s.oversold_bounce_min_bounce_pct)
+        band_ceiling = float(last["bb_lower"]) * (
+            s.oversold_bounce_bb_multiplier if s.entry_strategy == "oversold_bounce" else 1.0
+        )
+        indicators["entry_checks"] = {
+            "dip_rsi": dip_rsi < (
+                s.oversold_bounce_rsi_max if s.entry_strategy == "oversold_bounce" else 30
+            ),
+            "dip_band": (
+                float(last["close"]) < band_ceiling
+                if s.entry_strategy == "oversold_bounce"
+                else float(last["close"]) <= band_ceiling
+            ),
+            "dip_bounce": low5 > 0 and float(last["close"]) > bounce_floor,
+            "bounce_band_interval_feasible": bounce_floor < band_ceiling,
+            "dip_ready": dip_ready,
+            "pullback_loose_ready": pullback_loose_ready,
+            "pullback_candidate_ready": scored_candidates["pullback_to_ema"].ready,
+            "pullback_ready": pullback_ready,
+            "above_ema20": float(last["close"]) > float(last["ema_20"]),
+            "btc_alignment": btc_aligned,
+            "volume": daily_quote >= s.profitstream_low_volume_quote_min,
+            "extension": not extended,
+            "news": not near_news,
+            "spread": spread_pct is not None and spread_pct <= max_spread_pct,
+            "all_hard_filters": filt_ok and (btc_aligned or not s.btc_alignment_hard_gate),
+        }
         btc_score_penalty = 0
         if not btc_aligned:
             btc_score_penalty = 10
@@ -286,14 +323,39 @@ class ProfitStreamStrategy:
             pullback_candidate_score = scored_candidates["pullback_to_ema"].score
             indicators["pullback_candidate_score"] = pullback_candidate_score
             score = min(score, pullback_candidate_score)
+        indicators["score_breakdown"] = {
+            "dip": 70 if dip_ready else 0,
+            "pullback": 60 if pullback_ready else 0,
+            "btc_alignment": 20 if btc_aligned else 0,
+            "hard_filters": 10 if filt_ok else 0,
+            "btc_penalty": -btc_score_penalty,
+            "pullback_cap": indicators.get("pullback_candidate_score"),
+            "final": score,
+        }
 
         if not dip_ready:
-            rsi_bar = s.oversold_bounce_rsi_max if s.entry_strategy == "oversold_bounce" else 45
+            rsi_bar = s.oversold_bounce_rsi_max if s.entry_strategy == "oversold_bounce" else 30
             bb_mult = s.oversold_bounce_bb_multiplier if s.entry_strategy == "oversold_bounce" else 1.0
             if dip_rsi >= rsi_bar:
                 reasons.append("rsi_not_oversold")
-            if float(df_1d.iloc[-1]["close"]) > float(df_1d.iloc[-1]["bb_lower"]) * bb_mult:
+            if not indicators["entry_checks"]["dip_band"]:
                 reasons.append("close_above_lower_band")
+            if s.entry_strategy == "oversold_bounce":
+                low5 = float(df_1d["low"].tail(5).min())
+                minimum_bounce_close = low5 * (1 + s.oversold_bounce_min_bounce_pct)
+                maximum_band_close = float(df_1d.iloc[-1]["bb_lower"]) * bb_mult
+                bounce_ok = low5 > 0 and float(df_1d.iloc[-1]["close"]) > minimum_bounce_close
+                indicators["bounce"] = {
+                    "ok": bounce_ok,
+                    "low5": low5,
+                    "minimum_close": minimum_bounce_close,
+                    "maximum_band_close": maximum_band_close,
+                    "interval_feasible": minimum_bounce_close < maximum_band_close,
+                }
+                if not bounce_ok:
+                    reasons.append("bounce_below_required_recovery")
+                if minimum_bounce_close >= maximum_band_close:
+                    reasons.append("bounce_band_interval_empty")
 
         if pullback_loose_ready and not pullback_ready:
             reasons.append("pullback_not_tight_ema_candidate")
@@ -309,7 +371,11 @@ class ProfitStreamStrategy:
                     reasons.append("pullback_rsi_out_of_range")
                 if not (close > ema20 and close > ema50):
                     reasons.append("pullback_below_ema_structure")
-                if not (ema20 > 0 and close >= ema20 and ((close - ema20) / ema20) <= 0.07):
+                if ema20 <= 0:
+                    reasons.append("pullback_ema20_invalid")
+                elif close <= ema20:
+                    reasons.append("pullback_below_ema20")
+                elif ((close - ema20) / ema20) > 0.07:
                     reasons.append("pullback_too_far_from_ema20")
 
         if held:
@@ -326,18 +392,9 @@ class ProfitStreamStrategy:
         return StrategyDecision(symbol, SignalAction.HOLD, score, reasons, indicators)
 
     async def _candles(self, symbol: str, interval: str, limit: int) -> pd.DataFrame:
-        df = await self._client.klines(symbol, interval, limit=limit)
-        if "ema_20" not in df.columns:
-            df = add_indicators(df)
-        df = df.dropna()
-        # Binance's klines endpoint includes the still-forming current bar. On
-        # Binance.US's thin books that bar's volume is usually near/exactly 0
-        # seconds after it opens, permanently failing the low-volume filter, and
-        # its OHLC keeps shifting mid-bar (flickering EMA/MACD crosses). Drop it
-        # so every indicator is computed off fully closed candles only.
-        if not df.empty and df.index[-1] > pd.Timestamp.now(tz="UTC"):
-            df = df.iloc[:-1]
-        return df
+        return await load_daily_snapshot(
+            symbol, repository=OHLCVRepository(client=self._client)
+        )
 
     def _dip_buy_setup(self, df: pd.DataFrame) -> tuple[bool, float]:
         out = df.dropna()

@@ -121,6 +121,33 @@ def _render_tick_diagnostics() -> tuple[str, str]:
     data = storage.kv_get("autopilot_last_tick_debug") or {}
     reasons = data.get("by_reason") or {}
     per_symbol = data.get("per_symbol") or {}
+    scan = storage.kv_get("profitstream_scan") or {}
+    scan_html = ""
+    if scan:
+        breadth = scan.get("breadth") or {}
+        scan_html = (
+            "<div class='card'><h2>Daily strategy scan</h2>"
+            f"<div>Closed candle: {escape(str(scan.get('candle_close_at') or 'unavailable'))}</div>"
+            f"<div>{escape(str(scan.get('error') or ''))}</div>"
+            f"<div>Analyzed: {int(scan.get('symbols', 0))}; "
+            f"ready: {int(scan.get('usable_symbols', 0))}; "
+            f"highest score: {int(scan.get('highest_score', 0))}/"
+            f"{int(scan.get('score_threshold', 80))} required</div>"
+            f"<div>BTC regime: {escape(str(scan.get('btc_regime_label', 'unknown')))}; "
+            f"market policy allows entries: {'yes' if scan.get('market_allowed') else 'no'}; "
+            f"strong bull required: {'yes' if scan.get('strong_bull_required') else 'no'}</div>"
+            f"<div>Alt breadth: {int(breadth.get('above', 0))}/"
+            f"{int(breadth.get('usable', 0))} above EMA{int(breadth.get('ema_span', 20))}; "
+            f"coverage {int(breadth.get('usable', 0))}/{int(breadth.get('expected', 0))}; "
+            f"allows entries: {'yes' if breadth.get('allowed') else 'no'}</div>"
+            "<div class='muted'>Repeated scans of the same closed daily candle are not "
+            "independent opportunities. Entry eligibility does not mean an order was submitted.</div>"
+            + "".join(
+                f"<div class='row'><span>{escape(str(name))}</span><b>{int(count)} pass</b></div>"
+                for name, count in sorted((scan.get("predicate_pass_counts") or {}).items())
+            )
+            + "</div>"
+        )
     market_hits = int(reasons.get("market_gate", 0) or 0)
     banner = ""
     if market_hits > 0:
@@ -132,7 +159,7 @@ def _render_tick_diagnostics() -> tuple[str, str]:
         )
 
     if not data:
-        return banner, (
+        return banner, scan_html + (
             "<div class='card'><h2>Last tick diagnostics</h2>"
             "<div class='muted'>No tick diagnostics recorded yet.</div></div>"
         )
@@ -190,7 +217,7 @@ def _render_tick_diagnostics() -> tuple[str, str]:
   {buy_table}
 </div>
 """
-    return banner, card
+    return banner, scan_html + card
 
 
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -706,6 +733,7 @@ async def autopilot_status() -> dict:
         "trades_executed": s.trades_executed,
         "last_action": s.last_action,
         "last_error": s.last_error,
+        "strategy_scan": storage.kv_get("profitstream_scan") or {},
         # ENTRY_HALTED (new BUYs blocked, e.g. drawdown breaker/emergency halt)
         # is distinct from SYSTEM_OFFLINE (the whole process/scheduler down).
         # Existing positions keep receiving stop-loss/TP/trailing/reconciliation
@@ -809,5 +837,3 @@ async def live_diagnostics() -> dict:
         "websocket": live_prices.status(),
         "trade_audit": audit,
     }
-
-

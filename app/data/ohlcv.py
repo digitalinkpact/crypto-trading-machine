@@ -6,7 +6,10 @@ cross-language reads of the cache.
 """
 from __future__ import annotations
 
+import asyncio
+import os
 from pathlib import Path
+import tempfile
 from typing import Optional
 
 import pandas as pd
@@ -42,7 +45,19 @@ class OHLCVRepository:
     ) -> pd.DataFrame:
         path = self._path(symbol, timeframe)
         if not refresh and path.exists():
-            return pd.read_pickle(path)
+            return await asyncio.to_thread(pd.read_pickle, path)
         df = await self._client.klines(symbol, timeframe, limit=limit)
-        df.to_pickle(path)
+        await asyncio.to_thread(self._write_cache, path, df)
         return df
+
+    @staticmethod
+    def _write_cache(path: Path, df: pd.DataFrame) -> None:
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".pkl", delete=False) as file:
+                temporary = Path(file.name)
+                df.to_pickle(file)
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)

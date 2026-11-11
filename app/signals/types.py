@@ -50,6 +50,7 @@ class Signal(BaseModel):
     exit_reason: str = ""
     entry_strategy: str = ""
     entry_btc_regime: int | None = None
+    decision_id: int | None = None
 
 
 # Higher timeframes carry more weight in cross-timeframe fusion.
@@ -138,4 +139,3 @@ class SignalAggregator:
                 contributing_agents=tuple(sorted(contribs[symbol][action])),
             )
         return result
-

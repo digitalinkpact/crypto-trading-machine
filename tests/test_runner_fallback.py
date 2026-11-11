@@ -130,6 +130,7 @@ async def test_profitstream_respects_configured_score_threshold(monkeypatch):
         SimpleNamespace(
             record_tick_audit=lambda **kwargs: None,
             load_model_artifact=lambda name: None,
+            kv_set=lambda *args: None,
         ),
     )
     monkeypatch.setattr(runner, "get_settings", lambda: SimpleNamespace(

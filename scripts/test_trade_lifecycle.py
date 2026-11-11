@@ -62,7 +62,7 @@ async def main():
                     if p["mode"] == ("paper" if settings.paper_trading else "live")]
         print(f"✓ Open positions: {len(positions)}")
         for p in positions[:3]:
-            print(f"  - {p['symbol']}: qty={p['quantity']} entry={p['entry_price']}")
+            print(f"  - {p['symbol']}: qty={p['qty']} entry={p['entry_price']}")
     except Exception as e:
         print(f"✗ Position check failed: {e}")
     

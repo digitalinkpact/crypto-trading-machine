@@ -402,7 +402,7 @@ async def test_fetch_liquid_universe_filters_and_caps(monkeypatch):
         # EEE has a wide 0.50% spread; DDD is too new (5 daily candles).
         spreads = {"BBBUSDT": (100.0, 100.05), "CCCUSDT": (100.0, 100.1),
                    "DDDUSDT": (100.0, 100.1), "EEEUSDT": (100.0, 100.5)}
-        ages = {"BBBUSDT": 30, "CCCUSDT": 30, "DDDUSDT": 5, "EEEUSDT": 30}
+        ages = {"BBBUSDT": 300, "CCCUSDT": 300, "DDDUSDT": 5, "EEEUSDT": 300}
 
         async def order_book(self, symbol, limit=5):
             bid, ask = self.spreads[symbol]
@@ -410,7 +410,13 @@ async def test_fetch_liquid_universe_filters_and_caps(monkeypatch):
 
         async def klines(self, symbol, timeframe, limit=500):
             n = min(self.ages[symbol], limit)
-            return pd.DataFrame({"close": list(range(n))})
+            from app.data.daily import latest_daily_close
+            return pd.DataFrame(
+                {"close": list(range(n))},
+                index=pd.date_range(
+                    end=latest_daily_close() + pd.Timedelta(days=1), periods=n, freq="D"
+                ),
+            )
 
     sym_mod._LIQUID_CACHE = {"symbols": None, "timestamp": 0.0}
     monkeypatch.setattr(
@@ -457,7 +463,14 @@ async def test_fetch_liquid_universe_at_full_size_does_not_collapse_to_fallback(
             return {"bids": [["100.0", "10"]], "asks": [[ask, "10"]]}
 
         async def klines(self, symbol, timeframe, limit=500):
-            return pd.DataFrame({"close": list(range(min(30, limit)))})  # 30 >= min_days
+            from app.data.daily import latest_daily_close
+            n = min(300, limit)
+            return pd.DataFrame(
+                {"close": list(range(n))},
+                index=pd.date_range(
+                    end=latest_daily_close() + pd.Timedelta(days=1), periods=n, freq="D"
+                ),
+            )
 
     # The fallback path must NOT be taken — make it raise if it ever is.
     async def _boom():
@@ -509,5 +522,4 @@ def test_is_stable_pair_keeps_real_coins(symbol):
     from app.exchange.symbols import _is_stable_pair
 
     assert _is_stable_pair(symbol) is False
-
 

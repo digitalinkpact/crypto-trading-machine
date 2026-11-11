@@ -1064,6 +1064,35 @@ class Storage:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def update_tick_execution(
+        self, decision_id: int, *, outcome: str,
+        submitted: Optional[bool] = None, filled: Optional[bool] = None,
+        client_order_id: Optional[str] = None, risk_passed: Optional[bool] = None,
+    ) -> None:
+        with self._lock, self._conn() as c:
+            row = c.execute(
+                "SELECT filters,executed FROM tick_audit WHERE id=?", (decision_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Unknown strategy decision {decision_id}")
+            detail = json.loads(row["filters"])
+            detail["final_outcome"] = outcome
+            if submitted is not None:
+                detail["submitted"] = submitted
+            if filled is not None:
+                detail["filled"] = filled
+            if client_order_id is not None:
+                detail["client_order_id"] = client_order_id
+            if risk_passed is not None:
+                detail["risk_passed"] = risk_passed
+            c.execute(
+                "UPDATE tick_audit SET executed=?,filters=? WHERE id=?",
+                (
+                    int(filled) if filled is not None else row["executed"],
+                    json.dumps(detail), decision_id,
+                ),
+            )
+
     def paper_balance_get(self, asset: str) -> float:
         with self._lock, self._conn() as c:
             row = c.execute("SELECT qty FROM paper_balances WHERE asset=?", (asset,)).fetchone()

@@ -46,17 +46,15 @@ def _wire(monkeypatch, frames: dict[str, pd.DataFrame], settings=_Settings) -> A
     ap = Autopilot()
     monkeypatch.setattr(autopilot_module, "get_settings", lambda: settings())
 
-    fake_paths = [Path(f"/x/{s}_1d.pkl") for s in frames]
-    monkeypatch.setattr(Path, "glob", lambda self, pat: iter(fake_paths), raising=True)
-
-    class _Repo:
-        async def get(self, symbol, tf, refresh=False):
-            return frames[symbol]
+    async def _symbols():
+        return list(frames)
 
     import app.data as data_mod
-    monkeypatch.setattr(data_mod, "OHLCVRepository", _Repo, raising=True)
-    import app.ta as ta_mod
-    monkeypatch.setattr(ta_mod, "add_indicators", lambda df: df, raising=True)
+    import app.exchange.symbol_source as source_mod
+    async def _snapshot(symbol):
+        return frames[symbol]
+    monkeypatch.setattr(source_mod, "get_symbols", _symbols)
+    monkeypatch.setattr(data_mod, "load_daily_snapshot", _snapshot)
     return ap
 
 
@@ -106,9 +104,11 @@ async def test_breadth_fails_closed_on_too_few_symbols(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_breadth_fails_closed_on_exception(monkeypatch):
-    class _S(_Settings):
-        data_cache_dir = None  # Path(None) raises -> fail-closed branch
-    ap = _wire(monkeypatch, {}, settings=_S)
+    ap = _wire(monkeypatch, {})
+    import app.exchange.symbol_source as source_mod
+    async def _broken_symbols():
+        raise RuntimeError("universe unavailable")
+    monkeypatch.setattr(source_mod, "get_symbols", _broken_symbols)
     ok, why = await ap._breadth_gate()
     assert ok is False
     assert why.startswith("breadth_unavailable")
@@ -130,11 +130,33 @@ async def test_breadth_result_is_cached_for_five_minutes(monkeypatch):
     frames = {"AAAUSDT": _frame(101, 100), "BBBUSDT": _frame(102, 100), "CCCUSDT": _frame(103, 100)}
     ap = _wire(monkeypatch, frames)
     import app.data as data_mod
-    class _Counting:
-        async def get(self, symbol, tf, refresh=False):
-            calls["n"] += 1
-            return frames[symbol]
-    monkeypatch.setattr(data_mod, "OHLCVRepository", _Counting, raising=True)
+    async def _snapshot(symbol):
+        calls["n"] += 1
+        return frames[symbol]
+    monkeypatch.setattr(data_mod, "load_daily_snapshot", _snapshot)
     await ap._breadth_gate(); first = calls["n"]
     await ap._breadth_gate()
     assert calls["n"] == first  # second call served from cache
+
+
+async def test_breadth_does_not_remove_unavailable_pair_from_denominator(monkeypatch):
+    frames = {name: _frame(101, 100) for name in ("AAAUSDT", "BBBUSDT", "CCCUSDT")}
+    ap = _wire(monkeypatch, frames)
+    import app.exchange.symbol_source as source_mod
+    async def _symbols():
+        return [*frames, "STALEUSDT"]
+    monkeypatch.setattr(source_mod, "get_symbols", _symbols)
+    ok, reason = await ap._breadth_gate()
+    assert ok is False
+    assert "breadth_incomplete_coverage:3/4" in reason
+
+
+async def test_breadth_ignores_out_of_universe_cache_files(monkeypatch, tmp_path):
+    frames = {name: _frame(101, 100) for name in ("AAAUSDT", "BBBUSDT", "CCCUSDT")}
+    _frame(1, 100).to_pickle(tmp_path / "OLDUSDT_1d.pkl")
+    class _S(_Settings):
+        data_cache_dir = tmp_path
+    ap = _wire(monkeypatch, frames, settings=_S)
+    ok, reason = await ap._breadth_gate()
+    assert ok is True
+    assert "3/3=100%" in reason

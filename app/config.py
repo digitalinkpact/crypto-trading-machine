@@ -48,6 +48,11 @@ TIMEFRAMES: tuple[Timeframe, ...] = (
     Timeframe.W1,
 )
 
+DAILY_FETCH_BARS = 320
+DAILY_HISTORY_BARS = 319
+DAILY_MIN_CLOSED_BARS = 259
+DAILY_MIN_USABLE_BARS = 60
+
 
 
 class Settings(BaseSettings):
@@ -84,7 +89,7 @@ class Settings(BaseSettings):
     # fetch_dynamic_symbols then the static list on any API failure.
     #
     # UNIT FOOTGUN: `max_spread_percent` is a PERCENT (0.50 = 0.50%), whereas the
-    # execution-time `max_spread_pct` below is a FRACTION (0.0025 = 0.25%). The
+    # execution-time `max_spread_pct` below is a FRACTION (0.0015 = 0.15%). The
     # universe filter is a coarse compute-saver; the execution gate is the hard
     # money-guard and is intentionally kept stricter.
     #
@@ -125,7 +130,7 @@ class Settings(BaseSettings):
     #     -$2.43/53% wr were negative too, but within fee-noise / with healthy
     #     win rates, so deliberately NOT blocked.)
     #  B) Structurally thin order books — top-of-book spread measured twice,
-    #     identical, on Binance.US; each is >=8x the 0.50% universe spread cap.
+    #     identical, on Binance.US; each is >=15x the 0.45% universe spread cap.
     #     The universe spread probe FAILS OPEN on error, so these are a hard
     #     backstop against that path. (ONE 5.4%, PROM 5.4%, BTRST 4.9%, DGB 4.4%
     #     also trip the gate but are left to the dynamic spread filter.)
@@ -255,16 +260,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _log_win_rate_guardrail_overrides(self) -> "Settings":
-        """Loudly log any override of the evidence-locked entry-quality caps.
-
-        2026-09-29: widening the universe past top-75/top-50 and positions past
-        12 dropped live win rate ~95% -> ~69%. These can still be changed via
-        .env (reversible), but never silently — each deviation is a CRITICAL
-        log line naming the setting, its value and the evidence-locked value.
-        """
+        """Log changes that override the live-evidence quality guardrails."""
         import logging
 
-        log = logging.getLogger("app.config")
+        logger = logging.getLogger("app.config")
         guardrails = (
             ("universe_size", self.universe_size, "<=", 75),
             ("final_pairlist_size", self.final_pairlist_size, "<=", 50),
@@ -281,17 +280,17 @@ class Settings(BaseSettings):
             ("trend_gate_bypass_enabled", self.trend_gate_bypass_enabled, "==", False),
             ("profitstream_trend_soft_penalty", self.profitstream_trend_soft_penalty, "==", False),
         )
-        for name, value, op, locked in guardrails:
-            ok = (
-                value <= locked if op == "<="
-                else value >= locked if op == ">="
+        for name, value, operator, locked in guardrails:
+            valid = (
+                value <= locked if operator == "<="
+                else value >= locked if operator == ">="
                 else value == locked
             )
-            if not ok:
-                log.critical(
+            if not valid:
+                logger.critical(
                     "WIN-RATE GUARDRAIL OVERRIDDEN: %s=%r (evidence-locked: %s %r). "
                     "See the 2026-09-29 win-rate regression notes in app/config.py.",
-                    name, value, op, locked,
+                    name, value, operator, locked,
                 )
         return self
 
@@ -319,22 +318,17 @@ class Settings(BaseSettings):
     max_position_pct: float = Field(0.05, ge=0.005, le=1.0)      # per-position sizing cap
     max_portfolio_risk_pct: float = Field(0.25, ge=0.0, le=1.0)
     kelly_fraction_cap: float = Field(0.25, ge=0.005, le=1.0)
-    max_open_positions: int = Field(12, ge=1, le=50)             # hard ceiling on concurrent positions (12 = 2026-09-29 revert)
+    max_open_positions: int = Field(12, ge=1, le=50)             # cap concurrent positions
     max_long_exposure_pct: float = Field(0.60, ge=0.0, le=1.0)   # ≤ 60% of equity in non-USDT
     aggressive_mode_enabled: bool = True
     aggressive_rollback_min_trades: int = Field(30, ge=1, le=10_000)
     aggressive_rollback_min_win_rate: float = Field(0.50, ge=0.0, le=1.0)
-    # Win rate is measured per POSITION (rows grouped by symbol+mode+entry_ts, a
-    # position wins iff its summed FEE-ADJUSTED pnl > 0; book-keeping closes and
-    # positions still open after a TP1/TP2 partial are excluded — single
-    # definition in app/trading/win_rate.py), not per partial-exit row. Winners
+    # Win rate is measured per POSITION (rows grouped by symbol+entry_ts, a
+    # position wins if its summed pnl > 0), not per partial-exit row. Winners
     # exit in several rows (TP1/TP2/trailing) while losers exit in one, so a
     # row-level win rate reads several points too high and kept the aggressive
     # sizing engaged through losing regimes. Position-level is the safer default;
     # set WIN_RATE_POSITION_LEVEL=false to restore the legacy per-row behaviour.
-    # Reports/dashboards ALWAYS print both numbers side by side. Any historical
-    # ~94-95% figure must be re-validated under the position-level definition
-    # (live 2026-10-12: 63% row-level vs 33% position-level).
     win_rate_position_level: bool = True
     aggressive_max_spread_pct: float = Field(0.0025, ge=0.0, le=0.05)
     rollback_max_spread_pct: float = Field(0.0015, ge=0.0, le=0.05)
@@ -354,7 +348,7 @@ class Settings(BaseSettings):
     aggressive_signal_exit_enabled: bool = False
     trend_gate_bypass_confidence: float = Field(0.85, ge=0.0, le=1.0)
     trend_gate_bypass_ml_proba: float = Field(0.55, ge=0.0, le=1.0)
-    pyramid_confidence_threshold: float = Field(0.85, ge=0.0, le=1.0)  # DEAD — autopilot hardcodes 0.75; ProfitStream returns HOLD for held coins so pyramiding never triggers
+    pyramid_confidence_threshold: float = Field(0.85, ge=0.0, le=1.0)
     pyramid_add_fraction: float = Field(0.50, ge=0.0, le=2.0)
     orderbook_retry_enabled: bool = True
     orderbook_retry_delay_seconds: int = Field(60, ge=1, le=3600)
@@ -397,10 +391,8 @@ class Settings(BaseSettings):
     # Falls back to stop_loss_pct when disabled or ATR is unavailable.
     atr_stop_enabled: bool = True
     atr_stop_multiple: float = Field(2.0, ge=0.5, le=6.0)        # stop distance = N x daily ATR%
-    # min floor 0.02->0.03 (2026-09-16 R:R sweep) -> 0.04 (win-rate forensics):
-    # the fixed-stop sweep above showed a ~4% stop is the shake-out boundary, so
-    # the ATR stop must never be tighter than it (risk.dynamic_stop_pct also
-    # floors at stop_loss_pct, so a quiet coin can't get a sub-4% stop).
+    # min floor 0.02->0.03->0.04 (2026-09-16 R:R and later live forensics): keep the tightest ATR stops
+    # out of the shake-out zone the fixed-stop finding above identified.
     atr_stop_min_pct: float = Field(0.04, ge=0.005, le=0.20)     # never tighter than 4%
     atr_stop_max_pct: float = Field(0.08, ge=0.01, le=0.50)      # never wider than 8%
     take_profit_pct: float = Field(0.05, ge=0.005, le=0.50)      # 5% take-profit (unused by the
@@ -429,13 +421,12 @@ class Settings(BaseSettings):
     trailing_stop_pct: float = Field(0.03, ge=0.005, le=0.20)    # 3.0% trail from HWM
     trailing_activation_pct: float = Field(0.05, ge=0.005, le=0.50)  # arm trailing after +5%
     # Arm the trailing stop as soon as a position gains `trailing_activation_pct`
-    # (+5% now; it was +2% when this was measured), WITHOUT waiting for the +8%
-    # TP1 to bank first. Live forensics
+    # (+2%), WITHOUT waiting for the +8% TP1 to bank first. Live forensics
     # (2026-09-14): on thin Binance.US, +8% moves are rare — take_profit_1 fired
     # only twice ever, while trailing_stop was the single largest winner bucket.
     # Requiring TP1 first therefore left the common +2-6% winners with NO profit
     # protection: they rode the hard stop back down or gave the gain back to the
-    # stale/max-hold exit near breakeven. Arming early lets the trail protect a
+    # stale/max-hold exit near breakeven. Arming at +2% lets the trail protect a
     # run-up in proportion to how far it ran (this is the config the profitable
     # walk-forward/strategy_lab backtest actually models). Set True to restore
     # the delayed-trailing behavior.
@@ -473,21 +464,14 @@ class Settings(BaseSettings):
     stale_exit_max_pnl_pct: float = Field(0.02, ge=0.0, le=0.50)
 
     # Entry gates
-    # NOTE (config-vs-behaviour): ProfitStream BUYs are gated by
-    # `profitstream_score_threshold` (runner.py) and the autopilot's hardcoded
-    # 0.40 confidence floor (`_signal_min_confidence`). This field and the
-    # dynamic-threshold delta below are only logged/displayed — they do NOT gate
-    # a live BUY.
     min_signal_confidence: float = Field(0.65, ge=0.0, le=1.0)
     buy_cooldown_minutes: int = Field(20, ge=0, le=1440)
+    signal_max_spread_pct: float = Field(0.0025, ge=0.0, le=0.05)
 
     # ProfitStream strategy controls.
     profitstream_enabled: bool = True
     profitstream_use_legacy_agents: bool = False
     profitstream_score_threshold: int = Field(80, ge=0, le=100)
-    # profitstream_rsi_*/volume_spike/btc_volatility below are read ONLY by the
-    # research/backtest scripts (profitstream_backtest_suite, profitstream_research),
-    # not by the live strategy (which uses the daily dip/pullback setups).
     profitstream_rsi_min: int = Field(40, ge=1, le=99)
     profitstream_rsi_max: int = Field(65, ge=1, le=99)
     profitstream_volume_spike_multiple: float = Field(1.5, ge=1.0, le=10.0)
@@ -561,28 +545,12 @@ class Settings(BaseSettings):
     oversold_bounce_rsi_max: float = Field(40.0, ge=1.0, le=99.0)
     oversold_bounce_bb_multiplier: float = Field(1.02, ge=1.0, le=1.20)
     oversold_bounce_min_bounce_pct: float = Field(0.05, ge=0.0, le=0.50)
+    pullback_require_candidate_confirmation: bool = True
     # Long-term trend filter — only open longs when the latest daily close is
     # above its 200-EMA. Spot is long-only, so buying assets in a downtrend just
     # feeds the stop-loss gate. Backtest-validated: cuts losses ~3x and max
     # drawdown ~half versus no filter (see scripts/param_sweep diagnosis).
     trend_filter_enabled: bool = True
-    # The 200-EMA veto above is a HARD gate for ProfitStream entries too. It was
-    # silently downgraded to a -10 score penalty (fa6b5d0) that was never
-    # re-checked against the score threshold, and the high-confidence bypass
-    # below waved through every score-100 dip — so oversold-bounce entries below
-    # the 200-EMA (falling knives) executed. Set PROFITSTREAM_TREND_SOFT_PENALTY=true
-    # / TREND_GATE_BYPASS_ENABLED=true only to reproduce the old behaviour.
-    profitstream_trend_soft_penalty: bool = False
-    trend_gate_bypass_enabled: bool = False
-    # A trend pullback must ALSO satisfy the tight `pullback_to_ema` candidate
-    # (<=2% from EMA20, RSI 45-55, EMA20>EMA50, MACD hist turning up). The live
-    # `_pullback_setup` alone accepts any close above EMA20/50 within 7% and
-    # RSI 35-70 — i.e. almost every coin in an uptrend, every day — which is
-    # trend-chasing, not a pullback.
-    pullback_require_candidate_confirmation: bool = True
-    # BTC not aligned (no golden cross AND regime score < 1) hard-blocks the
-    # entry instead of only costing 10 score points.
-    btc_alignment_hard_gate: bool = True
 
     # Market-regime kill-switch — block ALL new longs when the broad market
     # (BTC) is in a confirmed downtrend (50-EMA below 200-EMA, a "death cross").
@@ -600,6 +568,7 @@ class Settings(BaseSettings):
     # SIDEWAYS (score==0) allows entries only if the strategy's own quality
     # score clears this extra bonus above `profitstream_score_threshold`.
     market_regime_sideways_score_bonus: int = Field(15, ge=0, le=100)
+    btc_alignment_hard_gate: bool = True
     # Optional stricter mode (default OFF): only take new longs when BTC's
     # scored regime is STRONG_BULL (score>=2), blocking the merely-BULL
     # (score==1) tier. Live evidence (2026-09-15, closed_trades split by the
@@ -611,23 +580,12 @@ class Settings(BaseSettings):
     # setups (fewer trades / more time in cash). Exits are never affected.
     require_strong_bull_regime: bool = False
 
-    # ── Alt-market BREADTH gate (2026-10-28) ────────────────────────────
-    # The BTC-only regime gate scored the entire Oct-2026 alt drawdown as
-    # STRONG_BULL (BTC held its EMAs while most alts broke theirs); the live
-    # pullback entry went 91% -> 36% win with no config change. Breadth =
-    # fraction of the cached alt universe (excl. BTC) closing above its
-    # EMA{span}. Gate is ANDed with the BTC regime. Validated on the pullback
-    # entry, 189 symbols, data through 2026-10-28, position level:
-    #   gate                  SEP14-28 (won)   OCT5-27 (lost)   pooled
-    #   BTC only (current)    n=371 PF 2.67    n=328 PF 0.27    PF 1.04
-    #   BTC AND breadth20>=.5 n=361 PF 2.81    n=125 PF 0.18    PF 1.52
-    # Keeps September, cuts October entries 62%, lifts pooled PF above the
-    # 1.5 promotion bar. FAIL-CLOSED when breadth cannot be computed.
     breadth_gate_enabled: bool = True
     breadth_ema_span: int = Field(20, ge=5, le=200)
     breadth_min_fraction: float = Field(0.50, ge=0.0, le=1.0)
-    # Minimum number of alt symbols with usable data for the reading to count.
     breadth_min_symbols: int = Field(15, ge=3, le=500)
+    trend_gate_bypass_enabled: bool = False
+    profitstream_trend_soft_penalty: bool = False
 
     # ── Anti-chase / extension guard ──────────────────────────────────
     # A dip-buy that is too far *below* its EMA20 is more likely a falling
@@ -736,16 +694,10 @@ class Settings(BaseSettings):
     # or wide books. Fails OPEN (allows the trade) if the book can't be fetched.
     orderbook_gate_enabled: bool = True
     orderbook_depth_limit: int = Field(10, ge=5, le=100)
-    # Reject entry if (ask-bid)/mid exceeds this (0.0025 = 0.25%). Stricter than
-    # the coarse universe `max_spread_percent` (0.50%); Binance.US is thin, so
-    # the old 0.15% was effectively un-satisfiable and starved the bot of
-    # entries. The same cap applies to every entry type (dip and pullback).
+    # Reject entry if (ask-bid)/mid exceeds this (0.005 = 0.50%). Aligned with
+    # the universe `max_spread_percent` (0.50%) — Binance.US is thin, so the old
+    # 0.15% was effectively un-satisfiable and starved the bot of entries.
     max_spread_pct: float = Field(0.0025, ge=0.0, le=0.05)
-    # Spread cap applied by the SIGNAL (ProfitStreamStrategy.filt_ok). Kept
-    # separate from the execution gate's MAX_SPREAD_PCT / AGGRESSIVE_MAX_SPREAD_PCT
-    # so a looser .env value for the order-book gate can never loosen which
-    # setups are allowed to become BUY signals (0.0025 = the pre-2026-11 hardcode).
-    signal_max_spread_pct: float = Field(0.0025, ge=0.0, le=0.05)
     # Require resting depth near mid >= this multiple of the trade notional.
     min_depth_trade_multiple: float = Field(2.0, ge=0.0, le=100.0)
     # "Near mid" band used for the depth check (0.001 = 0.1%).

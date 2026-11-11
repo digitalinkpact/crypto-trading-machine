@@ -172,7 +172,8 @@ def test_env_example_matches_code_defaults():
     import re
     from pathlib import Path
 
-    defaults = Settings(_env_file=None)
+    from pydantic import SecretStr
+
     example = Path(__file__).resolve().parent.parent / ".env.example"
     checked = 0
     for line in example.read_text().splitlines():
@@ -181,6 +182,11 @@ def test_env_example_matches_code_defaults():
             continue
         name = m.group(1).lower()
         parsed = getattr(Settings(_env_file=None, **{name: m.group(2)}), name)
-        assert parsed == getattr(defaults, name), f".env.example {name}={m.group(2)} != code default"
+        expected = Settings.model_fields[name].default
+        if isinstance(parsed, SecretStr):
+            parsed = parsed.get_secret_value()
+        if isinstance(expected, SecretStr):
+            expected = expected.get_secret_value()
+        assert parsed == expected, f".env.example {name}={m.group(2)} != code default"
         checked += 1
     assert checked > 20

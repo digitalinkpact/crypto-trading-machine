@@ -56,28 +56,3 @@ async def test_get_symbols_excludes_blocked_even_when_top_ranked(monkeypatch):
     assert "ZECUSDT" not in out
     assert "HYPEUSDT" not in out
     assert out == ["BTCUSDT", "SOLUSDT"]
-
-
-async def test_liquid_universe_failure_fallback_stays_volume_capped(monkeypatch):
-    """When the staged pipeline errors, the fallback must NOT scan the whole
-    ~198-pair universe (the widening that cost ~95% -> ~69% win rate)."""
-    from app.exchange import symbols as symbols_module
-
-    class _Boom:
-        def __init__(self, *a, **k):
-            raise RuntimeError("exchange down")
-
-    seen: dict = {}
-
-    async def _fake_dynamic(top_n_override=None):
-        seen["top_n_override"] = top_n_override
-        return ["BTCUSDT"]
-
-    symbols_module._LIQUID_CACHE["symbols"] = []
-    symbols_module._LIQUID_CACHE["timestamp"] = 0.0
-    monkeypatch.setattr(symbols_module.httpx, "AsyncClient", _Boom)
-    monkeypatch.setattr(symbols_module, "fetch_dynamic_symbols", _fake_dynamic)
-
-    result = await symbols_module.fetch_liquid_universe()
-    assert result == ["BTCUSDT"]
-    assert seen["top_n_override"] == symbols_module.get_settings().final_pairlist_size

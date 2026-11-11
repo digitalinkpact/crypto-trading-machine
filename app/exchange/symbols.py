@@ -5,7 +5,7 @@ from typing import List, Optional
 
 import httpx
 
-from app.config import Timeframe, get_settings
+from app.config import DAILY_FETCH_BARS, DAILY_MIN_CLOSED_BARS, Timeframe, get_settings
 from app.exchange.client import BinanceUSClient
 from app.logging_setup import get_logger
 
@@ -122,11 +122,10 @@ async def _probe_symbol(
 ) -> tuple[str, Optional[float], Optional[int]]:
     """Probe one symbol's top-of-book spread (%) and available history (days).
 
-    Returns (symbol, spread_pct_or_None, age_days_or_None). Any error yields
-    None for that field and the caller FAILS OPEN (keeps the symbol) — the
-    execution-time order-book gate remains the hard money-guard. `age_days` is
-    the count of daily candles returned (capped at the requested limit), i.e. a
-    coin with >= min_days candles is treated as old enough.
+    Returns (symbol, spread_pct_or_None, closed_days_or_None). Unknown age,
+    stale candles and gaps fail eligibility closed. Unknown spread is left to
+    the execution-time order-book gate. Daily readiness uses the same history
+    window as the strategy when ProfitStream's warm-up is required.
     """
     async with sem:
         spread_pct: Optional[float] = None
@@ -147,8 +146,19 @@ async def _probe_symbol(
             log.debug("[UNIVERSE] %s depth probe error: %s", symbol, exc)
         if min_days > 0:
             try:
-                df = await client.klines(symbol, Timeframe.D1, limit=min_days)
-                age_days = int(len(df))
+                from app.data.daily import closed_daily_bars, latest_daily_close
+                import pandas as pd
+
+                limit = max(min_days + 1, DAILY_FETCH_BARS) if min_days >= DAILY_MIN_CLOSED_BARS else min_days + 1
+                df = await client.klines(symbol, Timeframe.D1, limit=limit)
+                expected = latest_daily_close()
+                closed = closed_daily_bars(df, expected)
+                age_days = int(len(closed))
+                if (
+                    closed.empty or closed.index[-1] != expected
+                    or not closed.index.to_series().diff().iloc[1:].eq(pd.Timedelta(days=1)).all()
+                ):
+                    age_days = 0
             except Exception as exc:  # noqa: BLE001
                 log.debug("[UNIVERSE] %s age probe failed: %s", symbol, exc)
     return symbol, spread_pct, age_days
@@ -176,6 +186,8 @@ async def fetch_liquid_universe(
     min_vol = float(getattr(s, "min_24h_volume", 0.0) or 0.0)
     max_spread = float(getattr(s, "max_spread_percent", 100.0))
     min_days = int(getattr(s, "min_days_listed", 0))
+    if getattr(s, "profitstream_enabled", False):
+        min_days = max(min_days, DAILY_MIN_CLOSED_BARS)
     final_size = int(getattr(s, "final_pairlist_size", 50))
     concurrency = int(getattr(s, "liquidity_probe_concurrency", 8))
 
@@ -233,8 +245,7 @@ async def fetch_liquid_universe(
         spread_rejects: list[tuple[str, float]] = []
         age_rejects: list[str] = []
         for sym, spread_pct, age_days in probes:
-            # Fail-open: unknown spread/age keeps the symbol.
-            if min_days > 0 and age_days is not None and age_days < min_days:
+            if min_days > 0 and (age_days is None or age_days < min_days):
                 age_rejects.append(sym)
                 continue
             if spread_pct is not None and spread_pct > max_spread:
@@ -284,4 +295,3 @@ async def fetch_liquid_universe(
         except Exception as e:  # noqa: BLE001
             log.exception("Trade execution failure: %s", e)
             return list(getattr(s, "static_symbols", []))
-
