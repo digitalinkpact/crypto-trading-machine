@@ -23,6 +23,38 @@ from app.trading.startup import verify_before_trading
 log = get_logger(__name__)
 
 
+def _log_trading_mode(settings) -> None:
+    """Make the live-trading flags and the BUY kill switch visible at boot."""
+    log.critical(
+        "TRADING MODE: live_mode=%s dry_run=%s paper_trading=%s live_buys_enabled=%s",
+        settings.live_mode, settings.dry_run, settings.paper_trading,
+        settings.live_buys_enabled,
+    )
+    if settings.live_mode and not settings.live_buys_enabled:
+        log.critical(
+            "LIVE_MODE is true but LIVE_BUYS_ENABLED is false — all new BUY orders "
+            "will be rejected by the kill switch"
+        )
+    elif settings.live_mode and settings.live_buys_enabled:
+        log.critical("LIVE TRADING ARMED — new BUY orders are allowed")
+
+
+async def _log_price_diagnostic(settings) -> None:
+    """Log endpoints and a live BTCUSDT price so the operator can see data is real."""
+    log.info(
+        "Binance endpoints: binance_base_url=%s binance_ws_url=%s",
+        settings.binance_base_url, settings.binance_ws_url,
+    )
+    try:
+        from app.exchange.client import BinanceUSClient
+
+        price = await BinanceUSClient().ticker_price("BTCUSDT")
+        log.info("Live price check: BTCUSDT=%s (source=%s)",
+                 price, settings.binance_base_url)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("BTCUSDT price diagnostic failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
@@ -42,6 +74,7 @@ async def lifespan(app: FastAPI):
             )
         else:
             log.info("LLM reasoner active in trading loop; provider=%s", reasoner.provider)
+    _log_trading_mode(settings)
     # Drop expired sessions/tokens on boot.
     try:
         storage.purge_expired_sessions()
@@ -91,6 +124,8 @@ async def lifespan(app: FastAPI):
         await startup_report()
     except Exception as exc:  # noqa: BLE001
         log.exception("startup report failed: %s", exc)
+
+    await _log_price_diagnostic(settings)
 
     try:
         yield
