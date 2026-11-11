@@ -4,12 +4,9 @@ from __future__ import annotations
 import contextlib
 import os
 import tempfile
-from pathlib import Path
 from typing import Iterable
 
-from app.config import get_settings
-
-_ENV_PATH = Path(".env")
+from app.config import _ENV_PATH, get_settings
 
 
 def _write_env(updates: dict[str, str], drop: Iterable[str] = ()) -> None:

@@ -5,10 +5,13 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=cryptobot
+Group=cryptobot
+UMask=0077
 WorkingDirectory=/opt/crypto-trading-machine
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=-/opt/crypto-trading-machine/.env
+Environment=APP_ENV_FILE=/var/lib/crypto-bot/.env
+EnvironmentFile=-/var/lib/crypto-bot/.env
 ExecStart=/opt/crypto-trading-machine/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=3
@@ -16,6 +19,10 @@ TimeoutStartSec=45
 TimeoutStopSec=30
 KillSignal=SIGINT
 NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/crypto-bot /opt/crypto-trading-machine/data /opt/crypto-trading-machine/logs
 
 [Install]
 WantedBy=multi-user.target

@@ -6,6 +6,7 @@ scripts must import from this module rather than hardcoding values.
 """
 from __future__ import annotations
 
+import os
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -15,7 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_ENV_PATH = _REPO_ROOT / ".env"
+_ENV_PATH = Path(os.environ.get("APP_ENV_FILE", _REPO_ROOT / ".env")).expanduser()
 
 
 class Timeframe(str, Enum):
