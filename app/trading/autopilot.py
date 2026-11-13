@@ -94,6 +94,14 @@ def _net_buy_position_qty(
 _PARTIAL_EXIT_REASONS = frozenset({"take_profit_1", "take_profit_2"})
 
 
+# A MARKET order can end EXPIRED/CANCELED after executing part of its quantity
+# (thin book). Those coins really moved, so they must be booked at the executed
+# quantity; ignoring them leaves an untracked, unprotected holding.
+_EXECUTED_STATUSES = (
+    OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED, OrderStatus.EXPIRED, OrderStatus.CANCELED,
+)
+
+
 @dataclass
 class AutopilotState:
     running: bool = False
@@ -993,11 +1001,12 @@ class Autopilot:
                 return False, reason
             order = await self._submit(symbol, OrderSide.SELL, sell_qty, list(getattr(sig, "contributing_agents", []) or []))
             ok = self._order_filled(order)
+            reached_exchange, response_label, outcome = self._order_outcome_labels(order)
             if getattr(sig, "decision_id", None) is not None:
                 storage.update_tick_execution(
                     sig.decision_id,
-                    outcome="executed" if ok else "rejected: Binance rejected order",
-                    submitted=True,
+                    outcome=outcome,
+                    submitted=reached_exchange,
                     filled=ok,
                     client_order_id=getattr(order, "client_order_id", None) if order else None,
                     risk_passed=True,
@@ -1010,13 +1019,13 @@ class Autopilot:
                 risk_passed=True,
                 position_exists=position_exists,
                 available_balance=sell_qty,
-                execution_attempted=True,
+                execution_attempted=reached_exchange,
                 min_notional_passed=True,
-                binance_response=(getattr(order, "status", "NONE") if order else "NONE"),
-                final_outcome=("executed" if ok else "rejected: Binance rejected order"),
+                binance_response=response_label,
+                final_outcome=outcome,
                 detail={"order_id": getattr(order, "exchange_order_id", None) if order else None},
             )
-            return ok, ("executed" if ok else "Binance rejected order")
+            return ok, outcome
 
         # BUY path
         entry_block_reason = self._entry_block_reason()
@@ -1097,11 +1106,12 @@ class Autopilot:
             list(getattr(sig, "contributing_agents", []) or []),
         )
         ok = self._order_filled(order)
+        reached_exchange, response_label, outcome = self._order_outcome_labels(order)
         if getattr(sig, "decision_id", None) is not None:
             storage.update_tick_execution(
                 sig.decision_id,
-                outcome="executed" if ok else "rejected: Binance rejected order",
-                submitted=True,
+                outcome=outcome,
+                submitted=reached_exchange,
                 filled=ok,
                 client_order_id=getattr(order, "client_order_id", None) if order else None,
                 risk_passed=True,
@@ -1115,12 +1125,12 @@ class Autopilot:
             position_exists=position_exists,
             available_balance=usdt_free,
             min_notional_passed=True,
-            execution_attempted=True,
-            binance_response=(getattr(order, "status", "NONE") if order else "NONE"),
-            final_outcome=("executed" if ok else "rejected: Binance rejected order"),
+            execution_attempted=reached_exchange,
+            binance_response=response_label,
+            final_outcome=outcome,
             detail={"plan": _jsonable(plan), "order_id": getattr(order, "exchange_order_id", None) if order else None},
         )
-        return ok, ("executed" if ok else "Binance rejected order")
+        return ok, outcome
 
     async def _execute(self, signals, *, allow_buys: bool = True) -> None:
         skip_counter: Counter[str] = Counter()
@@ -2598,9 +2608,10 @@ class Autopilot:
         )
         filled = self._order_filled(order)
         if getattr(sig, "decision_id", None) is not None:
+            _reached, _status, outcome = self._order_outcome_labels(order)
             storage.update_tick_execution(
                 sig.decision_id,
-                outcome="executed" if filled else "rejected: exchange did not fill BUY",
+                outcome=outcome,
                 submitted=order is not None,
                 filled=filled,
                 client_order_id=getattr(order, "client_order_id", None) if order else None,
@@ -2643,15 +2654,38 @@ class Autopilot:
         order = await self._submit(symbol, OrderSide.SELL, qty, agents)
         filled = self._order_filled(order)
         if getattr(sig, "decision_id", None) is not None:
+            _reached, _status, outcome = self._order_outcome_labels(order)
             storage.update_tick_execution(
                 sig.decision_id,
-                outcome="executed" if filled else "rejected: exchange did not fill SELL",
+                outcome=outcome,
                 submitted=order is not None,
                 filled=filled,
                 client_order_id=getattr(order, "client_order_id", None) if order else None,
                 risk_passed=True,
             )
         return filled
+
+    def _order_outcome_labels(self, order: Optional[Order]) -> tuple[bool, str, str]:
+        """(reached_exchange, binance_response, final_outcome) for an order result.
+
+        `_submit` returns None when it refused internally (locks, unresolved
+        intents, final safety check) or the exchange confirmed the order absent;
+        none of those is a Binance rejection.
+        """
+        if order is None:
+            return False, "NOT_SUBMITTED", "rejected: not submitted (internal)"
+        status = order.status.value
+        if order.status is OrderStatus.DRY_RUN:
+            return False, status, "simulated: dry-run order, nothing sent"
+        if self._order_filled(order):
+            return True, status, "executed"
+        if self.state.mode == "paper":
+            return False, status, f"simulated: paper order status {status}"
+        if order.status is OrderStatus.REJECTED and not order.exchange_order_id:
+            # The client's own kill-switch boundary returns REJECTED without
+            # contacting Binance.US; only an exchange order id proves it was sent.
+            return False, "NOT_SUBMITTED", "rejected: not submitted (client kill switch)"
+        return True, status, f"rejected: exchange status {status}"
 
     @staticmethod
     def _order_filled(order: Optional[Order]) -> bool:
@@ -2666,7 +2700,7 @@ class Autopilot:
         if order is None:
             return False
         filled = order.filled_quantity or Decimal("0")
-        return order.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED) and filled > 0
+        return order.status in _EXECUTED_STATUSES and filled > 0
 
     # ── Exchange-native protective stops (OFF by default; flag + canary gated) ──
     def _stop_allowed(self, symbol: str) -> bool:
@@ -3013,9 +3047,7 @@ class Autopilot:
             # next SELL could try to over-dump. Use the executed quantity and
             # the real average fill price so our book matches Binance exactly.
             filled = order.filled_quantity or Decimal("0")
-            if order.status not in (
-                OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED
-            ) or filled <= 0:
+            if not self._order_filled(order):
                 log.error(
                     "LIVE order NOT filled — not recording: %s %s qty=%s status=%s "
                     "filled=%s coid=%s",

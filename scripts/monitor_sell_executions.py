@@ -18,12 +18,12 @@ sys.path.insert(0, str(REPO_ROOT))
 DB_PATH = REPO_ROOT / "data" / "cache" / "trading.db"
 
 from app.exchange import BinanceUSClient
+from app.trading import audit_labels
 
 
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
+    # Read-only: a monitor must never migrate or write the trading DB.
+    return audit_labels.connect_readonly(DB_PATH)
 
 
 def check_sells() -> int:
@@ -52,31 +52,34 @@ def check_sells() -> int:
             print("❌ No SELL orders found in database")
 
         pending = c.execute(
-            """
-            SELECT ts, mode, symbol, signal, confidence, final_outcome
+            f"""
+            SELECT ts, mode, symbol, signal, confidence, final_outcome,
+                   execution_attempted, binance_response, detail
             FROM trade_audit
             WHERE signal='SELL'
               AND final_outcome NOT IN ('executed', 'executed_sell')
+              AND NOT {audit_labels.SQL_IS_TEST_FIXTURE}
             ORDER BY id DESC
             LIMIT 5
             """
         ).fetchall()
 
         if pending:
-            print("\n⏳ Pending SELL attempts (not executed):")
+            print("\n⏳ Recent SELL decisions that did not fill:")
             for p in pending:
                 conf = p["confidence"] if p["confidence"] is not None else "-"
                 print(
                     "  - "
                     f"[{p['mode']}] {p['symbol']} conf={conf} "
+                    f"[{audit_labels.stage_label(dict(p))}] "
                     f"reason={p['final_outcome']} at {p['ts']}"
                 )
         else:
-            print("\n✅ No pending SELL rejections in recent audit window")
+            print("\n✅ No unfilled SELL decisions in recent audit window")
 
         recent = c.execute(
             """
-            SELECT ts, symbol, reason, executed
+            SELECT ts, mode, symbol, reason, executed
             FROM tick_audit
             WHERE action='SELL'
             ORDER BY id DESC
@@ -88,7 +91,8 @@ def check_sells() -> int:
             for r in recent:
                 print(
                     "  - "
-                    f"{r['symbol']} executed={int(r['executed'])} reason={r['reason']} at {r['ts']}"
+                    f"[{r['mode']}] {r['symbol']} executed={int(r['executed'])} "
+                    f"reason={r['reason']} at {r['ts']}"
                 )
 
     return 0
@@ -123,12 +127,13 @@ def _trx_recent_sell(c: sqlite3.Connection, since: datetime) -> sqlite3.Row | No
 
 def _trx_latest_trade_audit_sell(c: sqlite3.Connection) -> sqlite3.Row | None:
         return c.execute(
-                """
+                f"""
                 SELECT id, ts, symbol, signal, confidence, final_outcome, detail
                 FROM trade_audit
                 WHERE mode='live'
                     AND symbol='TRXUSDT'
                     AND signal='SELL'
+                    AND NOT {audit_labels.SQL_IS_TEST_FIXTURE}
                 ORDER BY id DESC
                 LIMIT 1
                 """

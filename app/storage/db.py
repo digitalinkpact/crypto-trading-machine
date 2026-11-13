@@ -50,6 +50,27 @@ CREATE TABLE IF NOT EXISTS order_intents (
     response TEXT NOT NULL
 );
 
+-- Independent exchange verification of live orders (app/trading/fill_reconcile.py).
+-- One row per client order id, upserted on every check; never touches orders.
+CREATE TABLE IF NOT EXISTS fill_reconciliation (
+    client_order_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT,
+    exchange_order_id TEXT,
+    exchange_status TEXT,
+    stage TEXT NOT NULL,
+    executed_qty TEXT,
+    trade_qty TEXT,
+    trade_quote_qty TEXT,
+    trade_count INTEGER NOT NULL DEFAULT 0,
+    commission TEXT,
+    local_qty TEXT,
+    discrepancy TEXT,
+    checked_at TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -338,7 +359,10 @@ class Storage:
         self._path = path or (directory / "trading.db")
         if running_under_pytest():
             temp_root = Path(tempfile.gettempdir()).resolve()
-            if not self._path.resolve().is_relative_to(temp_root):
+            resolved = self._path.resolve()
+            # A checkout can itself live under the temp dir; its data/ is never a test DB.
+            repo_root = Path(__file__).resolve().parents[2]
+            if not resolved.is_relative_to(temp_root) or resolved.is_relative_to(repo_root):
                 raise RuntimeError(
                     f"Refusing to open non-temporary database {self._path} under pytest"
                 )
@@ -655,6 +679,64 @@ class Storage:
                 (mode, client_order_id),
             ).fetchone()
         return dict(row) if row else None
+
+    def upsert_fill_reconciliation(self, row: dict) -> None:
+        cols = ("client_order_id", "mode", "symbol", "side", "exchange_order_id", "exchange_status",
+                "stage", "executed_qty", "trade_qty", "trade_quote_qty", "trade_count", "commission",
+                "local_qty", "discrepancy", "checked_at", "detail")
+        values = [row.get(col) for col in cols]
+        values[cols.index("checked_at")] = row.get("checked_at") or _now()
+        values[cols.index("trade_count")] = int(row.get("trade_count") or 0)
+        for name in ("commission", "detail"):
+            idx = cols.index(name)
+            if not isinstance(values[idx], str) and values[idx] is not None:
+                values[idx] = json.dumps(values[idx], default=str)
+        values[cols.index("detail")] = values[cols.index("detail")] or "{}"
+        updates = ",".join(f"{col}=excluded.{col}" for col in cols[1:])
+        with self._lock, self._conn() as connection:
+            connection.execute(
+                f"INSERT INTO fill_reconciliation({','.join(cols)}) VALUES({','.join('?' * len(cols))}) "
+                f"ON CONFLICT(client_order_id) DO UPDATE SET {updates}",
+                values,
+            )
+
+    def fill_reconciliation(self, client_order_id: str) -> Optional[dict]:
+        with self._lock, self._conn() as connection:
+            row = connection.execute(
+                "SELECT * FROM fill_reconciliation WHERE client_order_id=?", (client_order_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def fill_reconciliations(self, mode: str, limit: int = 100) -> list[dict]:
+        with self._lock, self._conn() as connection:
+            rows = connection.execute(
+                "SELECT * FROM fill_reconciliation WHERE mode=? ORDER BY checked_at DESC LIMIT ?",
+                (mode, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def order_intents_for_reconciliation(self, mode: str, limit: int = 200) -> list[dict]:
+        """Intents still unresolved, plus recorded ones not yet exchange-verified."""
+        with self._lock, self._conn() as connection:
+            rows = connection.execute(
+                "SELECT i.* FROM order_intents i LEFT JOIN fill_reconciliation r "
+                "ON r.client_order_id = i.client_order_id "
+                "WHERE i.mode=? AND (i.status IN ('SUBMITTING','UNKNOWN','NEW','PARTIALLY_FILLED') "
+                "OR (i.status='FILLED' AND i.recorded=0) OR r.client_order_id IS NULL OR r.discrepancy IS NOT NULL "
+                "OR r.stage NOT IN ('FILLED_VERIFIED','PARTIAL_TERMINAL_VERIFIED','CANCELED','EXPIRED',"
+                "'EXCHANGE_REJECTED','NOT_ON_EXCHANGE')) "
+                "ORDER BY i.updated_at DESC LIMIT ?",
+                (mode, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def resolve_order_intent(self, client_order_id: str, status: str) -> None:
+        """Move an intent to an exchange-confirmed terminal status (keeps response/recorded)."""
+        with self._lock, self._conn() as connection:
+            connection.execute(
+                "UPDATE order_intents SET status=?, updated_at=? WHERE client_order_id=?",
+                (status, _now(), client_order_id),
+            )
 
     def record_live_fill(
         self, *, symbol, side, qty, position_qty, price, client_order_id, agents,
@@ -1208,7 +1290,7 @@ class Storage:
         with self._lock, self._conn() as c:
             rows = c.execute(
                 "SELECT * FROM trade_audit WHERE (? IS NULL OR mode=?) "
-                "AND (? OR NOT (json_valid(detail) AND json_extract(detail, '$.agents') = '[\"test\"]')) "
+                "AND (? OR NOT (json_valid(detail) AND json_extract(detail, '$.agents') IS '[\"test\"]')) "
                 "ORDER BY id DESC LIMIT ?",
                 (mode, mode, int(include_test), limit),
             ).fetchall()

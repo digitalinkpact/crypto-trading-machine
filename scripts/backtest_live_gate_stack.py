@@ -56,6 +56,13 @@ VARIANTS = (
     Variant("no pullback confirmation", settings={"pullback_require_candidate_confirmation": False}),
     Variant("no gates, threshold 0 (raw setups)", threshold=0, market_gate=False,
             strong_bull=False, breadth_gate=False),
+    # Simulation-only exit-ladder experiments (entry gates unchanged).
+    Variant("SIM exit: trail arms +3%", settings={"trailing_activation_pct": 0.03}),
+    Variant("SIM exit: ATR stop 3x (4-12%)",
+            settings={"atr_stop_multiple": 3.0, "atr_stop_max_pct": 0.12}),
+    Variant("SIM exit: max hold 8d", settings={"max_hold_hours": 192}),
+    Variant("SIM raw setups + trail +3%", threshold=0, market_gate=False, strong_bull=False,
+            breadth_gate=False, settings={"trailing_activation_pct": 0.03}),
 )
 
 
@@ -103,9 +110,10 @@ def _score(strategy: ProfitStreamStrategy, df: pd.DataFrame, btc_df: pd.DataFram
     return score, (dip_ready or pullback_ready) and filt_ok, dip_ready
 
 
-def _simulate_exit(df: pd.DataFrame, entry_i: int, entry_px: float, cost: float) -> tuple[float, int]:
+def _simulate_exit(df: pd.DataFrame, entry_i: int, entry_px: float, cost: float,
+                   s=None) -> tuple[float, int]:
     """Daily-bar risk ladder. Returns (net return fraction, exit bar index)."""
-    s = get_settings()
+    s = s or get_settings()
     atr_pct = float(df["atr_14"].iloc[entry_i - 1] / df["close"].iloc[entry_i - 1]) \
         if "atr_14" in df.columns else s.stop_loss_pct
     stop_pct = min(max(s.atr_stop_multiple * atr_pct, s.atr_stop_min_pct), s.atr_stop_max_pct)
@@ -144,8 +152,13 @@ def _metrics(returns: list[float], position_pct: float) -> dict:
     wins, losses = r[r > 0], r[r <= 0]
     equity = np.cumprod(1 + r * position_pct)
     dd = float(np.max(1 - equity / np.maximum.accumulate(equity)))
+    rng = np.random.default_rng(7)
+    boots = rng.choice(r, size=(2000, len(r)), replace=True).mean(axis=1) * 100
     return {
         "trades": len(r),
+        "avg_win_pct": float(wins.mean() * 100) if len(wins) else 0.0,
+        "avg_loss_pct": float(losses.mean() * 100) if len(losses) else 0.0,
+        "exp_ci95": (float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))),
         "win_rate": float(len(wins) / len(r)),
         "profit_factor": float(wins.sum() / -losses.sum()) if losses.sum() < 0 else float("inf"),
         "expectancy_pct": float(r.mean() * 100),
@@ -165,7 +178,8 @@ def run_variant(variant: Variant, frames: dict[str, pd.DataFrame], cost: float,
         btc = frames["BTCUSDT"]
         dates = btc.index[260:]
         held_until: dict[str, pd.Timestamp] = {}
-        trades: list[tuple[pd.Timestamp, float]] = []
+        trades: list[tuple[pd.Timestamp, float, int]] = []
+        best_scores: list[int] = []
         stats = {"days": 0, "score_ge_threshold": 0, "blocked_market": 0,
                  "blocked_strong_bull": 0, "blocked_breadth": 0, "regime_ge2_days": 0}
         for d in dates:
@@ -184,6 +198,7 @@ def run_variant(variant: Variant, frames: dict[str, pd.DataFrame], cost: float,
                 if i < 60 or i + 1 >= len(f):
                     continue
                 score, ready, _ = _score(strategy, f.iloc[: i + 1], btc_slice, regime)
+                best_scores.append(score)
                 if not ready or score < variant.threshold:
                     continue
                 stats["score_ge_threshold"] += 1
@@ -197,13 +212,23 @@ def run_variant(variant: Variant, frames: dict[str, pd.DataFrame], cost: float,
                     stats["blocked_breadth"] += 1
                     continue
                 entry_px = float(f["open"].iloc[i + 1]) * (1 + cost / 2)
-                ret, exit_i = _simulate_exit(f, i + 1, entry_px, cost)
+                ret, exit_i = _simulate_exit(f, i + 1, entry_px, cost, settings)
                 held_until[sym] = f.index[exit_i]
-                trades.append((d, ret))
-        ins = [r for d, r in trades if d < split]
-        oos = [r for d, r in trades if d >= split]
+                trades.append((d, ret, regime))
+        ins = [r for d, r, _ in trades if d < split]
+        oos = [r for d, r, _ in trades if d >= split]
         pct = float(settings.max_position_pct)
-        return {"variant": variant.name, **stats,
+        by_regime = {}
+        for bucket, test in (("bear(<0)", lambda g: g < 0), ("neutral(0-1)", lambda g: 0 <= g < 2),
+                             ("bull(>=2)", lambda g: g >= 2)):
+            by_regime[bucket] = _metrics([r for _, r, g in trades if test(g)], pct)
+        sc = np.array(best_scores) if best_scores else np.zeros(1)
+        stats["score_max"] = int(sc.max())
+        stats["score_ge70"] = int((sc >= 70).sum())
+        stats["score_ge80"] = int((sc >= 80).sum())
+        stats["score_evals"] = int(len(best_scores))
+        return {"variant": variant.name, **stats, "by_regime": by_regime,
+                "all": _metrics([r for _, r, _ in trades], pct),
                 "in_sample": _metrics(ins, pct), "out_of_sample": _metrics(oos, pct)}
     finally:
         strategy_module.get_settings = original
@@ -212,8 +237,11 @@ def run_variant(variant: Variant, frames: dict[str, pd.DataFrame], cost: float,
 def _fmt(m: dict) -> str:
     if not m.get("trades"):
         return "trades=0"
+    lo, hi = m["exp_ci95"]
     return (f"trades={m['trades']:3d} win={m['win_rate']:.0%} PF={m['profit_factor']:.2f} "
-            f"exp={m['expectancy_pct']:+.2f}% DD={m['max_dd_pct']:.2f}% ret={m['return_pct']:+.2f}%")
+            f"exp={m['expectancy_pct']:+.2f}% [95%CI {lo:+.2f},{hi:+.2f}] "
+            f"avgW={m['avg_win_pct']:+.2f}% avgL={m['avg_loss_pct']:+.2f}% "
+            f"DD={m['max_dd_pct']:.2f}% ret={m['return_pct']:+.2f}%")
 
 
 def main() -> None:
@@ -238,8 +266,13 @@ def main() -> None:
         print(f"\n[{res['variant']}] regime>=2 days={res['regime_ge2_days']}/{res['days']} "
               f"setups>=thr={res['score_ge_threshold']} blocked market={res['blocked_market']} "
               f"strong_bull={res['blocked_strong_bull']} breadth={res['blocked_breadth']}")
+        print(f"   scores: max={res['score_max']} >=70:{res['score_ge70']} >=80:{res['score_ge80']} "
+              f"of {res['score_evals']} symbol-days")
         print(f"   IS : {_fmt(res['in_sample'])}")
         print(f"   OOS: {_fmt(res['out_of_sample'])}")
+        print(f"   ALL: {_fmt(res['all'])}")
+        for bucket, m in res["by_regime"].items():
+            print(f"     {bucket:13s} {_fmt(m)}")
 
 
 if __name__ == "__main__":

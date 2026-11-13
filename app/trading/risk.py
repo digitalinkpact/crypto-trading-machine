@@ -49,18 +49,31 @@ def _tp2_key(symbol: str) -> str:
     return f"tp2:{getattr(get_settings(), 'ledger_mode', 'paper')}:{symbol}"
 
 
+def _put(key: str, value) -> None:
+    """Write mode-scoped risk state; mirror live state to the legacy key.
+
+    Releases up to 7819d3b read unprefixed `hwm:/lwm:/tp1:/tp2:<symbol>` keys
+    for the live ledger. Mirroring keeps a rollback from acting on stale
+    TP/trailing state (e.g. re-firing TP1 that already executed).
+    """
+    storage.kv_set(key, value)
+    prefix, mode, symbol = key.split(":", 2)
+    if mode == "live":
+        storage.kv_set(f"{prefix}:{symbol}", value)
+
+
 def update_hwm(symbol: str, price: Decimal) -> Decimal:
     """Track per-position high-water mark for trailing-stop."""
     cur = storage.kv_get(_hwm_key(symbol))
     cur_d = Decimal(str(cur)) if cur is not None else Decimal("0")
     new = max(cur_d, price)
     if new != cur_d:
-        storage.kv_set(_hwm_key(symbol), str(new))
+        _put(_hwm_key(symbol), str(new))
     return new
 
 
 def clear_hwm(symbol: str) -> None:
-    storage.kv_set(_hwm_key(symbol), None)
+    _put(_hwm_key(symbol), None)
 
 
 def update_lwm(symbol: str, price: Decimal) -> Decimal:
@@ -68,17 +81,17 @@ def update_lwm(symbol: str, price: Decimal) -> Decimal:
     used to compute MAE (maximum adverse excursion) at close time."""
     cur = storage.kv_get(_lwm_key(symbol))
     if cur is None:
-        storage.kv_set(_lwm_key(symbol), str(price))
+        _put(_lwm_key(symbol), str(price))
         return price
     cur_d = Decimal(str(cur))
     new = min(cur_d, price)
     if new != cur_d:
-        storage.kv_set(_lwm_key(symbol), str(new))
+        _put(_lwm_key(symbol), str(new))
     return new
 
 
 def clear_lwm(symbol: str) -> None:
-    storage.kv_set(_lwm_key(symbol), None)
+    _put(_lwm_key(symbol), None)
 
 
 def get_lwm(symbol: str) -> Optional[Decimal]:
@@ -106,11 +119,11 @@ def mfe_mae_pct(symbol: str, entry_price: Decimal) -> tuple[Optional[float], Opt
 
 
 def mark_tp1_taken(symbol: str) -> None:
-    storage.kv_set(_tp1_key(symbol), True)
+    _put(_tp1_key(symbol), True)
 
 
 def clear_tp1(symbol: str) -> None:
-    storage.kv_set(_tp1_key(symbol), None)
+    _put(_tp1_key(symbol), None)
 
 
 def tp1_taken(symbol: str) -> bool:
@@ -118,11 +131,11 @@ def tp1_taken(symbol: str) -> bool:
 
 
 def mark_tp2_taken(symbol: str) -> None:
-    storage.kv_set(_tp2_key(symbol), True)
+    _put(_tp2_key(symbol), True)
 
 
 def clear_tp2(symbol: str) -> None:
-    storage.kv_set(_tp2_key(symbol), None)
+    _put(_tp2_key(symbol), None)
 
 
 def tp2_taken(symbol: str) -> bool:

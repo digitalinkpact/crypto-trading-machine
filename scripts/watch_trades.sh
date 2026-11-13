@@ -1,49 +1,39 @@
 #!/bin/bash
-# Real-time trade execution monitor
-# Shows: executed trades, positions held, rejection reasons
+# Read-only trade monitor (every 60s): fills, submitted-not-filled, internal
+# gate reasons, tracked positions. Never calls signed exchange endpoints.
+# Usage: scripts/watch_trades.sh [live|paper]
 
-TARGET_POSITIONS=10
+MODE="${1:-live}"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHON="${PYTHON:-$REPO_ROOT/.venv/bin/python}"
+[ -x "$PYTHON" ] || PYTHON=python3
 
 while true; do
-  cd /workspaces/crypto-trading-machine
-  
-  python3 << 'PYSCRIPT'
-import asyncio
-from collections import defaultdict
-from app.storage import storage
-from app.exchange import BinanceUSClient
+  (cd "$REPO_ROOT" && MONITOR_MODE="$MODE" "$PYTHON" - <<'PYSCRIPT'
+import os
+from collections import Counter
 from datetime import datetime, timezone
 
-async def monitor():
-    trades = storage.recent_trade_audit(limit=500)
-    buy_exec = sum(1 for t in trades if t.get("signal") == "BUY" and t.get("execution_attempted"))
-    sell_exec = sum(1 for t in trades if t.get("signal") == "SELL" and t.get("execution_attempted"))
-    
-    client = BinanceUSClient()
-    account = await client.account()
-    balances = account.get("balances", [])
-    positions = sum(1 for b in balances if (float(b["free"]) + float(b["locked"])) > 0 and b["asset"] != "USDT")
-    
-    rejections = defaultdict(int)
-    for t in trades:
-        if not t.get("execution_attempted"):
-            rejections[t.get("final_outcome", "unknown")] += 1
-    
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    
-    # Status indicator
-    trade_status = "✅" if (buy_exec + sell_exec) > 0 else "⏳"
-    pos_status = "✅" if positions == 10 else f"⚠️ " if positions < 10 else "❌"
-    
-    print(f"\n[{ts}] TRADE MONITOR")
-    print(f"  {trade_status} Executions: {buy_exec} BUY + {sell_exec} SELL")
-    print(f"  {pos_status} Positions:   {positions}/10 held")
-    print(f"  Rejections (top 3):")
-    for reason, count in sorted(rejections.items(), key=lambda x: -x[1])[:3]:
-        print(f"    - {reason:20} {count}x")
+from app.trading import audit_labels
 
-asyncio.run(monitor())
+mode = os.environ["MONITOR_MODE"]
+with audit_labels.connect_readonly() as conn:
+    rows = audit_labels.fetch_trade_audit(conn, mode=mode, limit=500)
+    positions = conn.execute("SELECT COUNT(*) FROM positions WHERE mode=?", (mode,)).fetchone()[0]
+
+stages = Counter((audit_labels.execution_stage(r), r.get("signal")) for r in rows)
+internal = Counter(audit_labels.rejection_reason(r) for r in rows
+                   if audit_labels.execution_stage(r) == audit_labels.INTERNAL_REJECTED)
+not_filled = sum(n for (stage, _), n in stages.items() if stage == audit_labels.SUBMITTED_NOT_FILLED)
+
+print(f"\n[{datetime.now(timezone.utc):%H:%M:%S} UTC] TRADE MONITOR mode={mode} (last 500 decisions)")
+print(f"  Filled on Binance.US: {stages[(audit_labels.FILLED, 'BUY')]} BUY + {stages[(audit_labels.FILLED, 'SELL')]} SELL")
+print(f"  Submitted, not filled: {not_filled}")
+print(f"  Tracked open positions: {positions}")
+print("  Internal gate reasons (not sent to Binance.US), top 3:")
+for reason, count in internal.most_common(3):
+    print(f"    - {reason:28} {count}x")
 PYSCRIPT
-
+  )
   sleep 60
 done

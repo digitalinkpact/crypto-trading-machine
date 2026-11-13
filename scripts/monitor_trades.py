@@ -1,76 +1,77 @@
 #!/usr/bin/env python3
-"""Monitor trade executions in real-time."""
+"""Poll trade decisions every 30s (read-only): `python -m scripts.monitor_trades`.
+
+Filled orders, orders submitted but not filled, and internal gate rejections
+are counted separately. Pytest fixture rows are excluded.
+"""
+import argparse
 import asyncio
 import sys
-from datetime import datetime, timezone
 from collections import deque
-from app.storage import storage
+from datetime import datetime, timezone
+
 from app.logging_setup import get_logger
+from app.trading import audit_labels
 
 log = get_logger(__name__)
 
-# Track trades from the audit log
-last_id = 0
-execution_count = 0
-recent_trades = deque(maxlen=20)
+
+class TradeFeed:
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+        self.last_id = 0
+        self.counts = {stage: 0 for stage in audit_labels.STAGE_LABELS}
+        self.recent: deque[str] = deque(maxlen=20)
+
+    def poll(self, conn) -> None:
+        rows = audit_labels.fetch_trade_audit(conn, mode=self.mode, after_id=self.last_id, limit=500)
+        for row in reversed(rows):
+            stage = audit_labels.execution_stage(row)
+            self.counts[stage] += 1
+            detail = (audit_labels.rejection_reason(row) if stage == audit_labels.INTERNAL_REJECTED
+                      else row.get("binance_response"))
+            self.recent.append(f"{row.get('ts', '')} [{row.get('symbol', '?')}] {row.get('signal', '?'):4} "
+                               f"{audit_labels.STAGE_LABELS[stage]} ({detail})")
+            if stage == audit_labels.FILLED:
+                log.info("FILLED: %s %s", row.get("symbol"), row.get("signal"))
+            self.last_id = max(self.last_id, int(row["id"]))
+
+    def render(self) -> list[str]:
+        c = self.counts
+        lines = [
+            f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC] mode={self.mode}",
+            f"  filled on Binance.US:            {c[audit_labels.FILLED]}",
+            f"  submitted, not filled:           {c[audit_labels.SUBMITTED_NOT_FILLED]}",
+            f"  internal gate (not submitted):   {c[audit_labels.INTERNAL_REJECTED]}",
+            f"  simulated (paper/dry-run):       {c[audit_labels.SIMULATED]}",
+        ]
+        if self.recent:
+            lines.append("  Recent activity:")
+            lines.extend(f"    {entry}" for entry in list(self.recent)[-5:])
+        else:
+            lines.append("  (no decisions yet)")
+        return lines
 
 
-async def monitor_trades():
-    """Monitor execution of BUY/SELL orders."""
-    global last_id, execution_count
-    
+async def monitor(mode: str, interval: int) -> None:
+    feed = TradeFeed(mode)
     while True:
         try:
-            # Fetch recent audit records
-            trades = storage.recent_trade_audit(limit=100)
-            
-            for trade in trades:
-                trade_id = trade.get("id", 0)
-                if trade_id > last_id:
-                    # New trade record
-                    symbol = trade.get("symbol", "?")
-                    signal = trade.get("signal", "?")
-                    outcome = trade.get("final_outcome", "?")
-                    attempted = trade.get("execution_attempted", False)
-                    timestamp = trade.get("timestamp", "")
-                    
-                    status = "✅ EXECUTED" if attempted else f"⚠️  REJECTED ({outcome})"
-                    
-                    trade_info = f"[{symbol}] {signal:4} {status}"
-                    recent_trades.append(trade_info)
-                    
-                    if attempted:
-                        execution_count += 1
-                        log.info(f"TRADE EXECUTED: {symbol} {signal}")
-                    
-                    last_id = max(last_id, trade_id)
-            
-            # Display summary
-            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            print(f"\n[{timestamp}] Executions: {execution_count}")
-            
-            if recent_trades:
-                print("  Recent activity:")
-                for trade in list(recent_trades)[-5:]:
-                    print(f"    {trade}")
-            else:
-                print("  (waiting for first tick...)")
-            
-            await asyncio.sleep(30)
-            
-        except Exception as e:
-            log.error(f"Monitor error: {e}")
-            await asyncio.sleep(30)
+            with audit_labels.connect_readonly() as conn:
+                feed.poll(conn)
+            print("\n" + "\n".join(feed.render()))
+        except Exception as exc:  # noqa: BLE001 - keep monitoring through transient DB errors
+            log.error("Monitor error: %s", exc)
+        await asyncio.sleep(interval)
 
 
 if __name__ == "__main__":
-    print("=" * 70)
-    print("TRADE EXECUTION MONITOR")
-    print("=" * 70)
-    print("Monitoring orders every 30 seconds...\n")
-    
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", default="live", choices=("live", "paper"))
+    parser.add_argument("--interval", type=int, default=30)
+    args = parser.parse_args()
+    print("=" * 70 + "\nTRADE EXECUTION MONITOR (read-only)\n" + "=" * 70)
     try:
-        asyncio.run(monitor_trades())
+        asyncio.run(monitor(args.mode, args.interval))
     except KeyboardInterrupt:
-        print(f"\n\nMonitor stopped. Total executions: {execution_count}")
         sys.exit(0)

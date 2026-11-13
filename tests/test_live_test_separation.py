@@ -62,7 +62,12 @@ def test_live_diagnostics_exclude_test_tagged_audit_rows(tmp_path):
         **common, execution_attempted=False, binance_response="NOT_SUBMITTED",
         final_outcome="market_gate", detail={"agents": ["profitstream_strategy"]},
     )
+    # Genuine rows without an agents key must not be hidden by the test filter.
+    store.record_trade_audit(
+        **common, execution_attempted=False, binance_response="",
+        final_outcome="live_buy_kill_switch", detail={},
+    )
 
     live = store.recent_trade_audit(mode="live")
-    assert [row["final_outcome"] for row in live] == ["market_gate"]
-    assert len(store.recent_trade_audit(mode="live", include_test=True)) == 2
+    assert [row["final_outcome"] for row in live] == ["live_buy_kill_switch", "market_gate"]
+    assert len(store.recent_trade_audit(mode="live", include_test=True)) == 3

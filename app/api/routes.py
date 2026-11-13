@@ -18,6 +18,7 @@ from app.credentials import (
     save_trading_mode,
 )
 from app.storage import storage
+from app.trading import audit_labels
 from app.trading.autopilot import autopilot
 from app.trading.portfolio import portfolio_snapshot
 from app.exchange.ws_stream import live_prices
@@ -131,6 +132,19 @@ def _mode_pill() -> str:
     return "<span class='pill real'>LIVE &mdash; REAL MONEY</span>"
 
 
+def _audit_stage_text(row: dict) -> str:
+    """Dashboard text for a trade_audit row; internal gates never read as Binance."""
+    if not row:
+        return "Unavailable"
+    stage = audit_labels.execution_stage(row)
+    text = audit_labels.STAGE_LABELS[stage]
+    if stage == audit_labels.INTERNAL_REJECTED:
+        text += f" ({audit_labels.rejection_reason(row)})"
+    elif stage == audit_labels.SUBMITTED_NOT_FILLED:
+        text += f" (exchange status {row.get('binance_response')})"
+    return text
+
+
 def _execution_overview(snapshot: dict | None) -> dict:
     from app.trading.watchdog import get_scheduler_status
 
@@ -159,6 +173,7 @@ def _execution_overview(snapshot: dict | None) -> dict:
         "app_started_at": _APP_STARTED_AT.isoformat(),
         "open_positions": len(positions),
         "orders": storage.order_summary(mode),
+        "fill_reconciliation": storage.kv_get("fill_reconciliation_last_run"),
         "available_usdt": str(snapshot["usdt_cash"]) if snapshot is not None else None,
         "realized_pnl_usdt": storage.total_realized_pnl(mode=mode),
         "unrealized_pnl_usdt": str(unrealized) if unrealized is not None else None,
@@ -552,7 +567,7 @@ async def dashboard() -> str:
     <h2>Trading monitor {_mode_pill()}</h2>
     <div class='row'><span>Last signal</span><b>{escape(str(latest_audit.get('signal') or 'Unavailable'))}</b></div>
     <div class='row'><span>Last order</span><b>{escape(str(latest_order.get('side', '') + ' ' + latest_order.get('symbol', '')).strip() or 'Unavailable')}</b></div>
-    <div class='row'><span>Last exchange response</span><b>{escape(str(latest_audit.get('binance_response') or 'Unavailable'))}</b></div>
+    <div class='row'><span>Last execution stage</span><b>{escape(_audit_stage_text(latest_audit))}</b></div>
     <div class='row'><span>Last exception</span><b>{escape(str(latest_audit.get('exception') or st.last_error or 'Unavailable'))}</b></div>
     <div class='row'><span>Open positions</span><b>{len([p for p in storage.all_positions() if p['mode'] == st.mode])}</b></div>
     <div class='row'><span>Account assets</span><b>{len(snap.get('all_balances', {})) if snap is not None else 'Unavailable'}</b></div>
@@ -961,7 +976,10 @@ async def metrics() -> dict:
 async def live_diagnostics() -> dict:
     health = storage.kv_get("health_status") or {}
     startup = storage.kv_get("startup_report") or {}
-    audit = storage.recent_trade_audit(limit=25)
+    audit = [
+        dict(row, execution_stage=audit_labels.execution_stage(row))
+        for row in storage.recent_trade_audit(limit=25, mode=get_settings().ledger_mode)
+    ]
     return {
         "health": health,
         "startup_report": startup,

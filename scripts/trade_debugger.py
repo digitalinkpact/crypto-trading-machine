@@ -17,7 +17,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import get_settings
-from app.storage import storage
+from app.trading import audit_labels
 
 _LAST_TICK_DEBUG_KEY = "autopilot_last_tick_debug"
 
@@ -41,6 +41,7 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help="Filter by symbol, e.g. BTCUSDT",
     )
+    parser.add_argument("--include-test", action="store_true", help="Also show pytest fixture rows")
     parser.add_argument(
         "--show-last-tick",
         action="store_true",
@@ -83,14 +84,7 @@ def _fmt_ts(ts: str) -> str:
 
 
 def _outcome_status(row: dict[str, Any]) -> str:
-    attempted = _to_bool(row.get("execution_attempted"))
-    resp = str(row.get("binance_response") or "").upper()
-    outcome = str(row.get("final_outcome") or "")
-    if attempted and resp in {"SUCCESS", "FILLED", "PARTIALLY_FILLED"}:
-        return "PASSED"
-    if attempted and outcome.startswith("executed"):
-        return "PASSED"
-    return "FAILED"
+    return audit_labels.stage_label(row).upper()
 
 
 def _print_header() -> None:
@@ -146,8 +140,11 @@ def _print_audit_row(row: dict[str, Any]) -> None:
         print(f"threshold: {threshold}")
     print(status)
     print(f"reason: {reason}")
-    print(f"submitted: {attempted}")
-    print(f"binance: {response or 'N/A'}")
+    print(f"submitted to exchange: {attempted}")
+    if _to_bool(row.get("execution_attempted")):
+        print(f"exchange status: {response or 'N/A'}")
+    else:
+        print("exchange status: N/A (internal decision, nothing sent to Binance.US)")
     _print_filters(filters)
 
 
@@ -162,8 +159,9 @@ def _matches_filters(row: dict[str, Any], args: argparse.Namespace) -> bool:
     return True
 
 
-def _print_last_tick_debug() -> None:
-    payload = storage.kv_get(_LAST_TICK_DEBUG_KEY) or {}
+def _print_last_tick_debug(conn) -> None:
+    row = conn.execute("SELECT value FROM kv WHERE key=?", (_LAST_TICK_DEBUG_KEY,)).fetchone()
+    payload = _as_dict(row["value"]) if row else {}
     if not payload:
         print("\nNo autopilot_last_tick_debug found in kv store.")
         return
@@ -199,17 +197,22 @@ def main() -> None:
 
     _print_header()
 
-    rows = storage.recent_trade_audit(limit=max(1, args.limit))
-    filtered = [r for r in rows if _matches_filters(r, args)]
+    # Read-only: a debugger must never migrate or write the trading DB.
+    with audit_labels.connect_readonly() as conn:
+        rows = audit_labels.fetch_trade_audit(
+            conn, mode=get_settings().ledger_mode, limit=max(1, args.limit),
+            include_test=args.include_test,
+        )
+        filtered = [r for r in rows if _matches_filters(r, args)]
 
-    if not filtered:
-        print("No matching trade_audit rows.")
-    else:
-        for row in filtered:
-            _print_audit_row(row)
+        if not filtered:
+            print("No matching trade_audit rows.")
+        else:
+            for row in filtered:
+                _print_audit_row(row)
 
-    if args.show_last_tick:
-        _print_last_tick_debug()
+        if args.show_last_tick:
+            _print_last_tick_debug(conn)
 
 
 if __name__ == "__main__":
