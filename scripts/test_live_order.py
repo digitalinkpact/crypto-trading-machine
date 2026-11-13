@@ -3,6 +3,9 @@
 Usage:
     python scripts/test_live_order.py --symbol BTCUSDT --quote-usdt 10
 
+By default the position is sold back immediately (round-trip, only costs
+fees/spread). Pass --keep to leave the bought position open.
+
 Requires LIVE mode (not paper), DRY_RUN=false and LIVE_BUYS_ENABLED=true for
 real execution. The SELL only unwinds the quantity this script BOUGHT (net of
 any commission paid in the base asset) — pre-existing holdings are untouched.
@@ -29,6 +32,10 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--quote-usdt", type=Decimal, default=Decimal("10"))
+    parser.add_argument(
+        "--keep", action="store_true",
+        help="keep the bought position open instead of selling it back",
+    )
     args = parser.parse_args()
 
     s = get_settings()
@@ -82,6 +89,11 @@ async def main() -> None:
     print(f"Post-BUY {base}: bought(net)={bought} free={base_free}")
     if base_free <= 0 or bought <= 0:
         raise RuntimeError("Position verification failed: no base balance after BUY")
+
+    if args.keep:
+        print(f"--keep set: leaving bought(net)={bought} {base} position open")
+        print("Live order diagnostic completed successfully (BUY only)")
+        return
 
     # Never sell more than this test bought — protects pre-existing holdings.
     sell_qty = filters.round_qty(args.symbol, min(bought, base_free))
