@@ -73,7 +73,7 @@ from app.exchange.ws_stream import live_prices
 from app.logging_setup import get_logger
 from app.storage import storage
 from app.trading import health
-from app.trading.autopilot import autopilot
+from app.trading.autopilot import LAST_COMPLETED_TICK_KEY, autopilot
 
 log = get_logger(__name__)
 
@@ -360,8 +360,10 @@ async def _health_loop() -> None:
                 )
                 status["actions"].append("restarted_scheduler" + ("_verified" if recovered else "_unverified"))
 
-            last_success = storage.kv_get("autopilot_last_success")
-            last_tick = datetime.fromisoformat(last_success) if last_success else None
+            # Must be the completed-evaluation heartbeat, not the last tick that
+            # traded: a tick whose signal is rejected by a protection is healthy.
+            last_completed = storage.kv_get(LAST_COMPLETED_TICK_KEY)
+            last_tick = datetime.fromisoformat(last_completed) if last_completed else None
             if autopilot.state.running and last_tick is not None:
                 age = (datetime.now(timezone.utc) - last_tick).total_seconds()
                 stale_after = int(s.health_tick_stale_seconds)

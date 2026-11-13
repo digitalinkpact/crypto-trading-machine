@@ -153,6 +153,7 @@ def _execution_overview(snapshot: dict | None) -> dict:
         "latest_tick": latest,
         "scheduler": get_scheduler_status(),
         "last_successful_tick_at": storage.kv_get("autopilot_last_success"),
+        "last_completed_tick_at": storage.kv_get("autopilot_last_completed_tick"),
         "last_technical_error": storage.kv_get("autopilot_last_technical_error"),
         "risk_evaluation": storage.kv_get("risk_loop_status"),
         "app_started_at": _APP_STARTED_AT.isoformat(),

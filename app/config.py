@@ -7,6 +7,7 @@ scripts must import from this module rather than hardcoding values.
 from __future__ import annotations
 
 import os
+import sys
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -15,8 +16,21 @@ from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def running_under_pytest() -> bool:
+    return (
+        "PYTEST_VERSION" in os.environ
+        or "PYTEST_CURRENT_TEST" in os.environ
+        or "_pytest" in sys.modules
+    )
+
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_ENV_PATH = Path(os.environ.get("APP_ENV_FILE", _REPO_ROOT / ".env")).expanduser()
+# A test run must never inherit the deployment's live credentials, even when
+# it is started on the server from a checkout that lacks tests/conftest.py.
+_ENV_PATH = Path(
+    os.environ.get("APP_ENV_FILE")
+    or (os.devnull if running_under_pytest() else _REPO_ROOT / ".env")
+).expanduser()
 
 
 class TradingMode(str, Enum):
@@ -754,7 +768,9 @@ class Settings(BaseSettings):
     loss_streak_pause_minutes: int = Field(60, ge=1, le=1440)
 
     # Health monitor / watchdog controls.
-    # If `autopilot.last_tick_at` is older than this, the trading loop is stale.
+    # If the last completed tick evaluation (kv `autopilot_last_completed_tick`,
+    # written for EXECUTED and BLOCKED ticks alike) is older than this, the
+    # trading loop is stale.
     health_tick_stale_seconds: int = Field(180, ge=30, le=86_400)
     # API latency warning threshold; informational, does not auto-stop process.
     health_latency_warn_seconds: float = Field(3.0, ge=0.1, le=120.0)

@@ -1309,6 +1309,10 @@ async def test_strong_bull_regime_mode_blocks_weak_bull(monkeypatch):
     assert info["filters"]["strong_bull_regime"]["ok"] is False
     assert info["final_reason"] == "strong_bull_regime"
     assert info["submitted"] is False
+    audit = autopilot_module.storage.recent_trade_audit(limit=1, mode="live", include_test=True)[0]
+    assert audit["final_outcome"] == "strong_bull_regime"
+    assert not audit["execution_attempted"]
+    assert audit["binance_response"] == "NOT_SUBMITTED"
 
 
 # ── stop-loss re-entry cooldown ─────────────────────────────────────────────

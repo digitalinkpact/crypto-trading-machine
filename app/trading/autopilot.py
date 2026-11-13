@@ -56,6 +56,7 @@ _BASELINE_HALT_KEY = "baseline_unavailable"
 _CIRCUIT_BREAKER_FAILURE_KEY = "circuit_breaker_check_failed"
 _FILTERS_HALT_KEY = "exchange_filters_unavailable"
 _ML_GATE_HALT_KEY = "ml_gate_unavailable"
+LAST_COMPLETED_TICK_KEY = "autopilot_last_completed_tick"
 
 
 def _net_buy_position_qty(
@@ -366,12 +367,14 @@ class Autopilot:
             return {**result, "status": "FAILED", "completed_at": datetime.now(timezone.utc).isoformat(),
                     "errors": [{"stage": "tick_admission", "type": type(exc).__name__}], "reasons": ["database_unavailable"]}
         token = current_execution.set(result)
+        evaluated = False
         try:
             if hasattr(settings, "ledger_mode") and settings.ledger_mode != self.state.mode:
                 result.update(status="BLOCKED", reasons=["mode_mismatch; offline migration required"])
             else:
                 timeout = max(5, int(getattr(settings, "autopilot_tick_timeout_seconds", 50)))
                 outcome = await asyncio.wait_for(self._tick_once(), timeout=timeout)
+                evaluated = outcome.get("status") in ("executed", "blocked")
                 result["reasons"] = outcome.get("reasons", [])
                 result["execution"] = outcome.get("execution", {})
                 result["risk_rejections"] = {
@@ -408,6 +411,10 @@ class Autopilot:
                 storage.record_tick_run(result)
                 if result["status"] == "EXECUTED":
                     storage.kv_set("autopilot_last_success", result["completed_at"])
+                # Liveness is "the pipeline evaluated the market", independent
+                # of whether a signal was traded or rejected by a protection.
+                if evaluated and not result["errors"]:
+                    storage.kv_set(LAST_COMPLETED_TICK_KEY, result["completed_at"])
                 if result["errors"]:
                     storage.kv_set("autopilot_last_technical_error", {"at": result["completed_at"], "errors": result["errors"]})
                 self._save()
@@ -1174,7 +1181,9 @@ class Autopilot:
                 available_balance=avail,
                 min_notional_passed=min_notional_passed,
                 execution_attempted=submitted,
-                binance_response=("SUCCESS" if submitted else "REJECTED"),
+                # submitted=True is only passed after a confirmed fill; internal
+                # gate rejections never reach Binance and must not look like it.
+                binance_response=("FILLED" if submitted else "NOT_SUBMITTED"),
                 exception=None,
                 final_outcome=reason,
                 detail=audit_detail,

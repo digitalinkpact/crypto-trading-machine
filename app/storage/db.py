@@ -9,6 +9,7 @@ import json
 import os
 import pickle
 import sqlite3
+import tempfile
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -16,7 +17,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from app.config import get_settings
+from app.config import get_settings, running_under_pytest
 from app.trading.win_rate import is_bookkeeping_exit
 from app.trading.execution_context import current_execution
 from app.logging_setup import get_logger
@@ -335,6 +336,12 @@ class Storage:
         if settings.paper_trading:
             directory = directory / "simulation"
         self._path = path or (directory / "trading.db")
+        if running_under_pytest():
+            temp_root = Path(tempfile.gettempdir()).resolve()
+            if not self._path.resolve().is_relative_to(temp_root):
+                raise RuntimeError(
+                    f"Refusing to open non-temporary database {self._path} under pytest"
+                )
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._transaction = threading.local()
@@ -1193,11 +1200,17 @@ class Storage:
             )
             return int(cur.lastrowid or 0)
 
-    def recent_trade_audit(self, limit: int = 100, mode: Optional[str] = None) -> list[dict]:
+    def recent_trade_audit(
+        self, limit: int = 100, mode: Optional[str] = None, *, include_test: bool = False,
+    ) -> list[dict]:
+        # Historical pytest runs wrote rows tagged agents=["test"] into the
+        # live database; they are kept but hidden from diagnostics.
         with self._lock, self._conn() as c:
             rows = c.execute(
-                "SELECT * FROM trade_audit WHERE (? IS NULL OR mode=?) ORDER BY id DESC LIMIT ?",
-                (mode, mode, limit),
+                "SELECT * FROM trade_audit WHERE (? IS NULL OR mode=?) "
+                "AND (? OR NOT (json_valid(detail) AND json_extract(detail, '$.agents') = '[\"test\"]')) "
+                "ORDER BY id DESC LIMIT ?",
+                (mode, mode, int(include_test), limit),
             ).fetchall()
         return [dict(r) for r in rows]
 

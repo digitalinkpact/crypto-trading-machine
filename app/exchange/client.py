@@ -15,7 +15,7 @@ from typing import Any, Optional
 import pandas as pd
 from binance.spot import Spot  # type: ignore[import-untyped]
 
-from app.config import Settings, Timeframe, TradingMode, get_settings
+from app.config import Settings, Timeframe, TradingMode, get_settings, running_under_pytest
 from app.logging_setup import get_logger
 
 from .models import Order, OrderSide, OrderStatus, OrderType
@@ -111,9 +111,12 @@ class BinanceUSClient:
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self._settings = settings or get_settings()
+        # Tests may never hold signing credentials, so no test can authenticate
+        # a real Binance.US order regardless of how settings were loaded.
+        credentialed = not running_under_pytest()
         self._spot = Spot(
-            api_key=self._settings.binance_api_key.get_secret_value() or None,
-            api_secret=self._settings.binance_api_secret.get_secret_value() or None,
+            api_key=(self._settings.binance_api_key.get_secret_value() or None) if credentialed else None,
+            api_secret=(self._settings.binance_api_secret.get_secret_value() or None) if credentialed else None,
             base_url=self._settings.binance_base_url,
             timeout=10,
         )
