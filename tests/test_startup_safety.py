@@ -194,3 +194,47 @@ def _async_result(value):
     async def result():
         return value
     return result()
+
+
+@pytest.mark.asyncio
+async def test_fresh_db_halt_states_seeded_so_final_live_buy_gate_can_pass(monkeypatch):
+    from decimal import Decimal
+
+    import app.trading.autopilot as autopilot_module
+    from app.trading import startup as main
+    from app.trading.autopilot import Autopilot
+
+    ap = Autopilot()
+    ap.state.mode = "live"
+    ap.state.running = True
+    ap.state.starting_balance_usdt = Decimal("100")
+    monkeypatch.setattr(
+        autopilot_module, "get_settings",
+        lambda: type("S", (), {"live_buys_enabled": True})(),
+    )
+    monkeypatch.setattr(autopilot_module.filters, "_loaded", True)
+    # Halted entry_status is the next check after the halt keys, so reaching
+    # it proves the halt-key gate passed without touching price/portfolio.
+    main.storage.kv_set("entry_status", {"entry_halted": True})
+
+    allowed, reason, _ = await ap._final_live_buy_safety_check(symbol="BTCUSDT", qty=Decimal("1"))
+    assert (allowed, reason) == (False, "safety_state_unknown:drawdown_halt")
+
+    assert main.initialize_halt_states() == list(main.HALT_STATE_KEYS)
+    allowed, reason, _ = await ap._final_live_buy_safety_check(symbol="BTCUSDT", qty=Decimal("1"))
+    assert (allowed, reason) == (False, "entry_status_halted")
+
+
+def test_halt_state_seeding_never_overwrites_existing_or_corrupt_rows():
+    from app.trading import startup as main
+
+    main.storage.kv_set("drawdown_halt", {"active": True, "reason": "tripped"})
+    with main.storage._conn() as c:
+        c.execute("INSERT INTO kv(key,value) VALUES('tick_protection','{not json')")
+
+    assert main.initialize_halt_states() == ["emergency_halt"]
+    assert main.initialize_halt_states() == []
+
+    assert main.storage.kv_get("drawdown_halt") == {"active": True, "reason": "tripped"}
+    assert main.storage.kv_get("tick_protection") is None
+    assert main.storage.kv_get("emergency_halt")["active"] is False

@@ -560,6 +560,19 @@ class Storage:
                 (key, payload),
             )
 
+    def kv_set_if_absent(self, key: str, value: Any) -> bool:
+        """Atomically insert `key` only if no row exists. Returns True if inserted.
+
+        Existing rows — including unparseable ones — are never overwritten.
+        """
+        payload = json.dumps(value, default=str)
+        with self._lock, self._conn() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO kv(key,value) VALUES(?,?)",
+                (key, payload),
+            )
+            return cur.rowcount == 1
+
     def kv_get(self, key: str, default: Any = None) -> Any:
         with self._lock, self._conn() as c:
             row = c.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()

@@ -26,6 +26,7 @@ _SAFETY_KEYS = (
     "exchange_filters_unavailable",
     "ml_gate_unavailable",
 )
+_FINAL_GATE_KEYS = ("drawdown_halt", "emergency_halt", "tick_protection")
 
 
 def readiness_blockers(
@@ -103,8 +104,13 @@ def readiness_blockers(
 def main() -> int:
     settings = get_settings()
     autopilot_state = storage.kv_get("autopilot_state") or {}
-    entry_status = storage.kv_get("entry_status") or {}
-    safety_states = {key: storage.kv_get(key) or {} for key in _SAFETY_KEYS}
+    # The final live-BUY gate rejects when these are missing or unreadable, so
+    # report them unmasked; the other safety keys are absent when never engaged.
+    entry_status = storage.kv_get("entry_status")
+    safety_states = {
+        key: storage.kv_get(key) if key in _FINAL_GATE_KEYS else (storage.kv_get(key) or {})
+        for key in _SAFETY_KEYS
+    }
     scan = storage.kv_get("profitstream_scan") or {}
     blockers = readiness_blockers(
         settings, autopilot_state, entry_status, safety_states, scan

@@ -1,6 +1,8 @@
 """Startup safety verification before trading loops are started."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from app.config import get_settings
 from app.exchange import BinanceUSClient
 from app.logging_setup import get_logger
@@ -10,10 +12,34 @@ from app.trading.reconcile import reconcile_positions
 
 log = get_logger(__name__)
 
+# Keys the final live-BUY gate requires to be readable dicts. They are only
+# written when a halt engages, so a database that never tripped one has no
+# row and the gate would reject every live BUY as `safety_state_unknown`.
+HALT_STATE_KEYS = ("drawdown_halt", "emergency_halt", "tick_protection")
+
+
+def initialize_halt_states() -> list[str]:
+    """Seed missing halt-state rows as inactive; never touches existing rows."""
+    seeded = []
+    for key in HALT_STATE_KEYS:
+        if storage.kv_set_if_absent(
+            key,
+            {
+                "active": False,
+                "initialized_at": datetime.now(timezone.utc).isoformat(),
+                "reason": "initialized at startup; never engaged",
+            },
+        ):
+            seeded.append(key)
+    if seeded:
+        log.warning("startup initialized missing halt state(s) as inactive: %s", ", ".join(seeded))
+    return seeded
+
 
 async def verify_before_trading() -> None:
     """Verify local/exchange state and halt new entries on any discrepancy."""
     mode = "paper" if get_settings().paper_trading else "live"
+    initialize_halt_states()
     storage.migrate_risk_state(mode)
     storage.recover_interrupted_ticks()
     pending = storage.pending_order_intents(mode)
