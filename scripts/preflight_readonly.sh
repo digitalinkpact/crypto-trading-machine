@@ -6,7 +6,12 @@
 # Never writes git, .env, systemd, the database, or exchange state. The DB is
 # opened with SQLite mode=ro; Binance.US calls are account/openOrders/ticker
 # only. Secret-looking lines in unit files are redacted; keys are never printed.
+# It does not call /health (that route writes a probe row) and keeps the app
+# logger off logs/uvicorn.log. GIT_OPTIONAL_LOCKS=0 stops `git status` from
+# refreshing .git/index.
 set -uo pipefail
+export GIT_OPTIONAL_LOCKS=0
+TARGET=${TARGET:-0ebc3af6552346c3cd653d87da31627dc2f6799e}
 
 APP_DIR=${APP_DIR:-/opt/crypto-trading-machine}
 ENV_FILE=${ENV_FILE:-/var/lib/crypto-bot/.env}
@@ -21,6 +26,9 @@ section "host"
 hostname; date -u; uptime; [ -f /var/run/reboot-required ] && echo "NOTE: reboot-required flag present"
 df -h "$APP_DIR" | tail -1; free -m | sed -n 2p
 
+section "ownership / permissions"
+stat -c '%U:%G %a %n' "$APP_DIR" "$APP_DIR/.git" "$APP_DIR/data" "$APP_DIR/data/cache" "$APP_DIR"/data/cache/trading.db* "$APP_DIR/logs" "$ENV_FILE" 2>&1
+
 section "git (no fetch)"
 git -c safe.directory="$APP_DIR" rev-parse HEAD
 git -c safe.directory="$APP_DIR" log -1 --format='%h %cd %s' --date=iso
@@ -29,6 +37,15 @@ echo "-- status --porcelain (tracked + untracked, ignored excluded):"
 git -c safe.directory="$APP_DIR" status --porcelain
 echo "-- stashes:"; git -c safe.directory="$APP_DIR" stash list | head
 echo "-- remote main:"; git -c safe.directory="$APP_DIR" ls-remote origin refs/heads/main 2>&1 | head -1
+echo "-- target $TARGET:"
+if git -c safe.directory="$APP_DIR" cat-file -e "$TARGET^{commit}" 2>/dev/null; then
+  git -c safe.directory="$APP_DIR" merge-base --is-ancestor HEAD "$TARGET" \
+    && echo "   HEAD is an ancestor of target (fast-forward possible)" \
+    || echo "   HEAD is NOT an ancestor of target (fast-forward impossible)"
+  git -c safe.directory="$APP_DIR" diff --stat HEAD "$TARGET" | tail -20
+else
+  echo "   target not in local object store yet (ancestry checked after fetch at deploy time)"
+fi
 
 section "systemd units + drop-ins (secrets redacted)"
 for u in crypto-bot.service crypto-bot-risk.service crypto-bot-watchdog.service crypto-bot-watchdog.timer; do
@@ -60,6 +77,16 @@ ps -eo pid,ppid,user,etime,args --sort=pid | grep -E "uvicorn|app\.main|crypto|p
 
 section "listening ports"
 ss -ltnp 2>/dev/null
+echo "-- port 8000 owner:"; ss -ltnpH 'sport = :8000' 2>/dev/null
+
+section "processes holding the trading database open (potential writers)"
+for f in "$APP_DIR"/data/cache/trading.db "$APP_DIR"/data/cache/trading.db-wal; do
+  [ -e "$f" ] || continue
+  echo "-- $f"
+  if command -v fuser >/dev/null 2>&1; then fuser -v "$f" 2>&1 | sed 1d; else
+    for p in /proc/[0-9]*; do ls -l "$p/fd" 2>/dev/null | grep -q -- "$f" && echo "   pid ${p#/proc/}: $(tr '\0' ' ' < "$p/cmdline" | cut -c1-160)"; done
+  fi
+done
 
 section "env file (names + mode flags only)"
 ls -la "$ENV_FILE"
@@ -69,9 +96,15 @@ echo "-- mode overrides in unit environment:"; systemctl show crypto-bot -p Envi
 
 section "effective settings + DB + exchange (python, read-only, as $APP_USER)"
 runuser -u "$APP_USER" -- env APP_ENV_FILE="$ENV_FILE" "$PY" - <<'PYEOF'
-import asyncio, json, os, sqlite3
+import asyncio, json, logging, os, sqlite3, sys
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+
+# Keep app modules off the production RotatingFileHandler (logs/uvicorn.log).
+import app.logging_setup as _logging_setup
+_logging_setup._CONFIGURED = True
+logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
 from app.config import Settings
 
 env = Path(os.environ["APP_ENV_FILE"])
@@ -85,6 +118,8 @@ names = ("trading_mode", "live_mode", "paper_trading", "dry_run", "live_buys_ena
          "take_profit_1_fraction", "take_profit_2_pct", "take_profit_2_fraction",
          "trailing_stop_pct", "daily_loss_limit_pct", "drawdown_circuit_breaker_pct",
          "emergency_halt_enabled", "exchange_native_stops_enabled",
+         "exchange_native_stops_canary_symbols", "risk_loop_in_process_enabled",
+         "ml_learning_enabled", "ml_gate_max_model_age_hours",
          "market_regime_gate_enabled", "breadth_gate_enabled", "ml_gate_enabled",
          "profitstream_score_threshold", "entry_strategy")
 eff = {}
@@ -139,6 +174,20 @@ for k in ("drawdown_halt", "emergency_halt", "tick_protection", "entry_status", 
           "order_outcome_unknown", "circuit_breaker_check_failed", "exchange_filters_unavailable",
           "ml_gate_unavailable", "accounting_status"):
     print(f"   {k}: {json.dumps(kv(k), default=str)[:400]}")
+print("\n-- heartbeats (kv):")
+now_ts = datetime.now(timezone.utc).timestamp()
+for k in ("process_started_at", "autopilot_last_success", "autopilot_last_completed_tick",
+          "risk_loop_last_run", "risk_loop_last_attempt", "risk_loop_status"):
+    v = kv(k)
+    age = f" age_s={now_ts - v:.0f}" if isinstance(v, (int, float)) else ""
+    print(f"   {k}: {json.dumps(v, default=str)[:300]}{age}")
+hs = kv("health_status")
+if isinstance(hs, dict):
+    print("   health_status:", json.dumps({k: hs.get(k) for k in (
+        "checked_at", "ts", "scheduler_alive", "risk_loop_alive", "trade_loop_alive",
+        "binance_alive", "rest_alive", "websocket_alive", "emergency_halt")}, default=str))
+else:
+    print("   health_status:", hs)
 ap = kv("autopilot_state")
 if isinstance(ap, dict):
     print("   autopilot_state:", json.dumps({k: ap.get(k) for k in (
@@ -154,6 +203,19 @@ if isinstance(scan, dict):
 if "tick_runs" in tables:
     print("-- last ticks:")
     for r in c.execute("select started_at, completed_at, mode, source, status from tick_runs order by started_at desc limit 5"):
+        print("  ", dict(r))
+if "ml_models" in tables:
+    print("-- ML models:")
+    for r in c.execute("select name, version, trained_at, algorithm from ml_models"):
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(r["trained_at"]).astimezone(timezone.utc)).total_seconds() / 3600
+        except (TypeError, ValueError):
+            age = None
+        print("  ", dict(r), "age_h:", None if age is None else round(age, 1))
+if "trade_audit" in tables:
+    print("-- trade_audit last 24h by outcome:")
+    for r in c.execute("select mode, signal, final_outcome, count(*) n from trade_audit "
+                       "where ts >= datetime('now','-1 day') group by 1,2,3 order by n desc limit 20"):
         print("  ", dict(r))
 if "orders" in tables:
     print("-- last 8 orders:")
@@ -193,15 +255,25 @@ async def exchange():
         for o in orders:
             print("  ", {k: o.get(k) for k in ("symbol", "side", "type", "status", "origQty",
                                                "executedQty", "price", "stopPrice", "clientOrderId", "time")})
+        prefix = s.exchange_stop_coid_prefix
+        print(f"-- protective stop coverage (exchange_native_stops_enabled={s.exchange_native_stops_enabled}):")
+        for sym, q in sorted(live_positions.items()):
+            stops = [o for o in orders if o.get("symbol") == sym and str(o.get("side")).upper() == "SELL"
+                     and str(o.get("type")).upper() == "STOP_LOSS"
+                     and str(o.get("clientOrderId", "")).startswith(prefix)]
+            covered = sum(Decimal(str(o.get("origQty", "0"))) for o in stops)
+            print(f"   {sym}: local_qty={q} exchange_stop_qty={covered} "
+                  f"-> {'EXCHANGE-NATIVE STOP' if stops else 'APP-SIDE ONLY (risk loop)'}")
+        foreign = [o for o in orders if not str(o.get("clientOrderId", "")).startswith(prefix)]
+        print(f"   open orders without the bot stop prefix: {len(foreign)}")
     except Exception as exc:  # noqa: BLE001
         print("   OPEN ORDERS FAILED:", type(exc).__name__, exc)
 
 asyncio.run(exchange())
 PYEOF
 
-section "service health endpoints"
+section "liveness (GET /healthz only; /health writes a probe row)"
 curl -s -m 5 localhost:8000/healthz; echo
-curl -s -m 10 localhost:8000/health | head -c 3000; echo
 
 section "recent log signals"
 LOG=$APP_DIR/logs/uvicorn.log

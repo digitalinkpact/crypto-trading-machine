@@ -84,3 +84,29 @@ def test_readiness_reports_stale_scan_and_active_halt():
     )
     assert "emergency_halt is active: test" in blockers
     assert any(reason.startswith("ProfitStream scan is stale") for reason in blockers)
+
+def test_readiness_main_reports_missing_and_corrupt_halt_records(monkeypatch, capsys, tmp_path):
+    import scripts.check_live_buy_readiness as readiness
+    from app.storage.db import Storage
+
+    store = Storage(tmp_path / "trading.db")
+    monkeypatch.setattr(readiness, "storage", store)
+    monkeypatch.setattr(readiness, "get_settings", lambda: _settings())
+    store.kv_set("autopilot_state", {"running": True, "mode": "live"})
+    store.kv_set("entry_status", {"entry_halted": False})
+    store.kv_set("profitstream_scan", _scan(timestamp=datetime.now(timezone.utc).isoformat()))
+    for key, value in _safe_states().items():
+        if key not in ("drawdown_halt", "tick_protection"):
+            store.kv_set(key, value)
+    with store._conn() as c:
+        c.execute("INSERT INTO kv(key,value) VALUES('tick_protection','{not json')")
+
+    assert readiness.main() == 1
+    out = capsys.readouterr().out
+    assert "Live BUY readiness: BLOCKED" in out
+    assert "BLOCKER: safety state drawdown_halt is unavailable" in out
+    assert "BLOCKER: safety state tick_protection is unavailable" in out
+
+    store.kv_set("drawdown_halt", {"active": False})
+    store.kv_set("tick_protection", {"active": False})
+    assert readiness.main() == 0
