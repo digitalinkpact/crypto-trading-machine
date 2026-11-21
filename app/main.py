@@ -1,7 +1,8 @@
 """FastAPI entrypoint. Wires routes + APScheduler lifespan."""
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import fcntl
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI
@@ -56,8 +57,29 @@ async def _log_price_diagnostic(settings) -> None:
         log.warning("BTCUSDT price diagnostic failed: %s", exc)
 
 
+@contextmanager
+def _process_lock(directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / ".crypto-bot.lock").open("a") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("another crypto-bot process holds the application lock") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    with _process_lock(get_settings().data_cache_dir):
+        async with _app_lifespan(app):
+            yield
+
+
+@asynccontextmanager
+async def _app_lifespan(app: FastAPI):
     configure_logging()
     settings = get_settings()
     storage.kv_set("process_started_at", datetime.now(timezone.utc).isoformat())
@@ -91,7 +113,8 @@ async def lifespan(app: FastAPI):
     try:
         await verify_before_trading()
     except Exception as exc:  # noqa: BLE001
-        log.critical("startup safety verification failed: %s", exc)
+        log.exception("startup safety verification failed: %s", exc)
+        raise
     # Seed paper account on first run.
     try:
         if settings.paper_trading:

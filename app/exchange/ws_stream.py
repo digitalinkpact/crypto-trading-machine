@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
@@ -44,6 +45,7 @@ class LivePriceCache:
         self._running = False
         self._connected = False
         self._last_msg_at: float = 0.0
+        self._reconnect_attempts = 0
 
     # ── lifecycle ────────────────────────────────────────────────────────
     def start(self) -> None:
@@ -93,6 +95,9 @@ class LivePriceCache:
             "symbols_cached": len(self._prices),
             "last_msg_age_s": (round(time.time() - self._last_msg_at, 1)
                                if self._last_msg_at else None),
+            "last_update_at": (datetime.fromtimestamp(self._last_msg_at, timezone.utc).isoformat()
+                               if self._last_msg_at else None),
+            "reconnect_attempts": self._reconnect_attempts,
         }
 
     # ── internals ────────────────────────────────────────────────────────
@@ -109,10 +114,14 @@ class LivePriceCache:
                         if not self._running:
                             break
                         self._ingest(raw)
+                    self._connected = False
+                    if self._running:
+                        raise ConnectionError("websocket closed")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 self._connected = False
+                self._reconnect_attempts += 1
                 log.warning("live price stream dropped (%s); reconnecting in %.0fs",
                             exc, backoff)
                 try:
@@ -130,6 +139,7 @@ class LivePriceCache:
         # `!miniTicker@arr` delivers a list; guard against single-object frames.
         items = payload if isinstance(payload, list) else [payload]
         now = time.time()
+        updated = False
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -141,9 +151,11 @@ class LivePriceCache:
                 price = Decimal(str(last))
             except (InvalidOperation, ValueError):
                 continue
-            if price > 0:
+            if price.is_finite() and price > 0:
                 self._prices[str(sym).upper()] = (price, now)
-        self._last_msg_at = now
+                updated = True
+        if updated:
+            self._last_msg_at = now
 
 
 # Process-wide singleton used by the autopilot and dashboards.

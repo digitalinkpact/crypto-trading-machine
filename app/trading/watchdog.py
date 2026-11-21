@@ -301,6 +301,7 @@ async def _health_loop() -> None:
             "scheduler_alive": bool(_SCHEDULER_REF.running) if _SCHEDULER_REF is not None else False,
             "websocket_alive": bool(live_prices.connected),
             "binance_alive": False,
+            "rest_alive": False,
             "database_alive": False,
             "trade_loop_alive": False,
             "actions": [],
@@ -312,6 +313,11 @@ async def _health_loop() -> None:
                 status["database_alive"] = True
             except Exception as e:  # noqa: BLE001
                 log.exception("health check: database ping failed: %s", e)
+
+            status["rest_alive"], _ = await health._retry_async(
+                lambda: BinanceUSClient().ticker_price("BTCUSDT"),
+                attempts=1, base_delay=1.0, label="binance public REST ping",
+            )
 
             # Automatic API retries: transient blips (a single dropped
             # connection, a momentary 5xx) must not immediately count as a

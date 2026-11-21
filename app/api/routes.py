@@ -820,39 +820,71 @@ async def autopilot_drawdown_recovery(
 
 @router.get("/health")
 async def health(response: Response) -> dict:
-    """Liveness+readiness probe for external supervisors (systemd timer,
-    watchdog.sh, uptime monitors). Returns HTTP 200 only when the process is
-    alive AND the last Binance.US price update is fresh (<`live_price_max_age_
-    seconds`, default 30s) AND the local SQLite DB is writable. Any failing
-    check drops the status to 503 so a monitor can tell "up but broken" apart
-    from "actually fine".
-    """
+    """Public, secret-free readiness probe; /healthz is liveness only."""
     s = get_settings()
     problems: list[str] = []
 
     ws_status = live_prices.status()
     price_age = ws_status.get("last_msg_age_s")
-    price_fresh = True
-    if ws_status.get("enabled"):
-        if price_age is None or price_age > s.live_price_max_age_seconds:
-            price_fresh = False
-            problems.append(
-                f"last Binance.US price update {price_age if price_age is not None else 'never'}s "
-                f"ago (max {s.live_price_max_age_seconds}s)"
-            )
+    price_fresh = bool(
+        ws_status.get("enabled") and ws_status.get("connected")
+        and price_age is not None and 0 <= price_age <= s.live_price_max_age_seconds
+    )
+    if not price_fresh:
+        problems.append("market_data_unavailable_or_stale")
 
     db_writable = True
+    monitor = {}
+    last_evaluation = None
     try:
         storage.kv_set("healthz_probe", {"ts": datetime.now(timezone.utc).isoformat()})
-    except Exception as exc:  # noqa: BLE001
+        monitor = storage.kv_get("health_status") or {}
+        last_evaluation = storage.kv_get("autopilot_last_completed_tick")
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).exception("readiness database check failed")
         db_writable = False
-        problems.append(f"db not writable: {exc}")
+        problems.append("database_unavailable")
+
+    monitor_fresh = False
+    if isinstance(monitor, dict):
+        try:
+            monitor_time = datetime.fromisoformat(monitor["timestamp"])
+            age = (datetime.now(timezone.utc) - monitor_time).total_seconds()
+            monitor_fresh = monitor_time >= _APP_STARTED_AT and 0 <= age <= 180
+        except (KeyError, TypeError, ValueError):
+            pass
+    rest_healthy = monitor_fresh and monitor.get("rest_alive") is True
+    if not rest_healthy:
+        problems.append("binance_rest_unavailable_or_unverified")
+    if s.live_mode and (not monitor_fresh or monitor.get("binance_alive") is not True):
+        problems.append("binance_account_unavailable_or_unverified")
+    if not monitor_fresh or monitor.get("scheduler_alive") is not True:
+        problems.append("scheduler_unavailable_or_unverified")
+    if not monitor_fresh or monitor.get("risk_loop_alive") is not True:
+        problems.append("risk_loop_unavailable_or_unverified")
+    if autopilot.state.running and (not monitor_fresh or monitor.get("trade_loop_alive") is not True):
+        problems.append("trading_evaluation_unavailable_or_stale")
+    if monitor_fresh and monitor.get("emergency_halt"):
+        problems.append("emergency_halt_active")
 
     body = {
         "status": "ok" if not problems else "degraded",
         "process_alive": True,
         "price_fresh": price_fresh,
         "price_age_s": price_age,
+        "last_market_update_at": ws_status.get("last_update_at"),
+        "websocket_connected": bool(ws_status.get("connected")),
+        "websocket_reconnect_attempts": ws_status.get("reconnect_attempts", 0),
+        "binance_rest_healthy": rest_healthy,
+        "last_successful_evaluation_at": last_evaluation,
+        "monitor_checked_at": monitor.get("timestamp") if monitor_fresh else None,
+        "monitor_fail_streaks": monitor.get("fail_streaks", {}) if monitor_fresh else {},
+        "autopilot_running": autopilot.state.running,
+        "trading_mode": s.ledger_mode,
+        "live_mode": s.live_mode,
+        "paper_trading": s.paper_trading,
+        "dry_run": s.dry_run,
+        "live_buys_enabled": s.live_buys_enabled,
         "db_writable": db_writable,
         "problems": problems,
     }
