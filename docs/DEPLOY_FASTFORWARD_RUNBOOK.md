@@ -1,4 +1,4 @@
-# Fast-forward deployment runbook (halt-state fix)
+# Fast-forward deployment runbook (reviewed repair candidate)
 
 Operator-run, step by step, as root on the droplet. Paste each step's output
 for review before running the next. **Stop at the first failed check.**
@@ -86,30 +86,33 @@ systemctl is-active crypto-bot-watchdog.timer crypto-bot-watchdog.service || tru
 
 ## 5. Online database backup + verification
 
-SQLite online backup from a read-only source connection; safe with the live
-writer running.
+Use only the reviewed, timeout-bounded SQLite backup utility. It opens the live
+database read-only, uses SQLite's backup API, verifies integrity/counts, writes
+SHA-256, and atomically promotes a temporary destination.
+
+Create the backup with:
 
 ```bash
-runuser -u cryptobot -- "$APP/.venv/bin/python" - "$DB" "$BK/trading.db" <<'PY'
-import sqlite3, sys
-src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
-dst = sqlite3.connect(sys.argv[2])
-src.backup(dst)
-dst.close(); src.close()
-PY
-chmod 600 "$BK/trading.db"
-python3 - "$DB" "$BK/trading.db" <<'PY'
-import sqlite3, sys
-for p in sys.argv[1:]:
-    c = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
-    print(p, c.execute("pragma integrity_check").fetchone()[0],
-          {t: c.execute(f"select count(*) from {t}").fetchone()[0]
-           for t in ("positions", "orders", "order_intents", "closed_trades", "kv")})
-PY
+runuser -u cryptobot -- "$APP/.venv/bin/python" \
+  -m scripts.backup_trading_db "$DB" "$BK/trading.db" \
+  --timeout 30 --max-seconds 3600
 ```
 
-Backup integrity must be `ok`, and its counts must match the live DB (or the
-live DB may only be ahead by rows written in the last seconds).
+The utility creates a temporary destination, verifies `quick_check(1)`, compares
+key table counts with the live source, calculates SHA-256, and only promotes the
+destination after every check passes. Live-write count drift is reported without
+invalidating an otherwise integrity-valid snapshot. It fails without replacing a
+valid destination if verification fails.
+
+For an existing unexplained backup process:
+
+- Do not terminate or start another backup while it is under investigation.
+- Record PID, PPID, start time, command, CPU, RSS, open source/destination/WAL
+  descriptors, destination size, and I/O counters.
+- Compare destination size and I/O counters over a bounded interval.
+- Do not open or verify the destination as a normal writer; use a bounded
+  read-only connection only after confirming it is safe and the journal is stable.
+- Escalate if the destination does not grow or does not close its journal.
 
 > `runuser -u cryptobot` needs write access to `$BK`; if it fails, run the
 > backup as root instead (root can read the DB).
@@ -134,7 +137,7 @@ list matches the reviewed change set exactly.
 ```bash
 sudo -u "$REPO_OWNER" git merge --ff-only "$TARGET"
 sudo -u "$REPO_OWNER" git rev-parse HEAD        # must equal $TARGET
-sudo -u "$REPO_OWNER" git status --porcelain    # must equal $BK/git_status.txt
+sudo -u "$REPO_OWNER" git status --porcelain    # must be empty except $BK/git_status.txt-approved untracked files
 runuser -u cryptobot -- "$APP/.venv/bin/python" -m py_compile app/trading/startup.py app/storage/db.py scripts/check_live_buy_readiness.py && echo COMPILE-OK
 ```
 
@@ -192,11 +195,15 @@ systemctl start crypto-bot-watchdog.timer && systemctl is-active crypto-bot-watc
 cd /opt/crypto-trading-machine
 PREV=$(cat "$BK/prev_commit")
 systemctl stop crypto-bot-watchdog.timer
-sudo -u "$REPO_OWNER" git -c advice.detachedHead=false checkout "$PREV"
+if ! sudo -u "$REPO_OWNER" git merge-base --is-ancestor HEAD "$PREV"; then
+  echo "REFUSING ROLLBACK: $PREV is not a fast-forward target from HEAD" >&2
+  exit 1
+fi
+sudo -u "$REPO_OWNER" git merge --ff-only "$PREV"
 systemctl restart crypto-bot
 ```
 
-- `git checkout` refuses to overwrite local modifications and leaves untracked files alone. Return to the branch later with `git checkout main`.
+- Rollback is fast-forward-only. It does not overwrite local modifications or untracked files.
 - The seeded inactive halt rows are harmless to the previous code (every reader checks `.get("active")`); leave them.
 - Restore `$BK/env.bak` or `$BK/systemd/*` only if those files were changed (this deployment changes neither).
 - Restore `$BK/trading.db` **only** if the live DB fails `integrity_check` **and** `orders`, `order_intents`, `closed_trades` and `positions` show no activity after the backup time; otherwise keep the live DB and reconcile from Binance.US.

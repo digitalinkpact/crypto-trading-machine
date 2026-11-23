@@ -107,10 +107,12 @@ REL=<release-commit>; B=/var/backups/crypto-bot/$REL; mkdir -p -m 700 $B
 git rev-parse HEAD > $B/predeploy-rev.txt                          # expect 7819d3b…
 cp -p /var/lib/crypto-bot/.env $B/service.env                      # stays 0600
 systemctl cat crypto-bot > $B/crypto-bot.service
-nice -n 19 ionice -c3 sqlite3 data/cache/trading.db ".backup '$B/trading-predeploy.db'"   # ~9.2 GB; 73 GB free
-nice -n 19 ionice -c3 sqlite3 "$B/trading-predeploy.db" "PRAGMA integrity_check;"         # expect: ok
-sqlite3 "file:$B/trading-predeploy.db?mode=ro" "select max(id) from tick_audit; select max(id) from trade_audit; select count(*) from closed_trades;"
-sha256sum $B/trading-predeploy.db > $B/trading-predeploy.db.sha256
+# Retired shell-backup method; use the reviewed utility only.
+runuser -u cryptobot -- "$APP/.venv/bin/python" -m scripts.backup_trading_db \
+  data/cache/trading.db "$B/trading.db" --timeout 30 --max-seconds 3600
+
+# The utility verifies integrity/counts and prints SHA-256. Preserve that output
+# with the backup directory for audit and restore verification.
 ```
 
 The existing `/var/backups/crypto-bot/4569263/` holds:
